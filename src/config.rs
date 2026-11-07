@@ -375,4 +375,48 @@ mod tests {
         let c: Config = serde_json::from_value(v).unwrap();
         assert_eq!(c.quantum, 512);
     }
+
+    fn quantum_of(v: serde_json::Value) -> Result<u32, serde_json::Error> {
+        let mut j = serde_json::to_value(Config::default_config()).unwrap();
+        j["quantum"] = v;
+        serde_json::from_value::<Config>(j).map(|c| c.quantum)
+    }
+
+    #[test]
+    fn quantum_bad_values_normalised() {
+        use serde_json::json;
+        let cases = [
+            (json!("256"), 256), (json!(-1), 256), (json!(null), 256), (json!(1.5), 256),
+            (json!(0), 0), (json!(1), 32), (json!(16), 32), (json!(300), 512),
+            (json!(512), 512), (json!(2048), 2048), (json!(4096), 2048),
+        ];
+        for (v, want) in cases {
+            let got = quantum_of(v.clone()).unwrap_or_else(|e| panic!("{v} failed to parse: {e}"));
+            assert_eq!(got, want, "quantum {v}");
+        }
+        let mut j = serde_json::to_value(Config::default_config()).unwrap();
+        j["quantum"] = json!("256");
+        let c: Config = serde_json::from_value(j).unwrap();
+        assert_eq!(c.buses.len(), Config::default_config().buses.len());
+    }
+
+    #[test]
+    fn load_backs_up_unparseable_config() {
+        let home = std::env::temp_dir().join(format!("wavelink-load-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let dir = home.join(".config/wavelink-mixer");
+        std::fs::create_dir_all(&dir).unwrap();
+        let truncated: &[u8] = b"{\"buses\": [";
+        std::fs::write(dir.join("config.json"), truncated).unwrap();
+        let old = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        let _ = Config::load();
+        match old {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        let bad = std::fs::read(dir.join("config.json.bad"));
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(bad.unwrap(), truncated);
+    }
 }

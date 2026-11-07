@@ -315,4 +315,9 @@ mod tests {
         assert!(s.contains("added by mixer: 30.0 ms"), "{s}");
         assert!(s.contains("total game → ears ≈ 38.0 ms"), "{s}");
     }
+
+    #[test]
+    fn run_rejects_zero_runs() {
+        assert_eq!(run(vec!["--runs".into(), "0".into()]), 2);
+    }
 }
