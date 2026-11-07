@@ -137,8 +137,19 @@ fn spawn(cmd: &str, args: &[&str]) {
 }
 
 /// Forces the graph quantum (frames per cycle) through PipeWire metadata; 0 releases the force.
-pub fn force_quantum(q: u32) {
+/// Returns true once the value reads back, so the caller can retry a failed write.
+pub fn force_quantum(q: u32) -> bool {
     run("pw-metadata", &["-n", "settings", "0", "clock.force-quantum", &q.to_string()]);
+    let meta = output_timeout("pw-metadata", &["-n", "settings"], Duration::from_secs(3))
+        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .unwrap_or_default();
+    let got = meta_value(&meta, "clock.force-quantum");
+    if q == 0 {
+        // releasing: the key may read 0 or be removed entirely
+        got.unwrap_or(0) == 0
+    } else {
+        got == Some(q as u64)
+    }
 }
 
 pub fn set_volume(id: u64, v: f64) {
@@ -179,8 +190,14 @@ pub fn create_null_sink(name: &str, desc: &str, priority: u32) {
 
 /// Value of a `pw-metadata -n settings` key, e.g. `clock.force-quantum`.
 pub fn meta_value(meta: &str, key: &str) -> Option<u64> {
-    let _ = (meta, key);
-    todo!()
+    meta.lines()
+        .find(|l| l.contains(&format!("'{key}'")))?
+        .split("value:'")
+        .nth(1)?
+        .split('\'')
+        .next()?
+        .parse()
+        .ok()
 }
 
 #[cfg(test)]
@@ -189,7 +206,7 @@ mod tests {
 
     #[test]
     fn meta_value_reads_keys() {
-        let meta = "update: id:0 key:clock.quantum value:1024 type:\nupdate: id:0 key:clock.min-quantum value:32 type:\nupdate: id:0 key:clock.force-quantum value:256 type:\n";
+        let meta = "update: id:0 key:'clock.quantum' value:'1024' type:''\nupdate: id:0 key:'clock.min-quantum' value:'32' type:''\nupdate: id:0 key:'clock.force-quantum' value:'256' type:''\n";
         assert_eq!(meta_value(meta, "clock.force-quantum"), Some(256));
         assert_eq!(meta_value(meta, "clock.quantum"), Some(1024));
         assert_eq!(meta_value(meta, "clock.rate"), None);

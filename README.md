@@ -32,6 +32,8 @@ Config lives at `~/.config/wavelink-mixer/config.json`.
 ## Latency
 
 - `quantum` in `config.json` (default 256, about 5.3 ms per cycle) is forced on the PipeWire graph with `pw-metadata clock.force-quantum`. It applies live when the engine reloads the config, with no restart; 0 leaves PipeWire's own setting alone.
-- `contrib/51-wavelink-usb-latency.conf` sets the Scarlett Solo to period 256 and headroom 128. Copy it to `~/.config/wireplumber/wireplumber.conf.d/` and restart WirePlumber.
+- `contrib/51-wavelink-usb-latency.conf` sets the Scarlett Solo to period 256 and headroom 128. Install with `mkdir -p ~/.config/wireplumber/wireplumber.conf.d && cp contrib/51-wavelink-usb-latency.conf ~/.config/wireplumber/wireplumber.conf.d/ && systemctl --user restart wireplumber`.
 - `wavelink-mixer latency [--runs N] [--channel game]` plays clicks through the mixer and reports the delay the mixer adds, plus the device's PipeWire-reported latency.
 - The system panel's "ms per cycle" is one graph cycle, not the end-to-end delay; use `latency` for that.
+- The force is system-wide (every app, games included) and stays after the engine stops. To release it: set `"quantum": 0` in `config.json` while the engine runs, or run `pw-metadata -n settings 0 clock.force-quantum 0`; it also clears when PipeWire restarts. Valid values: 0 or 32–2048; other numbers are clamped to that range and rounded up to a power of two, and an unreadable value falls back to 256.
+- If `config.json` can't be parsed, the mixer saves a copy as `config.json.bad` before writing defaults.

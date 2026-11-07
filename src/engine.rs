@@ -339,8 +339,7 @@ pub fn run() {
             cfg = Config::load();
         }
         // graph quantum: forced through metadata (live, no restart), re-applied when the value changes
-        if last_quantum != Some(cfg.quantum) {
-            pw::force_quantum(cfg.quantum);
+        if last_quantum != Some(cfg.quantum) && pw::force_quantum(cfg.quantum) {
             last_quantum = Some(cfg.quantum);
         }
         let Some(g) = Graph::read() else {

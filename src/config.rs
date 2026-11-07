@@ -233,12 +233,30 @@ pub struct Config {
     #[serde(default)]
     pub piano: PianoCfg,
     /// Graph quantum forced by the engine (`pw-metadata clock.force-quantum`); 0 = don't force.
-    #[serde(default = "default_quantum")]
+    #[serde(default = "default_quantum", deserialize_with = "lenient_quantum")]
     pub quantum: u32,
 }
 
 fn default_quantum() -> u32 {
     256
+}
+
+/// Graph quantum from config: 0 = don't force, otherwise a power of two in 32..=2048.
+/// Anything else is normalised (or 256 with a message) so a bad value can't fail the whole load.
+pub fn normalize_quantum(v: &serde_json::Value) -> u32 {
+    match v.as_u64() {
+        Some(0) => 0,
+        Some(n) => (n.clamp(32, 2048) as u32).next_power_of_two(),
+        None => {
+            eprintln!("wavelink: config quantum {v} is invalid, using 256");
+            256
+        }
+    }
+}
+
+fn lenient_quantum<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(normalize_quantum(&v))
 }
 
 pub fn db_to_vol(db: f64) -> f64 {
@@ -275,14 +293,25 @@ impl Config {
     }
 
     pub fn load() -> Config {
-        std::fs::read(Self::path())
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_else(|| {
-                let c = Config::default_config();
-                c.save();
-                c
-            })
+        let path = Self::path();
+        let fresh = || {
+            let c = Config::default_config();
+            c.save();
+            c
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            return fresh();
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(c) => c,
+            Err(_) => {
+                // keep the user's bytes before defaults overwrite the file
+                let bad = path.with_extension("json.bad");
+                let _ = std::fs::write(&bad, &bytes);
+                eprintln!("wavelink: {} is unreadable, saved a copy to {}", path.display(), bad.display());
+                fresh()
+            }
+        }
     }
 
     pub fn save(&self) {

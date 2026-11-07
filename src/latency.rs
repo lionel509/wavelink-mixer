@@ -88,9 +88,9 @@ pub fn run(args: Vec<String>) -> i32 {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--runs" => match it.next().and_then(|v| v.parse().ok()) {
-                Some(n) => runs = n,
-                None => {
-                    eprintln!("--runs needs a number");
+                Some(n) if n > 0 => runs = n,
+                _ => {
+                    eprintln!("--runs needs a number above 0");
                     return 2;
                 }
             },
@@ -117,9 +117,9 @@ pub fn run(args: Vec<String>) -> i32 {
     };
     let game = names::ch(&channel);
     let meta = text("pw-metadata", &["-n", "settings"]);
-    let quantum = meta_value(&meta, "clock.force-quantum")
+    let quantum = pw::meta_value(&meta, "clock.force-quantum")
         .filter(|q| *q > 0)
-        .or(meta_value(&meta, "clock.quantum"))
+        .or(pw::meta_value(&meta, "clock.quantum"))
         .unwrap_or(1024);
     let dump: Value = pw::output_timeout("pw-dump", &[], Duration::from_secs(3))
         .and_then(|b| serde_json::from_slice(&b).ok())
@@ -137,7 +137,7 @@ pub fn run(args: Vec<String>) -> i32 {
     let (mut direct, mut via) = (Vec::new(), Vec::new());
     for i in 1..=runs {
         for (tag, target, out) in [("direct", hw.as_str(), &mut direct), ("via mixer", game.as_str(), &mut via)] {
-            match measure(&hw, target) {
+            match measure(&hw, target, quantum) {
                 Some(ms) => {
                     println!("{tag} run {i}: {ms:.1} ms");
                     out.push(ms);
@@ -157,12 +157,13 @@ pub fn run(args: Vec<String>) -> i32 {
 
 /// One click: record `hw`'s monitor while a click plays into `play`. Returns the delay in ms
 /// from the click's onset in the signal to its arrival at the monitor.
-fn measure(hw: &str, play: &str) -> Option<f64> {
+fn measure(hw: &str, play: &str, quantum: u64) -> Option<f64> {
+    let lat = format!("{quantum}/48000");
     let mut rec = Command::new("pw-record")
         .args([
             "--target", hw,
             "-P", "{ node.name=lat_rec node.passive=true media.class=Stream/Input/Audio stream.capture.sink=true node.dont-fallback=true }",
-            "--format", "f32", "--rate", "48000", "--channels", "2", "--latency", "256/48000", "--raw", "-",
+            "--format", "f32", "--rate", "48000", "--channels", "2", "--latency", lat.as_str(), "--raw", "-",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -202,7 +203,7 @@ fn measure(hw: &str, play: &str) -> Option<f64> {
             .args([
                 "--target", play,
                 "-P", "{ node.name=lat_play node.dont-fallback=true }",
-                "--format", "f32", "--rate", "48000", "--channels", "2", "--latency", "256/48000", "--raw", "-",
+                "--format", "f32", "--rate", "48000", "--channels", "2", "--latency", lat.as_str(), "--raw", "-",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -245,18 +246,6 @@ fn wait_frames(buf: &Mutex<Vec<f32>>, frames: usize, limit: Duration) -> bool {
 
 fn text(cmd: &str, args: &[&str]) -> String {
     pw::output_timeout(cmd, args, Duration::from_secs(3)).map(|b| String::from_utf8_lossy(&b).to_string()).unwrap_or_default()
-}
-
-/// Value of a `pw-metadata -n settings` key, e.g. `clock.quantum`.
-fn meta_value(meta: &str, key: &str) -> Option<u64> {
-    meta.lines()
-        .find(|l| l.contains(&format!("'{key}'")))?
-        .split("value:'")
-        .nth(1)?
-        .split('\'')
-        .next()?
-        .parse()
-        .ok()
 }
 
 #[cfg(test)]
