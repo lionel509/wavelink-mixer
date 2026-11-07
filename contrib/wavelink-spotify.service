@@ -1,0 +1,19 @@
+[Unit]
+Description=Wavelink mixer Spotify player (librespot, Spotify Connect device "Mixer" -> Spotify channel)
+After=wavelink-engine.service pipewire-pulse.service network-online.target
+Wants=wavelink-engine.service
+
+[Service]
+# Plays into the mixer's Spotify channel sink (ch_spotify). Credentials are cached
+# after the first connection (pick "Mixer" in any Spotify app once).
+ExecStart=%h/.local/share/wavelink/librespot/bin/librespot \
+  --name Mixer --device-type computer \
+  --backend pulseaudio --device ch_spotify \
+  --bitrate 320 --initial-volume 100 \
+  --cache %h/.cache/wavelink-librespot
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=default.target
