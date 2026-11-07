@@ -15,6 +15,11 @@ pub struct Stats {
     pub services: Vec<(&'static str, bool)>,
 }
 
+/// Stats line under the clock: the quantum is one cycle of the graph, not a latency figure.
+pub fn cycle_label(quantum: u64, rate: u64) -> String {
+    todo!()
+}
+
 fn out(cmd: &str, args: &[&str]) -> String {
     crate::pw::output_timeout(cmd, args, Duration::from_secs(3)).map(|b| String::from_utf8_lossy(&b).to_string()).unwrap_or_default()
 }
@@ -104,4 +109,16 @@ pub fn spawn(tx: Sender<Stats>) {
             std::thread::sleep(Duration::from_secs(2));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn label_says_per_cycle() {
+        let l = cycle_label(256, 48000);
+        assert!(l.ends_with("5.3 ms per cycle"), "{l}");
+        assert!(!l.contains("latency"), "{l}");
+    }
 }

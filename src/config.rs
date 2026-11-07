@@ -232,6 +232,13 @@ pub struct Config {
     pub buses: Vec<Bus>,
     #[serde(default)]
     pub piano: PianoCfg,
+    /// Graph quantum forced by the engine (`pw-metadata clock.force-quantum`); 0 = don't force.
+    #[serde(default = "default_quantum")]
+    pub quantum: u32,
+}
+
+fn default_quantum() -> u32 {
+    todo!()
 }
 
 pub fn db_to_vol(db: f64) -> f64 {
@@ -319,6 +326,7 @@ impl Config {
         };
         Config {
             piano: PianoCfg::default(),
+            quantum: 256,
             inputs: vec![
                 input("system", "System", "#8e8e93", "clean", r(&[("a1", true, 0.0), ("b1", true, -13.3)])),
                 input("spotify", "Spotify", "#1ed760", "music", r(&[("a1", true, -4.2), ("b1", true, -36.0)])),
@@ -350,4 +358,21 @@ impl Config {
 
 pub fn glib_home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_quantum_defaults_to_256() {
+        let mut v = serde_json::to_value(Config::default_config()).unwrap();
+        v.as_object_mut().unwrap().remove("quantum");
+        let c: Config = serde_json::from_value(v).unwrap();
+        assert_eq!(c.quantum, 256);
+        let mut v = serde_json::to_value(Config::default_config()).unwrap();
+        v["quantum"] = serde_json::json!(512);
+        let c: Config = serde_json::from_value(v).unwrap();
+        assert_eq!(c.quantum, 512);
+    }
 }
