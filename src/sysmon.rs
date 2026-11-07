@@ -17,7 +17,12 @@ pub struct Stats {
 
 /// Stats line under the clock: the quantum is one cycle of the graph, not a latency figure.
 pub fn cycle_label(quantum: u64, rate: u64) -> String {
-    todo!()
+    format!(
+        "{} samples · {} kHz\n{:.1} ms per cycle",
+        quantum,
+        rate as f64 / 1000.0,
+        quantum as f64 * 1000.0 / rate.max(1) as f64
+    )
 }
 
 fn out(cmd: &str, args: &[&str]) -> String {

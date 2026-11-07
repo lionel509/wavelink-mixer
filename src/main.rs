@@ -59,6 +59,9 @@ fn main() -> glib::ExitCode {
         engine::run();
         return glib::ExitCode::SUCCESS;
     }
+    if std::env::args().nth(1).as_deref() == Some("latency") {
+        std::process::exit(latency::run(std::env::args().skip(2).collect()));
+    }
     let app = adw::Application::builder().application_id("local.wavelink.Mixer").build();
     app.connect_activate(ui::activate);
     app.run_with_args::<&str>(&[])

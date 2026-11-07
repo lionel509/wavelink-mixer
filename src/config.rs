@@ -238,7 +238,7 @@ pub struct Config {
 }
 
 fn default_quantum() -> u32 {
-    todo!()
+    256
 }
 
 pub fn db_to_vol(db: f64) -> f64 {

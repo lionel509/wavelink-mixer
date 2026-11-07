@@ -136,6 +136,11 @@ fn spawn(cmd: &str, args: &[&str]) {
     let _ = Command::new(cmd).args(args).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
 }
 
+/// Forces the graph quantum (frames per cycle) through PipeWire metadata; 0 releases the force.
+pub fn force_quantum(q: u32) {
+    run("pw-metadata", &["-n", "settings", "0", "clock.force-quantum", &q.to_string()]);
+}
+
 pub fn set_volume(id: u64, v: f64) {
     spawn("wpctl", &["set-volume", &id.to_string(), &format!("{v:.4}")]);
 }
