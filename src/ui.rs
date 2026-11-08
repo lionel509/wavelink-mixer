@@ -4,7 +4,7 @@ use crate::engine::bus_fader_node;
 use crate::dash::{db_to_pos, hex_rgb, Hit, pos_to_db, screw_row, Analyzer, Fft, GrMeter, Knob, Lamp, LedMeter, Patch, PatchBay, Spectrum, Vu};
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
-use crate::pw::{self, Graph};
+use crate::pw::{self, Graph, Side};
 use adw::prelude::*;
 use gtk::{gdk, glib};
 use std::cell::{Cell, RefCell};
@@ -119,6 +119,8 @@ label.led.on { color: #1a1206; background: #ffb347; box-shadow: 0 0 6px rgba(255
 .sendcell button.route { min-width: 24px; min-height: 15px; padding: 0; font-size: 8px; }
 button.solo { min-width: 32px; min-height: 24px; padding: 0; font-weight: 700; font-size: 11px; border-radius: 6px; background: #24242a; color: #b8b8bd; }
 button.solo:checked { background: #f5c518; color: #111; }
+button.norm { min-width: 32px; min-height: 24px; padding: 0; font-weight: 700; font-size: 11px; border-radius: 6px; background: #24242a; color: #b8b8bd; }
+button.norm:checked { background: #5ac8fa; color: #111; }
 .sendval { font-size: 7px; font-weight: 700; color: #a0a0a8; font-feature-settings: "tnum"; }
 .person { background: #17171a; border: 1px solid #000; border-radius: 6px; padding: 6px 4px; }
 label.speaklight { color: #3a3a40; font-size: 12px; }
@@ -154,9 +156,18 @@ struct Fader {
     btns: gtk::Box,
     updating: Cell<bool>,
     busy: Cell<u32>,
+    /// true while auto-normalize moves the slider (its moves are not his, so they are not saved at once)
+    auto: Cell<bool>,
 }
 
 impl Fader {
+    /// Auto-normalize moves the real slider; the value-changed handler sees `auto` and does not count it as his move.
+    fn set_auto(&self, db: f64) {
+        self.auto.set(true);
+        self.scale.set_value(db_to_pos(db));
+        self.auto.set(false);
+    }
+
     fn sync(&self, g: &Graph) {
         if self.busy.get() > 0 {
             self.busy.set(self.busy.get() - 1);
@@ -189,6 +200,10 @@ struct Meter {
     last_rms: Cell<f64>,
     /// spectrum of this tap, shared with the analysers
     bands: Arc<Mutex<Vec<f32>>>,
+    /// the pw node name this tap records as (`meter_<id>.<pid>`, unique per process)
+    node: String,
+    /// L/R solo view: which side of the stereo pair this meter shows
+    side: Rc<Cell<Side>>,
 }
 impl Drop for Meter {
     fn drop(&mut self) {
@@ -204,6 +219,12 @@ impl Meter {
             db[c] = if raw.is_nan() { self.last[c].get() } else { raw };
             self.last[c].set(db[c]);
         }
+        // L/R solo: both ears get the one side (the monitor shows what is heard)
+        match self.side.get() {
+            Side::Left => db[1] = db[0],
+            Side::Right => db[0] = db[1],
+            Side::Stereo => {}
+        }
         if let Some(led) = &self.led {
             led.step(db[0], db[1], dt);
         }
@@ -218,13 +239,15 @@ impl Meter {
 }
 
 /// Meter on a sink monitor / source (`target`), or unconnected (`None`, linked manually as `name`).
-fn meter(name: &str, target: Option<(&str, bool)>, led: Option<Rc<LedMeter>>, vu: Option<Rc<Vu>>) -> Option<Meter> {
+fn meter(name: &str, target: Option<(&str, bool)>, led: Option<Rc<LedMeter>>, vu: Option<Rc<Vu>>, side: Rc<Cell<Side>>) -> Option<Meter> {
     use std::io::Read;
     if crate::dash::no_audio() {
         return None;
     }
     use std::sync::atomic::{AtomicU64, Ordering};
-    let mut props = format!("node.name={name} node.passive=true media.class=Stream/Input/Audio");
+    // a stale same-named tap from an earlier window can never take the link: every tap gets its pid
+    let node = format!("{name}.{}", std::process::id());
+    let mut props = format!("node.name={node} node.passive=true media.class=Stream/Input/Audio");
     let mut args: Vec<String> = vec![];
     match target {
         Some((t, sink)) => {
@@ -238,7 +261,10 @@ fn meter(name: &str, target: Option<(&str, bool)>, led: Option<Rc<LedMeter>>, vu
     }
     args.extend(["-P".into(), format!("{{ {props} }}"), "--format".into(), "f32".into(), "--rate".into(), "48000".into(),
                  "--channels".into(), "2".into(), "--latency".into(), "20ms".into(), "--raw".into(), "-".into()]);
-    let mut child = std::process::Command::new("pw-record")
+    // dies with this window (SIGKILL included): PDEATHSIG, see pw::die_with_parent
+    let mut cmd = std::process::Command::new("pw-record");
+    crate::pw::die_with_parent(&mut cmd);
+    let mut child = cmd
         .args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -292,7 +318,7 @@ fn meter(name: &str, target: Option<(&str, bool)>, led: Option<Rc<LedMeter>>, vu
             }
         }
     });
-    Some(Meter { child, level, led, vu, out: Rc::new(Cell::new((-90.0, -90.0))), last: [Cell::new(-90.0), Cell::new(-90.0)], rms, last_rms: Cell::new(-90.0), bands })
+    Some(Meter { child, level, led, vu, out: Rc::new(Cell::new((-90.0, -90.0))), last: [Cell::new(-90.0), Cell::new(-90.0)], rms, last_rms: Cell::new(-90.0), bands, node, side })
 }
 
 pub struct App {
@@ -316,6 +342,8 @@ pub struct App {
     /// console-page gauges/analysers (rebuilt with the strips)
     console_ticks: RefCell<Vec<Box<dyn Fn(f64)>>>,
     rack_visible: Cell<bool>,
+    /// input-level taps run on every page but the Player (nothing there shows them)
+    taps_on: Cell<bool>,
     levels: RefCell<HashMap<String, Rc<Cell<(f64, f64)>>>>,
     spectra: RefCell<HashMap<String, Arc<Mutex<Vec<f32>>>>>,
     patch: Rc<PatchBay>,
@@ -331,6 +359,17 @@ pub struct App {
     /// MIDI pickup state per controller: (engaged, last incoming 0..1, last applied 0..1)
     pickup: RefCell<HashMap<u8, (bool, f64, f64)>>,
     meter_links: RefCell<Vec<(String, String)>>,
+    /// auto-normalize state per input id (survives page switches)
+    norm: RefCell<HashMap<String, crate::norm::Channel>>,
+    /// auto moved a slider since the last save (saved at most once a minute)
+    norm_moved: Cell<bool>,
+    norm_save: Cell<f64>,
+    /// L/R solo per key ("in:<id>" or "bus:<id>"); survives page switches
+    sides: RefCell<HashMap<String, Rc<Cell<Side>>>>,
+    side_btns: RefCell<Vec<gtk::ToggleButton>>,
+    /// last (side, node ids) pushed to the graph per (out, in) link
+    side_applied: RefCell<HashMap<(String, String), (Side, u64, u64)>>,
+    side_clear: RefCell<Option<gtk::Button>>,
     apps: gtk::ListBox,
     apps_sig: RefCell<String>,
     css: gtk::CssProvider,
@@ -781,6 +820,111 @@ impl App {
         (get(format!("pre:{id}")), get(format!("post:{id}")))
     }
 
+    /// L/R solo state for a key ("in:<id>" or "bus:<id>"), created on first use.
+    fn side_cell(&self, key: &str) -> Rc<Cell<Side>> {
+        self.sides.borrow_mut().entry(key.to_string()).or_insert_with(|| Rc::new(Cell::new(Side::Stereo))).clone()
+    }
+
+    /// A manual fader move: his position wins, and auto-normalize pauses and keeps it as a preference.
+    fn fader_manual(&self, node: &str, db: f64) {
+        let id = self.cfg.borrow().inputs.iter().find(|i| names::strip_in(&i.id) == node).map(|i| i.id.clone());
+        if let Some(id) = id {
+            if let Some(c) = self.norm.borrow_mut().get_mut(&id) {
+                c.manual(db);
+            }
+        }
+    }
+
+    /// The L/R buttons for one meter key (input or bus); they rewire the outputs when pressed.
+    fn side_row(self: &Rc<Self>, key: String) -> gtk::Box {
+        let cell = self.side_cell(&key);
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        row.set_halign(gtk::Align::Center);
+        let l_btn = gtk::ToggleButton::with_label("L");
+        let r_btn = gtk::ToggleButton::with_label("R");
+        for b in [&l_btn, &r_btn] {
+            b.add_css_class("solo");
+            b.add_css_class("side");
+        }
+        l_btn.set_tooltip_text(Some("Solo left side: hear L in both ears on the headphone/speaker buses (stream buses untouched; temporary)"));
+        r_btn.set_tooltip_text(Some("Solo right side: hear R in both ears on the headphone/speaker buses (stream buses untouched; temporary)"));
+        l_btn.set_active(cell.get() == Side::Left);
+        r_btn.set_active(cell.get() == Side::Right);
+        let guard = Rc::new(Cell::new(false));
+        for (me, other, mine, theirs) in [(&l_btn, &r_btn, Side::Left, Side::Right), (&r_btn, &l_btn, Side::Right, Side::Left)] {
+            let (other2, cell2, guard2, app) = (other.clone(), cell.clone(), guard.clone(), Rc::downgrade(self));
+            me.connect_toggled(move |b| {
+                if guard2.get() {
+                    return;
+                }
+                if b.is_active() {
+                    guard2.set(true);
+                    other2.set_active(false);
+                    guard2.set(false);
+                }
+                cell2.set(if b.is_active() { mine } else if other2.is_active() { theirs } else { Side::Stereo });
+                if let Some(app) = app.upgrade() {
+                    let g = app.graph.borrow();
+                    app.apply_sides(&g);
+                }
+            });
+        }
+        row.append(&l_btn);
+        row.append(&r_btn);
+        self.side_btns.borrow_mut().push(l_btn);
+        self.side_btns.borrow_mut().push(r_btn);
+        row
+    }
+
+    /// Desired (out node, in node, side) for every input x hardware bus. A bus solo overrides the channel solo for that bus.
+    fn desired_sides(&self) -> Vec<(String, String, Side)> {
+        let (ins, buses) = {
+            let c = self.cfg.borrow();
+            (c.inputs.clone(), c.buses.clone())
+        };
+        let mut out = vec![];
+        for i in &ins {
+            for b in &buses {
+                if !matches!(b.kind, BusKind::Hardware { .. }) {
+                    continue;
+                }
+                let bs = self.side_cell(&format!("bus:{}", b.id)).get();
+                let side = if bs != Side::Stereo { bs } else { self.side_cell(&format!("in:{}", i.id)).get() };
+                out.push((names::strip(&i.id), names::route_in(&i.id, &b.id), side));
+            }
+        }
+        out
+    }
+
+    /// Rewire the hardware-bus links whose side changed. Links only: no node, no latency. Off the GTK thread.
+    fn apply_sides(&self, g: &Graph) {
+        let mut work = vec![];
+        for (o, i, s) in self.desired_sides() {
+            let (Some(a), Some(b)) = (g.node(&o), g.node(&i)) else { continue };
+            let (a_id, b_id) = (a.id, b.id);
+            let cur = self.side_applied.borrow().get(&(o.clone(), i.clone())).copied();
+            if cur.is_none() && s == Side::Stereo {
+                self.side_applied.borrow_mut().insert((o, i), (s, a_id, b_id));
+                continue;
+            }
+            if cur != Some((s, a_id, b_id)) {
+                self.side_applied.borrow_mut().insert((o.clone(), i.clone()), (s, a_id, b_id));
+                work.push((o, i, s));
+            }
+        }
+        if !work.is_empty() {
+            std::thread::spawn(move || {
+                for (o, i, s) in work {
+                    pw::link_side(&o, &i, s);
+                }
+            });
+        }
+        let any = self.sides.borrow().values().any(|c| c.get() != Side::Stereo);
+        if let Some(btn) = self.side_clear.borrow().as_ref() {
+            btn.set_visible(any);
+        }
+    }
+
     /// Apply solo: while anything is soloed, every other input is muted live (config untouched).
     fn apply_solo(&self) {
         let solo = self.solo.borrow().clone();
@@ -915,7 +1059,7 @@ impl App {
         if let Some(m) = &mute {
             btns.append(m);
         }
-        let f = Rc::new(Fader { node: RefCell::new(node), scale, label: lab, mute, btns, updating: Cell::new(false), busy: Cell::new(0) });
+        let f = Rc::new(Fader { node: RefCell::new(node), scale, label: lab, mute, btns, updating: Cell::new(false), busy: Cell::new(0), auto: Cell::new(false) });
         // double-click the dB label area resets to 0 dB
         let gest = gtk::GestureClick::new();
         let fw = Rc::downgrade(&f);
@@ -952,8 +1096,14 @@ impl App {
             }
             f.busy.set(6);
             apply(&app, db);
-            app.mark_dirty();
             let node = f.node.borrow().clone();
+            if f.auto.get() {
+                // auto moves are not his: saved at most once a minute (W8)
+                app.norm_moved.set(true);
+            } else {
+                app.mark_dirty();
+                app.fader_manual(&node, db);
+            }
             if let Some(id) = app.node_id(&node) {
                 pw::set_volume(id, db_to_vol(db));
             }
@@ -1090,10 +1240,11 @@ impl App {
         strip.append(&lights_btn);
         {
             let (w, id2, last) = (Rc::downgrade(self), id.clone(), Cell::new(255u8));
+            let bits_of = |r: &config::Rack| [r.pre_on, r.gate_on, r.comp_on, r.exc_on].iter().enumerate().fold(0u8, |b, (k, on)| b | ((*on as u8) << k));
             self.console_ticks.borrow_mut().push(Box::new(move |_| {
                 let Some(app) = w.upgrade() else { return };
-                let r = app.cfg.borrow().inputs.iter().find(|i| i.id == id2).map(|i| i.rack.clone()).unwrap_or_default();
-                let bits = [r.pre_on, r.gate_on, r.comp_on, r.exc_on].iter().enumerate().fold(0u8, |b, (k, on)| b | ((*on as u8) << k));
+                // read the flags in place: no Rack clone on every frame
+                let bits = app.cfg.borrow().inputs.iter().find(|i| i.id == id2).map(|i| bits_of(&i.rack)).unwrap_or_else(|| bits_of(&Default::default()));
                 if bits != last.get() {
                     last.set(bits);
                     for (k, l) in leds.iter().enumerate() {
@@ -1114,7 +1265,7 @@ impl App {
             InputKind::Virtual => (names::ch(&id), true),
             InputKind::Source { target } => (target.clone(), false),
         };
-        if let Some(m) = meter(&format!("meter_pre_{id}"), Some((&pre_node, pre_sink)), Some(in_led.clone()), None) {
+        if let Some(m) = self.taps_on.get().then(|| meter(&format!("meter_pre_{id}"), Some((&pre_node, pre_sink)), Some(in_led.clone()), None, self.side_cell(&format!("in:{id}")))).flatten() {
             self.levels.borrow_mut().insert(format!("pre:{id}"), m.out.clone());
             self.spectra.borrow_mut().insert(format!("pre:{id}"), m.bands.clone());
             self.meters.borrow_mut().push(m);
@@ -1127,11 +1278,11 @@ impl App {
         row.set_halign(gtk::Align::Center);
         row.set_vexpand(true);
         let meter_name = format!("meter_{id}");
-        if let Some(m) = meter(&meter_name, None, Some(led.clone()), Some(vu.clone())) {
+        if let Some(m) = self.taps_on.get().then(|| meter(&meter_name, None, Some(led.clone()), Some(vu.clone()), self.side_cell(&format!("in:{id}")))).flatten() {
             self.levels.borrow_mut().insert(format!("post:{id}"), m.out.clone());
             self.spectra.borrow_mut().insert(format!("post:{id}"), m.bands.clone());
+            self.meter_links.borrow_mut().push((names::strip(&id), m.node.clone()));
             self.meters.borrow_mut().push(m);
-            self.meter_links.borrow_mut().push((names::strip(&id), meter_name));
         }
         // compressor GR needle + gate lamp, then the mini before/after analyser
         let gr_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -1159,6 +1310,20 @@ impl App {
             move |a, db| a.cfg.borrow_mut().inputs.iter_mut().find(|i| i.id == i1).unwrap().gain_db = db,
             move |a, m| a.cfg.borrow_mut().inputs.iter_mut().find(|i| i.id == i2).unwrap().mute = m,
         );
+        // auto-normalize: the IN tap's pre-fader RMS drives the real slider (no extra tap)
+        if inp.normalize && !self.norm.borrow().contains_key(&id) {
+            self.norm.borrow_mut().insert(id.clone(), crate::norm::Channel::new(inp.gain_db));
+        }
+        if let Some(pre) = self.levels.borrow().get(&format!("pre:{id}")).cloned() {
+            let (w, id2, fw) = (Rc::downgrade(self), id.clone(), Rc::downgrade(&fader_rc));
+            self.console_ticks.borrow_mut().push(Box::new(move |dt| {
+                let (Some(app), Some(f)) = (w.upgrade(), fw.upgrade()) else { return };
+                let g = app.norm.borrow_mut().get_mut(&id2).and_then(|c| c.step(pre.get().1, dt));
+                if let Some(g) = g {
+                    f.set_auto(g);
+                }
+            }));
+        }
         // IN meter | fader | OUT meter, each meter labelled underneath and kept
         // clear of the dB readout + mute button below the fader slot
         let meter_col = |m: &Rc<LedMeter>, t: &str| {
@@ -1166,6 +1331,8 @@ impl App {
             col.set_margin_top(8);
             col.set_margin_bottom(52);
             m.area.set_vexpand(true);
+            // centred: the OUT label is wider than the 18 px meter, and a filling child would widen its bars
+            m.area.set_halign(gtk::Align::Center);
             col.append(&m.area);
             col.append(&label(t, "small"));
             col
@@ -1174,6 +1341,7 @@ impl App {
         row.append(&fb);
         row.append(&meter_col(&led, "OUT"));
         strip.append(&row);
+        strip.append(&self.side_row(format!("in:{id}")));
 
         // sends: one boxed cell per bus — on/off button on top, its level knob, then the level
         let grid = gtk::Grid::builder().column_spacing(2).row_spacing(0).halign(gtk::Align::Center).build();
@@ -1195,7 +1363,7 @@ impl App {
             };
             show(r.on, r.level_db);
             let (app, iid, bid, show2, t2) = (self.clone(), id.clone(), b.id.clone(), show.clone(), t.clone());
-            let knob = Knob::ranged(24, db_to_pos(r.level_db), 0.0, 1.0, db_to_pos(0.0), 0.005, move |p| {
+            let knob = Knob::ranged(28, db_to_pos(r.level_db), 0.0, 1.0, db_to_pos(0.0), 0.005, move |p| {
                 let db = pos_to_db(p);
                 let db = if db.abs() < 0.25 { 0.0 } else { (db * 10.0).round() / 10.0 };
                 {
@@ -1211,6 +1379,7 @@ impl App {
             });
             knob.area.set_tooltip_text(Some(&format!("Send level to {} · drag/scroll · double-click = 0 dB", b.name)));
             knob.area.set_opacity(if r.on { 1.0 } else { 0.35 });
+            knob.enable_halo();
             cell.append(&knob.area);
             cell.append(&val);
             // visuals follow the switch however it changes (click or live sync)
@@ -1224,6 +1393,17 @@ impl App {
                 });
             }
             self.send_knobs.borrow_mut().insert((id.clone(), b.id.clone()), knob.clone());
+            // send halo: the post-strip peak plus this send's level, on the frame tick
+            if let Some(post) = self.levels.borrow().get(&format!("post:{id}")).cloned() {
+                let (w, iid, bid, k) = (Rc::downgrade(self), id.clone(), b.id.clone(), Rc::downgrade(&knob));
+                self.console_ticks.borrow_mut().push(Box::new(move |dt| {
+                    let (Some(app), Some(k)) = (w.upgrade(), k.upgrade()) else { return };
+                    let r = app.cfg.borrow().inputs.iter().find(|i| i.id == iid).map(|i| i.route(&bid));
+                    if let Some(r) = r {
+                        k.halo_step(crate::dash::send_db(post.get().0, r.on, r.level_db), dt);
+                    }
+                }));
+            }
             self.knobs.borrow_mut().push(knob);
             let guard = Rc::new(Cell::new(false));
             let (app, iid, bid, g2) = (self.clone(), id.clone(), b.id.clone(), guard.clone());
@@ -1262,6 +1442,31 @@ impl App {
             });
             fader_rc.btns.append(&solo_btn);
             self.solo_btns.borrow_mut().insert(id.clone(), solo_btn.clone());
+            // N (auto-normalize): on = the slider drifts to even loudness; saved with the input
+            let n_btn = gtk::ToggleButton::with_label("N");
+            n_btn.add_css_class("norm");
+            n_btn.set_tooltip_text(Some("Auto-normalize: moves this slider to keep the channel at an even loudness (saved)"));
+            n_btn.set_active(inp.normalize);
+            {
+                let (app, id2) = (self.clone(), id.clone());
+                n_btn.connect_toggled(move |b| {
+                    let on = b.is_active();
+                    {
+                        let mut c = app.cfg.borrow_mut();
+                        if let Some(i) = c.inputs.iter_mut().find(|i| i.id == id2) {
+                            i.normalize = on;
+                        }
+                    }
+                    app.mark_dirty();
+                    let g = app.cfg.borrow().inputs.iter().find(|i| i.id == id2).map(|i| i.gain_db).unwrap_or(0.0);
+                    if on {
+                        app.norm.borrow_mut().insert(id2.clone(), crate::norm::Channel::new(g));
+                    } else {
+                        app.norm.borrow_mut().remove(&id2);
+                    }
+                });
+            }
+            fader_rc.btns.append(&n_btn);
         }
         strip.append(&screw_row());
         strip.set_size_request(140, -1);
@@ -1393,7 +1598,9 @@ impl App {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         row.set_halign(gtk::Align::Center);
         row.set_vexpand(true);
-        if let Some(m) = meter(&format!("meter_bus_{}", bus.id), Some((&names::bus(&bus.id), true)), Some(led.clone()), Some(vu.clone())) {
+        if let Some(m) = meter(&format!("meter_bus_{}", bus.id), Some((&names::bus(&bus.id), true)), Some(led.clone()), Some(vu.clone()), self.side_cell(&format!("bus:{}", bus.id))) {
+            // the bottom spectrum reads this tap's bands (bus taps run on every page)
+            self.spectra.borrow_mut().insert(format!("bus:{}", names::bus(&bus.id)), m.bands.clone());
             self.meters.borrow_mut().push(m);
         }
         let (b1, b2) = (bus.id.clone(), bus.id.clone());
@@ -1410,6 +1617,10 @@ impl App {
         led.area.set_margin_bottom(66);
         row.append(&led.area);
         strip.append(&row);
+        // L/R solo only on the hardware outputs (headphones, speakers); the stream buses never change
+        if matches!(bus.kind, BusKind::Hardware { .. }) {
+            strip.append(&self.side_row(format!("bus:{}", bus.id)));
+        }
         strip.append(&screw_row());
         strip.set_size_request(130, -1);
         strip
@@ -1545,6 +1756,7 @@ impl App {
                     routes,
                     default_sink: false,
                     rack: config::Rack::default(),
+                    normalize: false,
                 });
             }
             entry.set_text("");
@@ -1622,6 +1834,22 @@ impl App {
         self.spectra.borrow_mut().clear();
         self.console_ticks.borrow_mut().clear();
         self.meter_links.borrow_mut().clear();
+        self.side_btns.borrow_mut().clear();
+        self.side_clear.borrow_mut().take();
+        // auto-normalize's save, once a minute (W8): auto moves never write config per tick
+        {
+            let w = Rc::downgrade(self);
+            self.console_ticks.borrow_mut().push(Box::new(move |dt| {
+                let Some(app) = w.upgrade() else { return };
+                app.norm_save.set(app.norm_save.get() + dt);
+                if app.norm_save.get() >= 60.0 {
+                    app.norm_save.set(0.0);
+                    if app.norm_moved.replace(false) {
+                        app.mark_dirty();
+                    }
+                }
+            }));
+        }
         let mut css = String::new();
 
         let ins = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -1641,11 +1869,33 @@ impl App {
         sep.set_margin_start(6);
         sep.set_margin_end(6);
         let outs = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        outs.append(&{
+        // OUTPUTS header with the one-click clear for every L/R solo (shown only while one is set)
+        let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        head.append(&{
             let l = label("OUTPUTS", "section");
             l.set_xalign(0.0);
             l
         });
+        let clr = gtk::Button::with_label("L/R SOLO OFF");
+        clr.add_css_class("solo");
+        let any_side = self.sides.borrow().values().any(|c| c.get() != Side::Stereo);
+        clr.set_visible(any_side);
+        {
+            let w = Rc::downgrade(self);
+            clr.connect_clicked(move |_| {
+                let Some(app) = w.upgrade() else { return };
+                for c in app.sides.borrow().values() {
+                    c.set(Side::Stereo);
+                }
+                for b in app.side_btns.borrow().iter() {
+                    b.set_active(false);
+                }
+                app.apply_sides(&app.graph.borrow());
+            });
+        }
+        head.append(&clr);
+        *self.side_clear.borrow_mut() = Some(clr);
+        outs.append(&head);
         let row2 = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         row2.set_vexpand(true);
         let n_b = self.cfg.borrow().buses.len();
@@ -1670,6 +1920,7 @@ impl App {
         self.rebuild_rack();
         let g = self.graph.borrow().clone();
         self.sync(&g);
+        crate::leak::EXPECTED_TAPS.store(self.meters.borrow().len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// One 19" rack row per input: nameplate, preamp, gate, compressor, exciter, 12-band EQ.
@@ -1741,12 +1992,17 @@ impl App {
                 }
             }
         }
+        // meters whose strip and tap both exist but are not linked: the leak watch warns after two scans
+        let mut unlinked = 0u64;
         for (out, inp) in self.meter_links.borrow().iter() {
             if g.has(out) && g.has(inp) && !g.linked(out, inp) {
+                unlinked += 1;
                 let (o, i) = (out.clone(), inp.clone());
                 std::thread::spawn(move || pw::link(&o, &i));
             }
         }
+        crate::leak::UNLINKED.store(unlinked, std::sync::atomic::Ordering::Relaxed);
+        self.apply_sides(g);
         self.sync_apps(g);
         self.sync_patch(g);
     }
@@ -2009,7 +2265,8 @@ pub fn activate(app: &adw::Application) {
     sys_panel.add_css_class("syspanel");
     sys_panel.append(&label_x("SYSTEM"));
     let sys_top = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    let cpu_dial = crate::dash::Dial::new(124, "AUDIO CPU %", 100.0, 70.0);
+    let cpu_dial = crate::dash::Dial::new(124, "AUDIO CPU", 100.0, 70.0);
+    cpu_dial.area.set_tooltip_text(Some(&format!("pipewire + pipewire-pulse + wireplumber + mixer engine + its pipewire, as % of ONE CPU core (100% = one full core; this PC has {} cores). The mixer window itself is under LEAK WATCH.", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))));
     let fd_dial = crate::dash::Dial::new(124, "PIPEWIRE FILES", 1024.0, 820.0);
     sys_top.append(&cpu_dial.area);
     sys_top.append(&fd_dial.area);
@@ -2024,40 +2281,59 @@ pub fn activate(app: &adw::Application) {
     sys_info.append(&clock_lbl);
     sys_info.append(&label_x("DROPOUT WARNINGS"));
     sys_info.append(&warn_lbl);
+    let leak_lbl = label("", "sysbig");
+    leak_lbl.set_xalign(0.0);
+    sys_info.append(&label_x("LEAK WATCH"));
+    sys_info.append(&leak_lbl);
     sys_top.append(&sys_info);
     sys_panel.append(&sys_top);
     sys_panel.append(&lights_row);
     {
         let (stx, srx) = std::sync::mpsc::channel::<crate::sysmon::Stats>();
         crate::sysmon::spawn(stx);
-        let (cd, fdd, cl, wl, lr) = (cpu_dial.clone(), fd_dial.clone(), clock_lbl.clone(), warn_lbl.clone(), lights_row.clone());
+        let (cd, fdd, cl, wl, lr, lk) = (cpu_dial.clone(), fd_dial.clone(), clock_lbl.clone(), warn_lbl.clone(), lights_row.clone(), leak_lbl.clone());
         // needles animate on the frame clock (never starves redraws); data arrives every 2 s
         {
             let (cd2, fd2) = (cpu_dial.clone(), fd_dial.clone());
             let last = Cell::new(0i64);
+            let cap = crate::dash::FrameCap::new();
             cpu_dial.area.add_tick_callback(move |_, clock| {
                 let now = clock.frame_time();
                 let prev = last.replace(now);
-                let dt = if prev == 0 { 0.016 } else { ((now - prev) as f64 / 1e6).clamp(0.001, 0.1) };
+                let raw = if prev == 0 { 0.016 } else { ((now - prev) as f64 / 1e6).clamp(0.001, 0.1) };
+                let Some(dt) = cap.tick(raw) else { return glib::ControlFlow::Continue };
+                let dt = dt.clamp(0.001, 0.1);
                 cd2.step(dt);
                 fd2.step(dt);
                 glib::ControlFlow::Continue
             });
         }
+        // the services row is rebuilt only when a service changes state (it was rebuilt every tick)
+        let last_svc: RefCell<Vec<(&'static str, bool)>> = RefCell::new(vec![]);
         glib::timeout_add_local(Duration::from_millis(250), move || {
             while let Ok(st) = srx.try_recv() {
-                cd.set(st.cpu, &format!("{:.1}%", st.cpu));
+                cd.set(st.cpu, &format!("{:.0}% of 1 core", st.cpu));
                 fdd.set(st.fds as f64 * 1024.0 / st.fd_limit.max(1) as f64, &format!("{} / {}", st.fds, st.fd_limit));
                 cl.set_label(&crate::sysmon::cycle_label(st.quantum, st.rate));
                 wl.set_label(&format!("{}", st.warnings));
                 if st.warnings > 0 { wl.add_css_class("warn") } else { wl.remove_css_class("warn") }
-                while let Some(c) = lr.first_child() {
-                    lr.remove(&c);
-                }
-                for (name, ok) in &st.services {
-                    let l = label(&format!("● {name}"), "svc");
-                    l.add_css_class(if *ok { "ok" } else { "bad" });
-                    lr.append(&l);
+                lk.set_label(&format!("{}/{} taps · {} zombies\n{} MB · {:.0}% of 1 core", st.gui.taps, st.expected_taps, st.gui.zombies + st.engine.zombies, st.gui.rss_kb / 1024, st.gui_cpu));
+                if st.leaks.is_empty() { lk.remove_css_class("warn") } else { lk.add_css_class("warn") }
+                lk.set_tooltip_text(Some(&format!(
+                    "Window: {:.0}% of 1 core · {} MB · {} files · {} threads · {} zombies · {}/{} taps\nEngine: {} MB · {} files · {} threads · {} zombies\n{}",
+                    st.gui_cpu, st.gui.rss_kb / 1024, st.gui.fds, st.gui.threads, st.gui.zombies, st.gui.taps, st.expected_taps,
+                    st.engine.rss_kb / 1024, st.engine.fds, st.engine.threads, st.engine.zombies,
+                    if st.leaks.is_empty() { "No leaks seen".to_string() } else { st.leaks.join("\n") })));
+                if *last_svc.borrow() != st.services {
+                    *last_svc.borrow_mut() = st.services.clone();
+                    while let Some(c) = lr.first_child() {
+                        lr.remove(&c);
+                    }
+                    for (name, ok) in &st.services {
+                        let l = label(&format!("● {name}"), "svc");
+                        l.add_css_class(if *ok { "ok" } else { "bad" });
+                        lr.append(&l);
+                    }
                 }
             }
             glib::ControlFlow::Continue
@@ -2105,6 +2381,7 @@ pub fn activate(app: &adw::Application) {
         rack_ticks: RefCell::new(vec![]),
         console_ticks: RefCell::new(vec![]),
         rack_visible: Cell::new(false),
+        taps_on: Cell::new(true),
         levels: RefCell::new(HashMap::new()),
         spectra: RefCell::new(HashMap::new()),
         patch: patch.clone(),
@@ -2115,6 +2392,13 @@ pub fn activate(app: &adw::Application) {
         send_knobs: RefCell::new(HashMap::new()),
         pickup: RefCell::new(HashMap::new()),
         meter_links: RefCell::new(vec![]),
+        norm: RefCell::new(HashMap::new()),
+        norm_moved: Cell::new(false),
+        norm_save: Cell::new(0.0),
+        sides: RefCell::new(HashMap::new()),
+        side_btns: RefCell::new(vec![]),
+        side_applied: RefCell::new(HashMap::new()),
+        side_clear: RefCell::new(None),
         apps,
         apps_sig: RefCell::new(String::new()),
         css: dynamic,
@@ -2193,12 +2477,14 @@ pub fn activate(app: &adw::Application) {
         let st = st.clone();
         pages.connect_visible_child_name_notify(move |p| {
             st.rack_visible.set(p.visible_child_name().as_deref() == Some("rack"));
+            st.taps_on.set(p.visible_child_name().as_deref() != Some("player"));
             let st = st.clone();
             glib::idle_add_local_once(move || st.rebuild());
         });
     }
     if let Ok(v) = std::env::var("MIXER_VIEW") {
         st.rack_visible.set(v == "rack");
+        st.taps_on.set(v != "player");
         pages.set_visible_child_name(&v);
         st.rebuild();
     }
@@ -2216,10 +2502,14 @@ pub fn activate(app: &adw::Application) {
     // animate needles and spectrum on the frame clock (never starves redraws, pauses when hidden)
     let (st3, sp3) = (st.clone(), spectrum.clone());
     let last_frame = Cell::new(0i64);
+    // meters and the spectrum animate at 30 Hz, not at the refresh rate
+    let cap = crate::dash::FrameCap::new();
     win.add_tick_callback(move |_, clock| {
         let now = clock.frame_time();
         let prev = last_frame.replace(now);
-        let dt = if prev == 0 { 0.016 } else { ((now - prev) as f64 / 1e6).clamp(0.001, 0.05) };
+        let raw = if prev == 0 { 0.016 } else { ((now - prev) as f64 / 1e6).clamp(0.001, 0.1) };
+        let Some(dt) = cap.tick(raw) else { return glib::ControlFlow::Continue };
+        let dt = dt.clamp(0.001, 0.05);
         for m in st3.meters.borrow().iter() {
             m.tick(dt);
         }
@@ -2232,7 +2522,9 @@ pub fn activate(app: &adw::Application) {
         for t in st3.console_ticks.borrow().iter() {
             t(dt);
         }
-        sp3.step(dt);
+        // the bottom spectrum reads the bus tap's bands (no pw-record of its own)
+        let src = st3.spectra.borrow().get(&format!("bus:{}", sp3.target())).cloned();
+        sp3.step(dt, src.as_ref());
         glib::ControlFlow::Continue
     });
     let (st2, ww) = (st.clone(), win.downgrade());
@@ -2244,7 +2536,20 @@ pub fn activate(app: &adw::Application) {
                 st2.solo.borrow_mut().clear();
                 st2.apply_solo();
             }
+            // L/R solo: put both ears back before exit (synchronous, a few pw-link runs), so a clean close never leaves the headphones mono
+            for c in st2.sides.borrow().values() {
+                c.set(Side::Stereo);
+            }
+            for (o, i, s) in st2.desired_sides() {
+                if st2.side_applied.borrow().get(&(o.clone(), i.clone())).map(|r| r.0).unwrap_or(Side::Stereo) != Side::Stereo {
+                    pw::link_side(&o, &i, s);
+                }
+            }
             st2.meters.borrow_mut().clear();
+            crate::leak::EXPECTED_TAPS.store(0, std::sync::atomic::Ordering::Relaxed);
+            if st2.norm_moved.get() {
+                st2.dirty.set(true);
+            }
             if st2.dirty.get() {
                 st2.cfg.borrow().save();
             }
