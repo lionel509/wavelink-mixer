@@ -458,6 +458,20 @@ fn still_allowed(allowed: &Mutex<Vec<(String, String)>>, id: &str) -> bool {
     allowed.lock().map(|v| v.iter().any(|(a, _)| a == id)).unwrap_or(false)
 }
 
+/// True once the client has closed its end. A peek sees the FIN without consuming any bytes.
+fn peer_closed(s: &TcpStream) -> bool {
+    if s.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let closed = match s.peek(&mut [0u8; 1]) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => !matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted),
+    };
+    let _ = s.set_nonblocking(false);
+    closed
+}
+
 fn serve(l: TcpListener, allowed: Arc<Mutex<Vec<(String, String)>>>, stop: Arc<AtomicBool>) {
     if l.set_nonblocking(true).is_err() {
         return;
@@ -516,21 +530,38 @@ fn handle(mut s: TcpStream, allowed: &Mutex<Vec<(String, String)>>) -> std::io::
     let res = match child.stdout.take() {
         None => Ok(()),
         Some(mut out) => {
-            let mut b = [0u8; 4096];
+            // A reader thread hands the tap's bytes over, so this loop wakes up every 500 ms even
+            // when the tap is silent and can check the bus and the client socket.
+            let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+            std::thread::spawn(move || {
+                let mut b = [0u8; 4096];
+                loop {
+                    match out.read(&mut b) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if tx.send(b[..n].to_vec()).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+            });
             let mut last = Instant::now();
             loop {
-                let n = match out.read(&mut b) {
-                    Ok(0) => break Ok(()),
-                    Ok(n) => n,
-                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                    Err(e) => break Err(e),
-                };
-                if let Err(e) = s.write_all(&b[..n]) {
-                    break Err(e);
+                match rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(chunk) => {
+                        if let Err(e) = s.write_all(&chunk) {
+                            break Err(e);
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break Ok(()),
                 }
-                if last.elapsed() >= Duration::from_secs(1) {
+                if last.elapsed() >= Duration::from_millis(500) {
                     last = Instant::now();
-                    if !still_allowed(allowed, &id) {
+                    if !still_allowed(allowed, &id) || peer_closed(&s) {
                         break Ok(());
                     }
                 }
