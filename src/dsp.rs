@@ -137,12 +137,19 @@ pub fn resample(pcm: &[f32], from: u32, to: u32) -> Vec<f32> {
     out
 }
 
+/// Absolute spectral-flux floor, in amplitude units (see `onsets`). Below it nothing is an onset.
+pub const ONSET_FLOOR: f32 = 0.01;
+
 /// Spectral-flux onsets as (time in seconds, strength 0..1).
+/// Frames are unpadded, `N` long with hop `H`. Magnitudes are in amplitude units, so a steady sine of
+/// amplitude A reads A on a bin centre. `ONSET_FLOOR` makes the peak rules absolute: relative rules
+/// alone turn float jitter on a steady tone into onsets.
 pub fn onsets(mono: &[f32], rate: usize) -> Vec<(f64, f32)> {
     const N: usize = 1024;
     const H: usize = 256;
     const MIN_GAP_S: f64 = 0.05;
     let win = hann(N);
+    let win_sum: f32 = win.iter().sum();
     let bins = N / 2 + 1;
     let nfr = if mono.len() < N { 0 } else { 1 + (mono.len() - N) / H };
     let mut prev = vec![0f32; bins];
@@ -151,7 +158,9 @@ pub fn onsets(mono: &[f32], rate: usize) -> Vec<(f64, f32)> {
         let mut re: Vec<f32> = (0..N).map(|j| mono[i * H + j] * win[j]).collect();
         let mut im = vec![0f32; N];
         crate::dash::fft(&mut re, &mut im);
-        let mag: Vec<f32> = (0..bins).map(|k| (re[k] * re[k] + im[k] * im[k]).sqrt()).collect();
+        let mag: Vec<f32> = (0..bins)
+            .map(|k| 2.0 * (re[k] * re[k] + im[k] * im[k]).sqrt() / win_sum)
+            .collect();
         if i > 0 {
             sf[i] = mag.iter().zip(&prev).map(|(a, b)| (a - b).max(0.0)).sum();
         }
@@ -162,14 +171,16 @@ pub fn onsets(mono: &[f32], rate: usize) -> Vec<(f64, f32)> {
         return Vec::new();
     }
     let mut out: Vec<(f64, f32)> = Vec::new();
-    for i in 0..nfr {
-        // Frame 0 rises from silence, so it can be a peak; the last frame has no successor.
-        let before = if i > 0 { sf[i - 1] } else { 0.0 };
-        let after = if i + 1 < nfr { sf[i + 1] } else { 0.0 };
+    // Frame 0 has no previous frame and is never an onset; the last frame has no successor.
+    for i in 1..nfr.saturating_sub(1) {
         let lo = i.saturating_sub(8);
         let hi = (i + 8).min(nfr - 1);
         let mean = sf[lo..=hi].iter().sum::<f32>() / (hi - lo + 1) as f32;
-        let is_peak = sf[i] > before && sf[i] >= after && sf[i] >= 1.5 * mean && sf[i] > 0.05 * max;
+        let is_peak = sf[i] > sf[i - 1]
+            && sf[i] >= sf[i + 1]
+            && sf[i] >= 1.5 * mean
+            && sf[i] > 0.05 * max
+            && sf[i] >= ONSET_FLOOR;
         if !is_peak {
             continue;
         }
