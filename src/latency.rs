@@ -368,6 +368,14 @@ mod tests {
     }
 
     #[test]
+    fn summary_noise_line_hidden_when_rounded_medians_equal() {
+        let p = summary(&[37.34; 3], &[37.31; 3], 10.0);
+        assert!(p.contains("added by mixer: 0.0 ms\n"), "{p}");
+        assert!(!p.contains("below measurement noise"), "{p}");
+        assert!(p.contains("total game → ears ≈ 10.0 ms"), "{p}");
+    }
+
+    #[test]
     fn run_rejects_zero_runs() {
         assert_eq!(run(vec!["--runs".into(), "0".into()]), 2);
     }
