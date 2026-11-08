@@ -48,22 +48,39 @@ impl Channel {
         }
     }
 
-    pub fn resume(gain_db: f64, _base: Option<f64>, _out: Option<f64>) -> Channel {
-        Channel::untouched(gain_db)
-    }
-
-    pub fn saved(&self) -> (Option<f64>, Option<f64>) {
-        (None, None)
-    }
-
-    pub fn pause(&mut self) {}
-
-    pub fn new(gain_db: f64) -> Channel {
-        Channel {
-            gain: gain_db, base: 0.0, out: TARGET_DB, pending: false, loud: None,
-            acc: 0.0, wsum: 0.0, facc: 0.0, fwsum: 0.0, heard: 0.0, quiet: 0.0,
-            hold: 0.0, since_emit: MIN_EMIT_S, emitted: gain_db,
+    /// App start: the saved slider (`gain_db`) plus his saved position/level. `base` None = a config from
+    /// before #7 round 4: a nonzero slider counts as his position (pending), 0.0 as untouched.
+    pub fn resume(gain_db: f64, base: Option<f64>, out: Option<f64>) -> Channel {
+        let mut c = Channel::untouched(gain_db);
+        let Some(b) = base.or((gain_db != 0.0).then_some(gain_db)) else { return c };
+        c.base = b.clamp(FADER_MIN_DB, FADER_MAX_DB);
+        match out.filter(|_| base.is_some()) {
+            Some(o) => c.out = o,
+            None => c.pending = true,
         }
+        c
+    }
+
+    /// What a restart needs (the ui copies it into config): his position, and his level once anchored.
+    pub fn saved(&self) -> (Option<f64>, Option<f64>) {
+        (Some(self.base), (!self.pending).then_some(self.out))
+    }
+
+    /// N off: forget the loudness (stale by the time N is back on); keep his position, his level and a running hold.
+    pub fn pause(&mut self) {
+        self.loud = None;
+        self.acc = 0.0;
+        self.wsum = 0.0;
+        self.facc = 0.0;
+        self.fwsum = 0.0;
+        self.heard = 0.0;
+        self.quiet = 0.0;
+    }
+
+    /// A slider he set to `gain_db` whose level isn't anchored yet (tests model the ui's restart path with it).
+    #[cfg(test)]
+    pub fn new(gain_db: f64) -> Channel {
+        Channel::resume(gain_db, Some(gain_db), None)
     }
 
     pub fn loud_db(&self) -> Option<f64> {

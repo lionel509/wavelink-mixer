@@ -826,12 +826,22 @@ impl App {
         self.sides.borrow_mut().entry(key.to_string()).or_insert_with(|| Rc::new(Cell::new(Side::Stereo))).clone()
     }
 
-    /// A manual fader move: his position wins, and auto-normalize pauses and keeps it as a preference.
+    /// Copy one input's normalize state (his position, his anchored level) into the config so a restart resumes it (#7).
+    fn norm_store(&self, id: &str) {
+        let Some((b, o)) = self.norm.borrow().get(id).map(|c| c.saved()) else { return };
+        if let Some(i) = self.cfg.borrow_mut().inputs.iter_mut().find(|i| i.id == id) {
+            i.norm_base = b;
+            i.norm_out = o;
+        }
+    }
+
+    /// A manual fader move: his position wins (N on or off) and is kept for restarts.
     fn fader_manual(&self, node: &str, db: f64) {
         let id = self.cfg.borrow().inputs.iter().find(|i| names::strip_in(&i.id) == node).map(|i| i.id.clone());
         if let Some(id) = id {
-            if let Some(c) = self.norm.borrow_mut().get_mut(&id) {
-                c.manual(db);
+            let hit = self.norm.borrow_mut().get_mut(&id).map(|c| c.manual(db)).is_some();
+            if hit {
+                self.norm_store(&id);
             }
         }
     }
@@ -1309,14 +1319,28 @@ impl App {
             move |a, m| a.cfg.borrow_mut().inputs.iter_mut().find(|i| i.id == i2).unwrap().mute = m,
         );
         // auto-normalize: the IN tap's pre-fader RMS drives the real slider (no extra tap)
-        if inp.normalize && !self.norm.borrow().contains_key(&id) {
-            self.norm.borrow_mut().insert(id.clone(), crate::norm::Channel::new(inp.gain_db));
+        // auto-normalize: one channel per input for the whole session (N only gates `step`), resumed from the saved state
+        if !self.norm.borrow().contains_key(&id) {
+            self.norm.borrow_mut().insert(id.clone(), crate::norm::Channel::resume(inp.gain_db, inp.norm_base, inp.norm_out));
+            self.norm_store(&id);
         }
         if let Some(pre) = self.levels.borrow().get(&format!("pre:{id}")).cloned() {
             let (w, id2, fw) = (Rc::downgrade(self), id.clone(), Rc::downgrade(&fader_rc));
             self.console_ticks.borrow_mut().push(Box::new(move |dt| {
                 let (Some(app), Some(f)) = (w.upgrade(), fw.upgrade()) else { return };
-                let g = app.norm.borrow_mut().get_mut(&id2).and_then(|c| c.step(pre.get().1, dt));
+                let on = app.cfg.borrow().inputs.iter().any(|i| i.id == id2 && i.normalize);
+                let (g, anchored) = match app.norm.borrow_mut().get_mut(&id2) {
+                    Some(c) if on => {
+                        let was = c.pending;
+                        let g = c.step(pre.get().1, dt);
+                        (g, was && !c.pending)
+                    }
+                    _ => (None, false),
+                };
+                if anchored {
+                    app.norm_store(&id2);
+                    app.norm_moved.set(true);
+                }
                 if let Some(g) = g {
                     f.set_auto(g);
                 }
@@ -1456,11 +1480,11 @@ impl App {
                         }
                     }
                     app.mark_dirty();
-                    let g = app.cfg.borrow().inputs.iter().find(|i| i.id == id2).map(|i| i.gain_db).unwrap_or(0.0);
-                    if on {
-                        app.norm.borrow_mut().insert(id2.clone(), crate::norm::Channel::new(g));
-                    } else {
-                        app.norm.borrow_mut().remove(&id2);
+                    if !on {
+                        // N off: keep the channel (his position, his level, a running hold); forget only the loudness
+                        if let Some(c) = app.norm.borrow_mut().get_mut(&id2) {
+                            c.pause();
+                        }
                     }
                 });
             }
@@ -1551,6 +1575,7 @@ impl App {
         let (app, p2, id) = (self.clone(), pop.clone(), inp.id.clone());
         remove.connect_clicked(move |_| {
             app.cfg.borrow_mut().inputs.retain(|i| i.id != id);
+            app.norm.borrow_mut().remove(&id);
             p2.popdown();
             app.structural();
         });
