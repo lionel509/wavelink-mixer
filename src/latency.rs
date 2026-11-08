@@ -306,6 +306,29 @@ mod tests {
     }
 
     #[test]
+    fn summarize_clamps_negative_added_to_zero() {
+        let direct = [37.3, 37.3, 37.3];
+        let via = [33.5, 33.6, 33.7];
+        let s = summarize(&direct, &via, 10.7);
+        assert_eq!(s.added_ms, 0.0, "{s:?}");
+        assert!((s.total_ms - 10.7).abs() < 0.01, "{s:?}");
+        assert!(s.below_noise, "{s:?}");
+        let printed = summary(&direct, &via, 10.7);
+        assert!(
+            printed.contains("added by mixer: 0.0 ms (below measurement noise: via mixer median 33.6 ms < direct median 37.3 ms)"),
+            "{printed}"
+        );
+    }
+
+    #[test]
+    fn summarize_reports_real_delay() {
+        let s = summarize(&[42.7; 5], &[44.2; 5], 32.0);
+        assert!((s.added_ms - 1.5).abs() < 0.01, "{s:?}");
+        assert!((s.total_ms - 33.5).abs() < 0.01, "{s:?}");
+        assert!(!s.below_noise, "{s:?}");
+    }
+
+    #[test]
     fn run_rejects_zero_runs() {
         assert_eq!(run(vec!["--runs".into(), "0".into()]), 2);
     }
