@@ -418,6 +418,7 @@ mod tests {
             (json!("256"), 256), (json!(-1), 256), (json!(null), 256), (json!(1.5), 256),
             (json!(0), 0), (json!(1), 32), (json!(16), 32), (json!(300), 512),
             (json!(512), 512), (json!(2048), 2048), (json!(4096), 2048),
+            (json!("0"), 0), (json!(0.0), 0), (json!(" 512 "), 512), (json!(256.0), 256), (json!("abc"), 256),
         ];
         for (v, want) in cases {
             let got = quantum_of(v.clone()).unwrap_or_else(|e| panic!("{v} failed to parse: {e}"));
@@ -440,12 +441,18 @@ mod tests {
         let old = std::env::var_os("HOME");
         std::env::set_var("HOME", &home);
         let _ = Config::load();
+        // a second bad save must not overwrite the first backup
+        let second: &[u8] = b"{oops";
+        std::fs::write(dir.join("config.json"), second).unwrap();
+        let _ = Config::load();
         match old {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
         let bad = std::fs::read(dir.join("config.json.bad"));
+        let bad1 = std::fs::read(dir.join("config.json.bad.1"));
         let _ = std::fs::remove_dir_all(&home);
         assert_eq!(bad.unwrap(), truncated);
+        assert_eq!(bad1.unwrap(), second);
     }
 }

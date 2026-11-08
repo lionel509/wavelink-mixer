@@ -152,6 +152,11 @@ pub fn force_quantum(q: u32) -> bool {
     }
 }
 
+/// Whether a `pw-metadata` dump confirms that `force_quantum(q)` took effect.
+pub fn quantum_confirmed(q: u32, meta: &str) -> bool {
+    todo!()
+}
+
 pub fn set_volume(id: u64, v: f64) {
     spawn("wpctl", &["set-volume", &id.to_string(), &format!("{v:.4}")]);
 }
@@ -206,9 +211,28 @@ mod tests {
 
     #[test]
     fn meta_value_reads_keys() {
-        let meta = "update: id:0 key:'clock.quantum' value:'1024' type:''\nupdate: id:0 key:'clock.min-quantum' value:'32' type:''\nupdate: id:0 key:'clock.force-quantum' value:'256' type:''\n";
+        let meta = "update: id:0 key:'clock.quantum-limit' value:'8192' type:''\nupdate: id:0 key:'clock.quantum' value:'1024' type:''\nupdate: id:0 key:'clock.min-quantum' value:'32' type:''\nupdate: id:0 key:'clock.force-quantum' value:'256' type:''\n";
         assert_eq!(meta_value(meta, "clock.force-quantum"), Some(256));
         assert_eq!(meta_value(meta, "clock.quantum"), Some(1024));
         assert_eq!(meta_value(meta, "clock.rate"), None);
+    }
+
+    #[test]
+    fn quantum_confirmed_rules() {
+        let f0 = "update: id:0 key:'clock.quantum' value:'1024' type:''\nupdate: id:0 key:'clock.force-quantum' value:'0' type:''\n";
+        let f256 = "update: id:0 key:'clock.quantum' value:'1024' type:''\nupdate: id:0 key:'clock.force-quantum' value:'256' type:''\n";
+        let nokey = "update: id:0 key:'clock.quantum' value:'1024' type:''\n";
+        let cases = [
+            (0, "", false),
+            (0, f0, true),
+            (0, nokey, true),
+            (0, f256, false),
+            (256, f256, true),
+            (256, "", false),
+            (512, f256, false),
+        ];
+        for (q, meta, want) in cases {
+            assert_eq!(quantum_confirmed(q, meta), want, "q={q} meta={meta:?}");
+        }
     }
 }
