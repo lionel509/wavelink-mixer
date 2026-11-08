@@ -194,14 +194,16 @@ pub(super) fn wire(app: &Rc<App>, v: Rc<View>) {
             return;
         }
         update_label(&a, &vv);
-        changed(&a, &vv);
+        if let Some(id) = source_id(&a, &vv) {
+            changed(&a, &vv, Edit::Source(id));
+        }
     });
     let a = app.clone();
     let vv = v.clone();
-    v.engine.connect_selected_notify(move |_| changed(&a, &vv));
+    v.engine.connect_selected_notify(move |_| changed(&a, &vv, Edit::Engine(ENGINES[(vv.engine.selected() as usize).min(1)])));
     let a = app.clone();
     let vv = v.clone();
-    v.plays.connect_selected_notify(move |_| changed(&a, &vv));
+    v.plays.connect_selected_notify(move |_| changed(&a, &vv, Edit::Plays(PLAYS[(vv.plays.selected() as usize).min(2)])));
 
     // "Mute <source> while on": live only, and only while a session runs
     let a = app.clone();
@@ -211,8 +213,8 @@ pub(super) fn wire(app: &Rc<App>, v: Rc<View>) {
             return;
         }
         let id = if cb.is_active() { source_for_session(&a, &vv) } else { None };
+        set_marker(id.clone());
         *a.stems.replaced.borrow_mut() = id;
-        cur_cfg(&a, &vv).save();
         a.apply_solo();
     });
 
@@ -366,12 +368,30 @@ fn fill_sources(app: &App, v: &View, list: Vec<(String, String)>, want: &str) {
     update_label(app, v);
 }
 
-/// A picker changed: save, and restart the session if one runs.
-fn changed(app: &Rc<App>, v: &Rc<View>) {
+/// One picker change. Only this field is written, on top of what stems.json holds, so a value that
+/// came from an environment override (set on the picker, never saved) is never saved by accident.
+enum Edit {
+    Source(String),
+    Engine(SepEngine),
+    Plays(Plays),
+}
+
+fn apply_edit(c: &mut StemsCfg, e: Edit) {
+    match e {
+        Edit::Source(id) => c.source = id,
+        Edit::Engine(x) => c.engine = x,
+        Edit::Plays(x) => c.plays = x,
+    }
+}
+
+/// A picker changed: save that one field, and restart the session if one runs.
+fn changed(app: &Rc<App>, v: &Rc<View>, e: Edit) {
     if v.quiet.get() {
         return;
     }
-    cur_cfg(app, v).save();
+    let mut saved = stemcfg::load();
+    apply_edit(&mut saved, e);
+    saved.save();
     if app.stems.session.borrow().is_some() {
         stop(app);
         start(app, v.replace.is_active());
@@ -517,5 +537,18 @@ mod tests {
         assert_eq!(std::fs::read(&p1).unwrap(), b"first", "the first save was overwritten");
         assert_eq!(std::fs::read(&p2).unwrap(), b"second");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Picking one value saves that field only; the other saved fields stay as they were on disk.
+    #[test]
+    fn picker_edit_saves_only_its_field() {
+        let mut saved = StemsCfg::default();
+        apply_edit(&mut saved, Edit::Plays(Plays::Stems));
+        assert_eq!(saved.plays, Plays::Stems);
+        assert_eq!(saved.engine, SepEngine::Live, "an engine set only by MIXER_STEMS_ENGINE must not be written");
+        assert_eq!(saved.source, "spotify");
+        apply_edit(&mut saved, Edit::Source("ch_x".into()));
+        assert_eq!(saved.source, "ch_x");
+        assert_eq!(saved.plays, Plays::Stems);
     }
 }
