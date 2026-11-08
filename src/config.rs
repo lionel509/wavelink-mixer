@@ -174,6 +174,14 @@ pub struct Input {
     pub default_sink: bool,
     #[serde(default)]
     pub rack: Rack,
+    #[serde(default)]
+    pub normalize: bool,
+    /// Auto-normalize: his last manual slider position. None = a config saved before #7 round 4.
+    #[serde(default)]
+    pub norm_base: Option<f64>,
+    /// Auto-normalize: his wanted output level (dBFS) anchored from that position; None while pending.
+    #[serde(default)]
+    pub norm_out: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -371,7 +379,7 @@ impl Config {
         };
         let input = |id: &str, name: &str, color: &str, fx: &str, routes| Input {
             id: id.into(), name: name.into(), color: color.into(), kind: InputKind::Virtual, fx: fx.into(),
-            eq: flat_eq(), gain_db: 0.0, mute: false, routes, default_sink: id == "system", rack: Rack::default(),
+            eq: flat_eq(), gain_db: 0.0, mute: false, routes, default_sink: id == "system", rack: Rack::default(), normalize: false, norm_base: None, norm_out: None,
         };
         Config {
             piano: PianoCfg::default(),
@@ -386,7 +394,7 @@ impl Config {
                     id: "mic".into(), name: "Mic".into(), color: "#bf5af2".into(),
                     kind: InputKind::Source { target: "easyeffects_source".into() },
                     fx: "clean".into(), eq: flat_eq(), gain_db: 0.0, mute: false,
-                    routes: r(&[("b1", true, 0.0), ("b2", true, 0.0)]), default_sink: false, rack: Rack::default(),
+                    routes: r(&[("b1", true, 0.0), ("b2", true, 0.0)]), default_sink: false, rack: Rack::default(), normalize: false, norm_base: None, norm_out: None,
                 },
             ],
             buses: vec![
@@ -474,5 +482,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         assert_eq!(bad.unwrap(), truncated);
         assert_eq!(bad1.unwrap(), second);
+    }
+
+    #[test]
+    fn normalize_defaults_off_and_round_trips() {
+        let i = Input {
+            id: "x".into(),
+            name: "x".into(),
+            color: "#fff".into(),
+            kind: InputKind::Virtual,
+            fx: "clean".into(),
+            eq: flat_eq(),
+            gain_db: 0.0,
+            mute: false,
+            routes: Default::default(),
+            default_sink: false,
+            rack: Rack::default(),
+            normalize: true,
+            norm_base: None,
+            norm_out: None,
+        };
+        let s = serde_json::to_string(&i).unwrap();
+        let back: Input = serde_json::from_str(&s).unwrap();
+        assert!(back.normalize);
+        let mut v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        v.as_object_mut().unwrap().remove("normalize");
+        let old: Input = serde_json::from_value(v).unwrap();
+        assert!(!old.normalize);
+    }
+
+    #[test]
+    fn norm_state_loads_old_configs_and_round_trips() {
+        let i = Input {
+            id: "x".into(),
+            name: "x".into(),
+            color: "#fff".into(),
+            kind: InputKind::Virtual,
+            fx: "clean".into(),
+            eq: flat_eq(),
+            gain_db: -40.0,
+            mute: false,
+            routes: Default::default(),
+            default_sink: false,
+            rack: Rack::default(),
+            normalize: true,
+            norm_base: Some(-18.0),
+            norm_out: Some(-26.0),
+        };
+        let s = serde_json::to_string(&i).unwrap();
+        let back: Input = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, i);
+        let mut v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        v.as_object_mut().unwrap().remove("norm_base");
+        v.as_object_mut().unwrap().remove("norm_out");
+        let old: Input = serde_json::from_value(v).unwrap();
+        assert_eq!((old.norm_base, old.norm_out), (None, None));
+        assert_eq!(old.gain_db, -40.0);
     }
 }

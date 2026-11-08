@@ -3,8 +3,9 @@
 //!   wavelink-mixer engine    run the routing engine (systemd user service)
 mod config;
 mod dash;
-mod discord;
 mod latency;
+mod leak;
+mod norm;
 mod engine;
 mod midi;
 mod player;
@@ -12,7 +13,6 @@ mod spotify;
 mod sysmon;
 mod pw;
 mod ui;
-mod voice;
 
 use adw::prelude::*;
 use gtk::glib;

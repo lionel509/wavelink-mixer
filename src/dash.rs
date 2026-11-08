@@ -4,11 +4,9 @@ use gtk::prelude::*;
 use gtk::{cairo, glib};
 use std::cell::Cell;
 use std::f64::consts::PI;
-use std::io::Read;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 // ---------- colour helpers ----------
 
@@ -34,6 +32,71 @@ fn text_centered(cr: &cairo::Context, x: f64, y: f64, s: &str) {
         cr.move_to(x - e.width() / 2.0 - e.x_bearing(), y - e.height() / 2.0 - e.y_bearing());
         let _ = cr.show_text(s);
     }
+}
+
+/// Meters and needles animate at most this often (display refresh is 60-240 Hz).
+pub const METER_FPS: f64 = 30.0;
+/// Accumulates frame-clock dt; yields one frame's elapsed time per 1/METER_FPS. The overshoot
+/// past a period is carried, so 75 Hz and 144 Hz frames still give 30 emits a second.
+pub struct FrameCap { acc: Cell<f64> }
+impl FrameCap {
+    pub fn new() -> FrameCap { FrameCap { acc: Cell::new(0.0) } }
+    pub fn tick(&self, dt: f64) -> Option<f64> {
+        let period = 1.0 / METER_FPS;
+        let a = self.acc.get() + dt;
+        if a + 1e-4 < period { self.acc.set(a); return None; }
+        // a stall (window hidden, debugger) counts once, clamped, with no carry
+        if a > 0.1 { self.acc.set(0.0); return Some(0.1); }
+        self.acc.set(a - period);
+        Some(period)
+    }
+}
+/// Redraw only if something moved and the widget is on screen.
+pub fn redraw_if(area: &gtk::DrawingArea, moved: bool) { if moved && area.is_mapped() { area.queue_draw(); } }
+/// Exponential ease toward `target`; `moved` = changed by more than `eps`.
+pub fn ease_toward(cur: f64, target: f64, dt: f64, tau: f64, eps: f64) -> (f64, bool) {
+    let n = cur + (target - cur) * (1.0 - (-dt / tau).exp());
+    (n, (n - cur).abs() > eps)
+}
+/// One damped-spring step of the VU needle; `moved` = the needle travelled more than 0.01.
+pub fn vu_spring(pos: f64, vel: f64, dbfs: f64, dt: f64) -> (f64, f64, bool) {
+    // fed with RMS; 0 VU = -12 dBFS RMS (suits mastered music, which averages ~-14..-9)
+    let target = if dbfs.is_nan() { VU_MIN - 3.0 } else { (dbfs + 12.0).clamp(VU_MIN - 3.0, VU_MAX + 1.0) };
+    let (k, c) = (110.0, 19.0);
+    let a = k * (target - pos) - c * vel;
+    let v = vel + a * dt;
+    let p = (pos + v * dt).clamp(VU_MIN - 3.0, VU_MAX + 1.0);
+    (p, v, (p - pos).abs() > 0.01)
+}
+/// Analyser band smoothing (fast rise, 0.9/s fall). True if any band moved more than 1e-3.
+pub fn smooth_bands(shown: &mut [f64], src: &[f32], dt: f64) -> bool {
+    let mut moved = false;
+    for (cur, &v) in shown.iter_mut().zip(src) {
+        let v = v as f64;
+        let n = if v > *cur { *cur + (v - *cur) * 0.5 } else { (*cur - 0.9 * dt).max(v) };
+        if (n - *cur).abs() > 1e-3 { moved = true; }
+        *cur = n;
+    }
+    moved
+}
+/// Spectrum bar and cap smoothing with hold. True if a bar or cap moved more than 1e-4
+/// (hold-timer changes don't count).
+pub fn smooth_spectrum(shown: &mut [f64], peaks: &mut [(f64, f64)], src: &[f32], dt: f64) -> bool {
+    let mut moved = false;
+    for i in 0..shown.len().min(peaks.len()).min(src.len()) {
+        let v = src[i] as f64;
+        let before = (shown[i], peaks[i].0);
+        shown[i] = if v > shown[i] { shown[i] + (v - shown[i]) * 0.6 } else { (shown[i] - 1.1 * dt).max(v) };
+        if shown[i] >= peaks[i].0 {
+            peaks[i] = (shown[i], 1.2);
+        } else if peaks[i].1 > 0.0 {
+            peaks[i].1 -= dt;
+        } else {
+            peaks[i].0 = (peaks[i].0 - 0.35 * dt).max(shown[i]);
+        }
+        if (shown[i] - before.0).abs() > 1e-4 || (peaks[i].0 - before.1).abs() > 1e-4 { moved = true; }
+    }
+    moved
 }
 
 // ---------- fader taper (shared by faders and meters) ----------
@@ -68,6 +131,27 @@ pub fn pos_to_db(p: f64) -> f64 {
 
 // ---------- stereo LED meter ----------
 
+pub const AMBER_DB: f64 = -6.0; // Scarlett Solo 3rd Gen halo: amber at -6 dBFS
+pub const RED_DB: f64 = 0.0; // red at 0 dBFS (digital clipping)
+pub const HOLD_S: f64 = 3.0; // peak flag hold
+pub const SILENT_DB: f64 = -90.0; // what Meter reports for silence
+const RELEASE_DB_S: f64 = 24.0;
+const FALL_DB_S: f64 = 12.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Zone { Green, Amber, Red }
+pub fn zone(db: f64) -> Zone {
+    if db >= RED_DB { Zone::Red } else if db >= AMBER_DB { Zone::Amber } else { Zone::Green }
+}
+fn zone_rgb(z: Zone) -> (f64, f64, f64) {
+    match z { Zone::Green => (0.3, 0.85, 0.42), Zone::Amber => (0.98, 0.72, 0.2), Zone::Red => (0.95, 0.22, 0.16) }
+}
+const FLAG_RGB: (f64, f64, f64) = (1.0, 0.2, 0.15);
+/// Level an input sends to a bus: post-strip peak + send gain (wpctl cubic volume => level_db is amplitude dB).
+pub fn send_db(post_db: f64, on: bool, level_db: f64) -> f64 {
+    if !on || level_db <= crate::config::MIN_DB { SILENT_DB } else { post_db + level_db }
+}
+
 const M_MIN: f64 = -60.0;
 const M_MAX: f64 = 6.0;
 const SEG: usize = 40;
@@ -77,12 +161,28 @@ fn m_pos(db: f64) -> f64 {
     ((db.clamp(M_MIN, M_MAX) - M_MIN) / (M_MAX - M_MIN)).powf(1.6)
 }
 
-/// Segmented L/R peak meter with falling bars and a peak-hold line per channel.
+/// Pure peak-hold state for one channel: instant attack, 24 dB/s release, a peak that holds
+/// for HOLD_S and then falls at 12 dB/s.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ballistics { pub level: f64, pub peak: f64, pub hold: f64 }
+impl Ballistics {
+    pub const fn new() -> Self { Ballistics { level: M_MIN, peak: M_MIN, hold: 0.0 } }
+    /// One frame: `v` = new peak reading in dBFS, `dt` seconds. Returns true if level or peak moved.
+    pub fn step(&mut self, v: f64, dt: f64) -> bool {
+        let before = (self.level, self.peak);
+        let v = if v.is_nan() { SILENT_DB } else { v.min(M_MAX) };
+        self.level = if v > self.level { v } else { (self.level - RELEASE_DB_S * dt).max(v).max(M_MIN) };
+        if v >= self.peak { self.peak = v; self.hold = HOLD_S; }
+        else if self.hold > 0.0 { self.hold -= dt; }
+        else { self.peak = (self.peak - FALL_DB_S * dt).max(self.level); }
+        (self.level, self.peak) != before
+    }
+}
+
+/// Segmented L/R peak meter with falling bars and a 3 s peak flag per channel.
 pub struct LedMeter {
     pub area: gtk::DrawingArea,
-    level: [Cell<f64>; 2], // displayed dB
-    peak: [Cell<f64>; 2],
-    hold: [Cell<f64>; 2], // seconds left on the peak hold
+    ch: [Cell<Ballistics>; 2],
 }
 
 impl LedMeter {
@@ -92,9 +192,7 @@ impl LedMeter {
         area.set_vexpand(true);
         let m = Rc::new(LedMeter {
             area: area.clone(),
-            level: [Cell::new(M_MIN), Cell::new(M_MIN)],
-            peak: [Cell::new(M_MIN), Cell::new(M_MIN)],
-            hold: [Cell::new(0.0), Cell::new(0.0)],
+            ch: [Cell::new(Ballistics::new()), Cell::new(Ballistics::new())],
         });
         let w = Rc::downgrade(&m);
         area.set_draw_func(move |_, cr, wd, ht| {
@@ -107,20 +205,13 @@ impl LedMeter {
 
     /// New peak readings (dBFS) for L and R; `dt` seconds since the last frame.
     pub fn step(&self, l: f64, r: f64, dt: f64) {
+        let mut moved = false;
         for (c, v) in [l, r].into_iter().enumerate() {
-            let cur = self.level[c].get();
-            // instant attack, ~24 dB/s release
-            self.level[c].set(if v > cur { v } else { (cur - 24.0 * dt).max(v).max(M_MIN) });
-            if v >= self.peak[c].get() {
-                self.peak[c].set(v.min(M_MAX));
-                self.hold[c].set(1.5);
-            } else if self.hold[c].get() > 0.0 {
-                self.hold[c].set(self.hold[c].get() - dt);
-            } else {
-                self.peak[c].set((self.peak[c].get() - 12.0 * dt).max(self.level[c].get()));
-            }
+            let mut b = self.ch[c].get();
+            moved |= b.step(v, dt);
+            self.ch[c].set(b);
         }
-        self.area.queue_draw();
+        redraw_if(&self.area, moved);
     }
 
     fn draw(&self, cr: &cairo::Context, w: f64, h: f64) {
@@ -130,29 +221,23 @@ impl LedMeter {
         let seg_h = span / SEG as f64;
         for c in 0..2 {
             let x = c as f64 * (colw + 3.0);
-            let lit = m_pos(self.level[c].get());
+            let bl = self.ch[c].get();
+            let lit = m_pos(bl.level);
             for i in 0..SEG {
                 let p0 = i as f64 / SEG as f64;
                 let db_here = M_MIN + (M_MAX - M_MIN) * ((p0 + 0.5 / SEG as f64).powf(1.0 / 1.6));
-                let (r, g, b) = if db_here >= -3.0 {
-                    (0.95, 0.22, 0.16)
-                } else if db_here >= -12.0 {
-                    (0.98, 0.72, 0.2)
-                } else {
-                    (0.3, 0.85, 0.42)
-                };
+                let (r, g, b) = zone_rgb(zone(db_here));
                 let on = p0 < lit;
                 cr.set_source_rgba(r, g, b, if on { 0.95 } else { 0.08 });
                 let y = bot - (i + 1) as f64 * seg_h;
                 cr.rectangle(x, y + 1.0, colw, (seg_h - 1.0).max(1.0));
                 let _ = cr.fill();
             }
-            // peak-hold line
-            let pk = self.peak[c].get();
-            if pk > M_MIN + 0.5 {
-                let y = bot - m_pos(pk) * span;
-                if pk >= -3.0 { cr.set_source_rgb(1.0, 0.35, 0.28) } else { cr.set_source_rgb(0.95, 0.95, 0.95) }
-                cr.rectangle(x, y - 1.0, colw, 2.0);
+            // peak flag, held 3 s
+            if bl.peak > M_MIN + 0.5 {
+                let y = bot - m_pos(bl.peak) * span;
+                cr.set_source_rgb(FLAG_RGB.0, FLAG_RGB.1, FLAG_RGB.2);
+                cr.rectangle(x, y - 1.5, colw, 3.0);
                 let _ = cr.fill();
             }
         }
@@ -175,6 +260,8 @@ pub struct Knob {
     default: f64,
     /// same path as a mouse turn (clamp, redraw, notify) — used by MIDI control
     setter: std::cell::RefCell<Option<Rc<dyn Fn(f64)>>>,
+    /// send level halo (zone arc + peak flag) instead of the printed scale, once enabled
+    halo: Cell<Option<Ballistics>>,
 }
 
 impl Knob {
@@ -188,7 +275,7 @@ impl Knob {
         area.set_content_width(size);
         area.set_content_height(size);
         area.set_halign(gtk::Align::Center);
-        let k = Rc::new(Knob { area: area.clone(), value: Cell::new(value), min, max, default, setter: std::cell::RefCell::new(None) });
+        let k = Rc::new(Knob { area: area.clone(), value: Cell::new(value), min, max, default, setter: std::cell::RefCell::new(None), halo: Cell::new(None) });
         let cb: Rc<dyn Fn(f64)> = Rc::new(on_change);
         let w = Rc::downgrade(&k);
         area.set_draw_func(move |_, cr, wd, ht| {
@@ -269,28 +356,72 @@ impl Knob {
         (self.value.get() - self.min) / (self.max - self.min)
     }
 
+    /// Switch this knob to the send-level halo (used by the bus send knobs).
+    pub fn enable_halo(&self) {
+        self.halo.set(Some(Ballistics::new()));
+        self.area.queue_draw();
+    }
+
+    /// Feed the send level in dBFS (`SILENT_DB` when off); `dt` seconds since the last frame.
+    pub fn halo_step(&self, db: f64, dt: f64) {
+        if let Some(mut b) = self.halo.get() {
+            redraw_if(&self.area, b.step(db, dt));
+            self.halo.set(Some(b));
+        }
+    }
+
     fn draw(&self, cr: &cairo::Context, w: f64, h: f64) {
         let (cx, cy) = (w / 2.0, h / 2.0);
         let r = w.min(h) / 2.0 - 1.0;
         let a_of = |v: f64| START + SWEEP * ((v - self.min) / (self.max - self.min));
-        // printed scale: 11 ticks round the skirt
-        cr.set_line_cap(cairo::LineCap::Butt);
-        for i in 0..=10 {
-            let a = START + SWEEP * i as f64 / 10.0;
-            cr.set_line_width(if i % 5 == 0 { 1.4 } else { 0.8 });
-            cr.set_source_rgba(0.85, 0.85, 0.85, if i % 5 == 0 { 0.8 } else { 0.4 });
-            cr.move_to(cx + a.cos() * r * 0.84, cy + a.sin() * r * 0.84);
-            cr.line_to(cx + a.cos() * r, cy + a.sin() * r);
-            let _ = cr.stroke();
-        }
-        // amber arc from the detent to the value
         let v = self.value.get();
-        if (v - self.default).abs() > 1e-6 {
-            cr.set_line_width(2.0);
-            cr.set_source_rgb(1.0, 0.66, 0.2);
-            let (a0, a1) = (a_of(self.default), a_of(v));
-            cr.arc(cx, cy, r * 0.78, a0.min(a1), a0.max(a1));
-            let _ = cr.stroke();
+        if let Some(bl) = self.halo.get() {
+            // send halo: three zone arcs (dim track, lit to the level), then the held peak flag
+            let ang = |db: f64| START + SWEEP * m_pos(db);
+            cr.set_line_cap(cairo::LineCap::Butt);
+            cr.set_line_width(r * 0.18);
+            let pieces = [(M_MIN, AMBER_DB), (AMBER_DB, RED_DB), (RED_DB, M_MAX)];
+            for (lo, hi) in pieces {
+                let (zr, zg, zb) = zone_rgb(zone(lo));
+                cr.set_source_rgba(zr, zg, zb, 0.15);
+                cr.arc(cx, cy, r * 0.9, ang(lo), ang(hi));
+                let _ = cr.stroke();
+            }
+            for (lo, hi) in pieces {
+                if lo < bl.level {
+                    let (zr, zg, zb) = zone_rgb(zone(lo));
+                    cr.set_source_rgba(zr, zg, zb, 0.95);
+                    cr.arc(cx, cy, r * 0.9, ang(lo), ang(hi.min(bl.level)));
+                    let _ = cr.stroke();
+                }
+            }
+            if bl.peak > M_MIN + 0.5 {
+                let a = ang(bl.peak);
+                cr.set_line_width(2.0);
+                cr.set_source_rgb(FLAG_RGB.0, FLAG_RGB.1, FLAG_RGB.2);
+                cr.move_to(cx + a.cos() * r * 0.72, cy + a.sin() * r * 0.72);
+                cr.line_to(cx + a.cos() * r, cy + a.sin() * r);
+                let _ = cr.stroke();
+            }
+        } else {
+            // printed scale: 11 ticks round the skirt
+            cr.set_line_cap(cairo::LineCap::Butt);
+            for i in 0..=10 {
+                let a = START + SWEEP * i as f64 / 10.0;
+                cr.set_line_width(if i % 5 == 0 { 1.4 } else { 0.8 });
+                cr.set_source_rgba(0.85, 0.85, 0.85, if i % 5 == 0 { 0.8 } else { 0.4 });
+                cr.move_to(cx + a.cos() * r * 0.84, cy + a.sin() * r * 0.84);
+                cr.line_to(cx + a.cos() * r, cy + a.sin() * r);
+                let _ = cr.stroke();
+            }
+            // amber arc from the detent to the value
+            if (v - self.default).abs() > 1e-6 {
+                cr.set_line_width(2.0);
+                cr.set_source_rgb(1.0, 0.66, 0.2);
+                let (a0, a1) = (a_of(self.default), a_of(v));
+                cr.arc(cx, cy, r * 0.78, a0.min(a1), a0.max(a1));
+                let _ = cr.stroke();
+            }
         }
         // black skirt with grip notches
         let kr = r * 0.7;
@@ -337,6 +468,7 @@ pub struct Vu {
     pub area: gtk::DrawingArea,
     pos: Cell<f64>, // VU
     vel: Cell<f64>,
+    pk: Cell<Ballistics>, // peak flag over the needle, held 3 s
 }
 
 const VU_MIN: f64 = -20.0;
@@ -354,7 +486,7 @@ impl Vu {
         area.set_content_width(width);
         area.set_content_height((width as f64 * 0.62) as i32);
         area.set_halign(gtk::Align::Center);
-        let v = Rc::new(Vu { area: area.clone(), pos: Cell::new(VU_MIN - 3.0), vel: Cell::new(0.0) });
+        let v = Rc::new(Vu { area: area.clone(), pos: Cell::new(VU_MIN - 3.0), vel: Cell::new(0.0), pk: Cell::new(Ballistics::new()) });
         let w = Rc::downgrade(&v);
         area.set_draw_func(move |_, cr, wd, ht| {
             if let Some(v) = w.upgrade() {
@@ -366,15 +498,13 @@ impl Vu {
 
     /// Feed an RMS level in dBFS; needle follows a damped spring (~300 ms rise).
     pub fn step(&self, dbfs: f64, dt: f64) {
-        // fed with RMS; 0 VU = -12 dBFS RMS (suits mastered music, which averages ~-14..-9)
-        let target = (dbfs + 12.0).max(VU_MIN - 3.0);
-        let (k, c) = (110.0, 19.0);
-        let x = self.pos.get();
-        let a = k * (target - x) - c * self.vel.get();
-        let v = self.vel.get() + a * dt;
+        let (p, v, moved) = vu_spring(self.pos.get(), self.vel.get(), dbfs, dt);
         self.vel.set(v);
-        self.pos.set((x + v * dt).clamp(VU_MIN - 3.0, VU_MAX + 1.0));
-        self.area.queue_draw();
+        self.pos.set(p);
+        let mut b = self.pk.get();
+        let pk_moved = b.step(self.pos.get() - 12.0, dt);
+        self.pk.set(b);
+        redraw_if(&self.area, moved | pk_moved);
     }
 
     fn draw(&self, cr: &cairo::Context, w: f64, h: f64) {
@@ -418,6 +548,16 @@ impl Vu {
         cr.set_source_rgb(0.75, 0.1, 0.05);
         cr.arc(px, py, rad * 0.87, ang(0.0), ang(VU_MAX));
         let _ = cr.stroke();
+        // peak flag, held 3 s
+        let pv = self.pk.get().peak + 12.0;
+        if pv > VU_MIN {
+            let a = ang(pv);
+            cr.set_source_rgb(FLAG_RGB.0, FLAG_RGB.1, FLAG_RGB.2);
+            cr.set_line_width(2.0);
+            cr.move_to(px + a.cos() * rad * 0.80, py + a.sin() * rad * 0.80);
+            cr.line_to(px + a.cos() * rad * 0.97, py + a.sin() * rad * 0.97);
+            let _ = cr.stroke();
+        }
         cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
         cr.set_font_size((fh * 0.13).max(7.0));
         for (v, s) in [(-20.0, "20"), (-10.0, "10"), (-7.0, "7"), (-5.0, "5"), (-3.0, "3"), (-1.0, "1"), (0.0, "0"), (1.0, "+1"), (2.0, "2"), (3.0, "+3")] {
@@ -525,21 +665,14 @@ fn fft(re: &mut [f32], im: &mut [f32]) {
     }
 }
 
-/// Spectrum of one PipeWire node (a bus), drawn as rainbow bars with falling peak caps.
+/// Spectrum of one bus, drawn as rainbow bars with falling peak caps. Fed by the chosen bus
+/// meter's own tap (no extra PipeWire stream).
 pub struct Spectrum {
     pub area: gtk::DrawingArea,
-    data: Arc<Mutex<Vec<f32>>>,
     shown: std::cell::RefCell<Vec<f64>>,
     peaks: std::cell::RefCell<Vec<(f64, f64)>>, // (level, hold time)
-    target: Arc<Mutex<String>>,
-    stop: Arc<AtomicBool>,
+    target: std::cell::RefCell<String>,
     born: Instant,
-}
-
-impl Drop for Spectrum {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-    }
 }
 
 impl Spectrum {
@@ -549,11 +682,9 @@ impl Spectrum {
         area.set_hexpand(true);
         let s = Rc::new(Spectrum {
             area: area.clone(),
-            data: Arc::new(Mutex::new(vec![0.0; BANDS])),
             shown: std::cell::RefCell::new(vec![0.0; BANDS]),
             peaks: std::cell::RefCell::new(vec![(0.0, 0.0); BANDS]),
-            target: Arc::new(Mutex::new(target.to_string())),
-            stop: Arc::new(AtomicBool::new(false)),
+            target: std::cell::RefCell::new(target.to_string()),
             born: Instant::now(),
         });
         let w = Rc::downgrade(&s);
@@ -562,118 +693,26 @@ impl Spectrum {
                 s.draw(cr, wd as f64, ht as f64);
             }
         });
-        if !no_audio() {
-            Self::spawn_reader(s.data.clone(), s.target.clone(), s.stop.clone());
-        }
         s
     }
 
-    /// Switch which node is analysed (the reader reconnects).
+    /// Which bus this spectrum is labelled and keyed by.
     pub fn set_target(&self, t: &str) {
-        *self.target.lock().unwrap() = t.to_string();
+        *self.target.borrow_mut() = t.to_string();
     }
 
-    fn spawn_reader(data: Arc<Mutex<Vec<f32>>>, target: Arc<Mutex<String>>, stop: Arc<AtomicBool>) {
-        std::thread::spawn(move || {
-            // band edges in FFT bins
-            let edges: Vec<f64> = (0..=BANDS).map(|i| F_LO * (F_HI / F_LO).powf(i as f64 / BANDS as f64) * FFT_N as f64 / RATE).collect();
-            let window: Vec<f32> = (0..FFT_N).map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (FFT_N - 1) as f32).cos()).collect();
-            while !stop.load(Ordering::Relaxed) {
-                let tgt = target.lock().unwrap().clone();
-                let props = "{ node.name=spectrum node.passive=true media.class=Stream/Input/Audio stream.capture.sink=true node.dont-fallback=true }";
-                let child = std::process::Command::new("pw-record")
-                    .args(["--target", &tgt, "-P", props, "--format", "f32", "--rate", "48000", "--channels", "2", "--latency", "20ms", "--raw", "-"])
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
-                let Ok(mut child) = child else {
-                    std::thread::sleep(Duration::from_secs(2));
-                    continue;
-                };
-                let mut out = child.stdout.take().unwrap();
-                let mut ring = vec![0.0f32; FFT_N];
-                let mut pos = 0usize;
-                let mut fresh = 0usize;
-                let mut buf = vec![0u8; 4 * 2 * 960];
-                let mut carry: Vec<u8> = vec![];
-                let (mut re, mut im) = (vec![0.0f32; FFT_N], vec![0.0f32; FFT_N]);
-                loop {
-                    if stop.load(Ordering::Relaxed) || *target.lock().unwrap() != tgt {
-                        break;
-                    }
-                    let n = match out.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
-                    };
-                    carry.extend_from_slice(&buf[..n]);
-                    let frames = carry.len() / 8;
-                    for f in 0..frames {
-                        let o = f * 8;
-                        let l = f32::from_le_bytes([carry[o], carry[o + 1], carry[o + 2], carry[o + 3]]);
-                        let r = f32::from_le_bytes([carry[o + 4], carry[o + 5], carry[o + 6], carry[o + 7]]);
-                        ring[pos] = 0.5 * (l + r);
-                        pos = (pos + 1) % FFT_N;
-                    }
-                    carry.drain(..frames * 8);
-                    fresh += frames;
-                    if fresh < 1600 {
-                        continue; // ~30 analyses per second
-                    }
-                    fresh = 0;
-                    for i in 0..FFT_N {
-                        re[i] = ring[(pos + i) % FFT_N] * window[i];
-                        im[i] = 0.0;
-                    }
-                    fft(&mut re, &mut im);
-                    let mag = |b: usize| (re[b] * re[b] + im[b] * im[b]).sqrt() * 4.0 / FFT_N as f32;
-                    let mut bands = vec![0.0f32; BANDS];
-                    for (k, band) in bands.iter_mut().enumerate() {
-                        let (a, b) = (edges[k], edges[k + 1]);
-                        let (ia, ib) = (a.floor() as usize, (b.ceil() as usize).min(FFT_N / 2 - 1));
-                        let m = if ib <= ia + 1 {
-                            // narrower than a bin: interpolate
-                            let c = (a + b) / 2.0;
-                            let i0 = c.floor() as usize;
-                            let t = (c - i0 as f64) as f32;
-                            mag(i0) * (1.0 - t) + mag(i0 + 1) * t
-                        } else {
-                            (ia..ib).map(mag).fold(0.0f32, f32::max)
-                        };
-                        // pink-ish tilt so music looks level across the range, then -72..0 dB -> 0..1
-                        let f = F_LO * (F_HI / F_LO).powf((k as f64 + 0.5) / BANDS as f64);
-                        let db = 20.0 * m.max(1e-9).log10() + 3.0 * (f / 1000.0).log2() as f32;
-                        *band = ((db + 72.0) / 72.0).clamp(0.0, 1.0);
-                    }
-                    *data.lock().unwrap() = bands;
-                }
-                let _ = child.kill();
-                let _ = child.wait();
-                *data.lock().unwrap() = vec![0.0; BANDS];
-                if !stop.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(500));
-                }
-            }
-        });
+    pub fn target(&self) -> String {
+        self.target.borrow().clone()
     }
 
-    /// Advance smoothing and redraw (call ~25-60 Hz).
-    pub fn step(&self, dt: f64) {
-        let d = self.data.lock().unwrap().clone();
+    /// Advance smoothing and redraw (call ~25-60 Hz). `src` is the chosen bus meter's band buffer.
+    pub fn step(&self, dt: f64, src: Option<&Arc<Mutex<Vec<f32>>>>) {
+        let d = src.map(|a| a.lock().unwrap().clone()).unwrap_or_else(|| vec![0.0; BANDS]);
         let mut sh = self.shown.borrow_mut();
         let mut pk = self.peaks.borrow_mut();
-        for i in 0..BANDS {
-            let v = d[i] as f64;
-            sh[i] = if v > sh[i] { sh[i] + (v - sh[i]) * 0.6 } else { (sh[i] - 1.1 * dt).max(v) };
-            if sh[i] >= pk[i].0 {
-                pk[i] = (sh[i], 1.2);
-            } else if pk[i].1 > 0.0 {
-                pk[i].1 -= dt;
-            } else {
-                pk[i].0 = (pk[i].0 - 0.35 * dt).max(sh[i]);
-            }
-        }
+        let moved = smooth_spectrum(&mut sh, &mut pk, &d, dt);
         drop((sh, pk));
-        self.area.queue_draw();
+        redraw_if(&self.area, moved);
     }
 
     fn draw(&self, cr: &cairo::Context, w: f64, h: f64) {
@@ -1086,13 +1125,10 @@ impl Analyzer {
         let (p, q) = (self.pre.lock().unwrap().clone(), self.post.lock().unwrap().clone());
         let mut sh = self.shown.borrow_mut();
         let (a, b) = &mut *sh;
-        for i in 0..BANDS {
-            for (cur, v) in [(&mut a[i], p[i] as f64), (&mut b[i], q[i] as f64)] {
-                *cur = if v > *cur { *cur + (v - *cur) * 0.5 } else { (*cur - 0.9 * dt).max(v) };
-            }
-        }
+        // non-short-circuit: both sides always step
+        let moved = smooth_bands(a, &p, dt) | smooth_bands(b, &q, dt);
         drop(sh);
-        self.area.queue_draw();
+        redraw_if(&self.area, moved);
     }
 
     fn draw(&self, cr: &cairo::Context, w: f64, h: f64, col: (f64, f64, f64), eq: &[f64], bands: &[(f64, &str)]) {
@@ -1173,8 +1209,9 @@ impl GrMeter {
     pub fn step(&self, gr: f64, attack: f64, release: f64, dt: f64) {
         let cur = self.pos.get();
         let tau = if gr > cur { 0.005 + attack * 0.08 } else { 0.05 + release * 0.6 };
-        self.pos.set(cur + (gr - cur) * (1.0 - (-dt / tau).exp()));
-        self.area.queue_draw();
+        let (n, moved) = ease_toward(cur, gr, dt, tau, 0.01);
+        self.pos.set(n);
+        redraw_if(&self.area, moved);
     }
 
     fn draw(&self, cr: &cairo::Context, w: f64, h: f64) {
@@ -1266,6 +1303,62 @@ impl Lamp {
 
 // ---------- general needle dial ----------
 
+pub const DIAL_BAND: f64 = 24.0; // label plate under the face: title + value
+
+/// Ink box of `s` centred on (cx, cy), placed exactly as `text_centered` places it.
+fn ink_box(cr: &cairo::Context, s: &str, cx: f64, cy: f64) -> [f64; 4] {
+    match cr.text_extents(s) {
+        Ok(e) => {
+            let x0 = cx - e.width() / 2.0;
+            let y0 = cy - e.height() / 2.0;
+            [x0, y0, x0 + e.width(), y0 + e.height()]
+        }
+        Err(_) => [cx, cy, cx, cy],
+    }
+}
+
+/// Labels of a Dial, in draw order: (text, centre x, centre y, font size, ink box). Items 0-4
+/// are the five tick labels on the face; item 5 is the title and item 6 the value, both on the
+/// plate under the face. Measured with the same font as `Dial::draw`.
+pub(crate) fn dial_texts(cr: &cairo::Context, w: f64, h: f64, title: &str, max: f64, value: &str) -> Vec<(String, f64, f64, f64, [f64; 4])> {
+    let (fx, fy, fw, fh) = (3.0, 3.0, w - 6.0, h - 6.0 - DIAL_BAND);
+    let (px, py) = (fx + fw / 2.0, fy + fh * 1.05);
+    let rad = fh * 0.86;
+    let (a0, a1) = (-PI / 2.0 - 0.85, -PI / 2.0 + 0.85);
+    let ang = |v: f64| a0 + (a1 - a0) * (v / max).clamp(0.0, 1.02);
+    cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+    let mut out = Vec::with_capacity(7);
+    let size = (fh * 0.085).max(7.0);
+    cr.set_font_size(size);
+    for k in 0..=4 {
+        let v = max * k as f64 / 4.0;
+        let a = ang(v);
+        let t = if max >= 10000.0 { format!("{:.0}k", v / 1000.0) } else { format!("{:.0}", v) };
+        let (cx, cy) = (px + a.cos() * rad * 0.72, py + a.sin() * rad * 0.72);
+        let b = ink_box(cr, &t, cx, cy);
+        out.push((t, cx, cy, size, b));
+    }
+    // title and value shrink to fit the face width
+    let fit = |s: &str, start: f64| {
+        let mut sz = start;
+        cr.set_font_size(sz);
+        while cr.text_extents(s).map(|e| e.width()).unwrap_or(0.0) > fw - 8.0 && sz > 6.0 {
+            sz -= 0.5;
+            cr.set_font_size(sz);
+        }
+        sz
+    };
+    let sz = fit(title, 8.0);
+    let (cx, cy) = (px, fy + fh + 2.0 + 7.0);
+    let b = ink_box(cr, title, cx, cy);
+    out.push((title.to_string(), cx, cy, sz, b));
+    let sz = fit(value, 10.0);
+    let (cx, cy) = (px, fy + fh + 2.0 + 17.0);
+    let b = ink_box(cr, value, cx, cy);
+    out.push((value.to_string(), cx, cy, sz, b));
+    out
+}
+
 /// Amber needle gauge for any value: `max` full scale, red zone from `danger`.
 pub struct Dial {
     pub area: gtk::DrawingArea,
@@ -1278,7 +1371,7 @@ impl Dial {
     pub fn new(width: i32, title: &'static str, max: f64, danger: f64) -> Rc<Dial> {
         let area = gtk::DrawingArea::new();
         area.set_content_width(width);
-        area.set_content_height((width as f64 * 0.66) as i32);
+        area.set_content_height((width as f64 * 0.66) as i32 + DIAL_BAND as i32);
         let d = Rc::new(Dial { area: area.clone(), pos: Cell::new(0.0), target: Cell::new(0.0), text: std::cell::RefCell::new(String::new()) });
         let w = Rc::downgrade(&d);
         area.set_draw_func(move |_, cr, wd, ht| {
@@ -1290,21 +1383,25 @@ impl Dial {
     }
 
     pub fn set(&self, v: f64, text: &str) {
+        let changed = *self.text.borrow() != text;
+        if changed {
+            *self.text.borrow_mut() = text.to_string();
+        }
         self.target.set(v);
-        *self.text.borrow_mut() = text.to_string();
+        redraw_if(&self.area, changed);
     }
 
     pub fn step(&self, dt: f64) {
-        let p = self.pos.get();
-        self.pos.set(p + (self.target.get() - p) * (1.0 - (-dt / 0.25).exp()));
-        self.area.queue_draw();
+        let (n, moved) = ease_toward(self.pos.get(), self.target.get(), dt, 0.25, 0.01);
+        self.pos.set(n);
+        redraw_if(&self.area, moved);
     }
 
     fn draw(&self, cr: &cairo::Context, w: f64, h: f64, title: &str, max: f64, danger: f64) {
         cr.set_source_rgb(0.05, 0.05, 0.055);
         cr.rectangle(0.0, 0.0, w, h);
         let _ = cr.fill();
-        let (fx, fy, fw, fh) = (3.0, 3.0, w - 6.0, h - 6.0);
+        let (fx, fy, fw, fh) = (3.0, 3.0, w - 6.0, h - 6.0 - DIAL_BAND);
         let face = cairo::RadialGradient::new(fx + fw / 2.0, fy + fh * 0.9, fh * 0.1, fx + fw / 2.0, fy + fh * 0.6, fw * 0.75);
         face.add_color_stop_rgb(0.0, 1.0, 0.86, 0.55);
         face.add_color_stop_rgb(0.6, 0.96, 0.74, 0.36);
@@ -1327,8 +1424,8 @@ impl Dial {
         cr.set_source_rgb(0.75, 0.1, 0.05);
         cr.arc(px, py, rad * 0.87, ang(danger), ang(max));
         let _ = cr.stroke();
+        let items = dial_texts(cr, w, h, title, max, &self.text.borrow());
         cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
-        cr.set_font_size((fh * 0.085).max(7.0));
         for k in 0..=4 {
             let v = max * k as f64 / 4.0;
             let a = ang(v);
@@ -1337,14 +1434,13 @@ impl Dial {
             cr.move_to(px + a.cos() * rad * 0.84, py + a.sin() * rad * 0.84);
             cr.line_to(px + a.cos() * rad * 0.95, py + a.sin() * rad * 0.95);
             let _ = cr.stroke();
-            let t = if max >= 10000.0 { format!("{:.0}k", v / 1000.0) } else { format!("{:.0}", v) };
-            text_centered(cr, px + a.cos() * rad * 0.72, py + a.sin() * rad * 0.72, &t);
         }
-        cr.set_source_rgb(0.12, 0.08, 0.03);
-        cr.set_font_size((fh * 0.085).max(8.0));
-        text_centered(cr, px, fy + fh * 0.52, title);
-        cr.set_font_size((fh * 0.11).max(9.0));
-        text_centered(cr, px, fy + fh * 0.72, &self.text.borrow());
+        for (k, it) in items.iter().take(5).enumerate() {
+            let v = max * k as f64 / 4.0;
+            if v >= danger { cr.set_source_rgb(0.7, 0.08, 0.04) } else { cr.set_source_rgb(0.12, 0.08, 0.03) }
+            cr.set_font_size(it.3);
+            text_centered(cr, it.1, it.2, &it.0);
+        }
         let a = ang(self.pos.get());
         cr.set_line_width(1.4);
         cr.set_source_rgb(0.05, 0.05, 0.05);
@@ -1352,5 +1448,352 @@ impl Dial {
         cr.line_to(px + a.cos() * rad * 0.97, py + a.sin() * rad * 0.97);
         let _ = cr.stroke();
         let _ = cr.restore();
+        // label plate under the face, outside the clip: the needle can't cross the text
+        cr.set_source_rgb(0.10, 0.09, 0.08);
+        cr.rectangle(fx, fy + fh + 2.0, fw, DIAL_BAND - 2.0);
+        let _ = cr.fill();
+        cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+        let (t, val) = (&items[5], &items[6]);
+        cr.set_source_rgb(0.85, 0.70, 0.45);
+        cr.set_font_size(t.3);
+        text_centered(cr, t.1, t.2, &t.0);
+        cr.set_source_rgb(1.0, 0.86, 0.55);
+        cr.set_font_size(val.3);
+        text_centered(cr, val.1, val.2, &val.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic uniform [0, 1) from an LCG (no `rand` crate).
+    fn unit(x: &mut u64) -> f64 {
+        *x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*x >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    #[test]
+    fn zone_matches_scarlett_3rd_gen() {
+        assert_eq!(zone(-24.0), Zone::Green);
+        assert_eq!(zone(-6.01), Zone::Green);
+        assert_eq!(zone(-6.0), Zone::Amber);
+        assert_eq!(zone(-0.01), Zone::Amber);
+        assert_eq!(zone(0.0), Zone::Red);
+        assert_eq!(zone(3.0), Zone::Red);
+        assert_eq!(zone(SILENT_DB), Zone::Green);
+        assert!(AMBER_DB == -6.0 && RED_DB == 0.0);
+    }
+
+    #[test]
+    fn zone_is_monotonic() {
+        for k in 0..=1020 {
+            let db = -90.0 + k as f64 * 0.1;
+            assert!(zone(db) >= zone(db - 0.1), "db {db}");
+        }
+    }
+
+    #[test]
+    fn peak_held_for_hold_s() {
+        assert_eq!(HOLD_S, 3.0);
+        let mut b = Ballistics::new();
+        b.step(-10.0, 0.016);
+        for _ in 0..180 {
+            b.step(SILENT_DB, 0.016);
+        }
+        assert_eq!(b.peak, -10.0);
+        assert!(b.level < -10.0);
+    }
+
+    #[test]
+    fn peak_falls_after_hold() {
+        let mut b = Ballistics::new();
+        b.step(-10.0, 0.016);
+        for _ in 0..250 {
+            b.step(SILENT_DB, 0.016);
+        }
+        assert!(b.peak < -10.0);
+        assert!(b.peak >= b.level);
+        for _ in 250..1000 {
+            b.step(SILENT_DB, 0.016);
+        }
+        assert_eq!(b.peak, M_MIN);
+        assert_eq!(b.level, M_MIN);
+    }
+
+    #[test]
+    fn higher_peak_restarts_hold() {
+        let mut b = Ballistics::new();
+        b.step(-20.0, 0.016);
+        for _ in 0..100 {
+            b.step(SILENT_DB, 0.016);
+        }
+        b.step(-10.0, 0.016);
+        assert_eq!(b.peak, -10.0);
+        assert_eq!(b.hold, HOLD_S);
+    }
+
+    #[test]
+    fn release_is_24_db_per_s() {
+        let mut b = Ballistics::new();
+        b.step(-10.0, 0.016);
+        for _ in 0..50 {
+            b.step(M_MIN, 0.01);
+        }
+        assert!((b.level - -22.0).abs() < 1e-9, "level {}", b.level);
+    }
+
+    #[test]
+    fn step_reports_motion_only() {
+        let mut b = Ballistics::new();
+        for _ in 0..1000 {
+            b.step(SILENT_DB, 0.016);
+        }
+        assert!(!b.step(SILENT_DB, 0.016));
+        assert!(b.step(-10.0, 0.016));
+    }
+
+    #[test]
+    fn ballistics_invariant_under_random_feed() {
+        let mut x: u64 = 1;
+        let mut b = Ballistics::new();
+        let mut since = 0.0_f64; // time since the peak was last set
+        let mut silent_left = 0u32;
+        for i in 0..100_000u32 {
+            let v = if silent_left > 0 {
+                silent_left -= 1;
+                SILENT_DB
+            } else if i % 50 == 0 {
+                silent_left = 300;
+                SILENT_DB
+            } else {
+                -90.0 + 102.0 * unit(&mut x)
+            };
+            let dt = 0.001 + 0.049 * unit(&mut x);
+            let prev_peak = b.peak;
+            let vc = v.min(M_MAX);
+            b.step(v, dt);
+            assert!(b.level >= M_MIN && b.level <= M_MAX, "step {i}: level {}", b.level);
+            assert!(b.level <= b.peak && b.peak <= M_MAX, "step {i}: peak {} level {}", b.peak, b.level);
+            if vc >= prev_peak {
+                assert_eq!(b.peak, vc, "step {i}: a higher reading must set the peak");
+                since = 0.0;
+            } else {
+                since += dt;
+            }
+            if since < HOLD_S {
+                assert!(b.peak >= prev_peak, "step {i}: peak fell {prev_peak} -> {} inside its hold", b.peak);
+            }
+        }
+    }
+
+    #[test]
+    fn send_db_math() {
+        assert_eq!(send_db(-10.0, true, -6.0), -16.0);
+        assert_eq!(send_db(-10.0, false, 0.0), SILENT_DB);
+        assert_eq!(send_db(-10.0, true, crate::config::MIN_DB), SILENT_DB);
+        assert_eq!(send_db(-3.0, true, 6.0), 3.0);
+        assert_eq!(zone(send_db(-3.0, true, 6.0)), Zone::Red);
+    }
+
+    #[test]
+    fn send_level_db_is_amplitude_db() {
+        for d in [-50.0, -20.0, -6.0, 0.0, 6.0] {
+            let v = crate::config::db_to_vol(d).powi(3);
+            assert!((v - 10f64.powf(d / 20.0)).abs() < 1e-9, "d {d}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod redraw_tests {
+    use super::*;
+
+    /// Deterministic uniform [0, 1) from an LCG (no `rand` crate).
+    fn unit(x: &mut u64) -> f64 {
+        *x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*x >> 11) as f64 / (1u64 << 53) as f64
+    }
+    fn uni(x: &mut u64, lo: f64, hi: f64) -> f64 {
+        lo + (hi - lo) * unit(x)
+    }
+    /// Frame dt in the range FrameCap emits at 60-240 Hz.
+    fn frame_dt(x: &mut u64) -> f64 {
+        uni(x, 1.0 / 40.0, 1.0 / 27.0)
+    }
+
+    #[test]
+    fn frame_cap_rates() {
+        for hz in [60.0_f64, 75.0, 120.0, 144.0, 165.0, 240.0] {
+            let cap = FrameCap::new();
+            let dt = 1.0 / hz;
+            let (mut n, mut sum) = (0usize, 0.0_f64);
+            for _ in 0..(10.0 / dt).round() as usize {
+                if let Some(d) = cap.tick(dt) {
+                    n += 1;
+                    sum += d;
+                }
+            }
+            assert!((270..=300).contains(&n), "{hz} Hz: {n} emits in 10 s");
+            // time still accumulating after the last emit is never returned, so allow one emit period
+            assert!((sum - 10.0).abs() <= 1.0 / METER_FPS + 1e-9, "{hz} Hz: summed dt {sum}");
+        }
+        let cap = FrameCap::new();
+        assert_eq!(cap.tick(0.5), Some(0.1));
+    }
+
+    fn settle_vu(x: &mut u64, case: usize) {
+        let (mut pos, mut vel) = (VU_MIN, 0.0_f64);
+        for _ in 0..50 {
+            let db = uni(x, -90.0, 6.0);
+            let (p, v, _) = vu_spring(pos, vel, db, frame_dt(x));
+            pos = p;
+            vel = v;
+        }
+        let hold = uni(x, -30.0, -12.0);
+        for _ in 0..300 {
+            let (p, v, _) = vu_spring(pos, vel, hold, frame_dt(x));
+            pos = p;
+            vel = v;
+        }
+        for _ in 0..30 {
+            let (p, v, moved) = vu_spring(pos, vel, hold, frame_dt(x));
+            assert!(!moved, "case {case}: vu moved while settled");
+            pos = p;
+            vel = v;
+        }
+        let (_, _, moved) = vu_spring(pos, vel, hold + 10.0, frame_dt(x));
+        assert!(moved, "case {case}: vu did not wake on +10 dB");
+    }
+
+    fn random_bands(x: &mut u64) -> Vec<f32> {
+        (0..BANDS).map(|_| uni(x, 0.0, 1.0) as f32).collect()
+    }
+
+    fn settle_bands(x: &mut u64, case: usize) {
+        let mut shown = vec![0.0f64; BANDS];
+        for _ in 0..50 {
+            let src = random_bands(x);
+            smooth_bands(&mut shown, &src, frame_dt(x));
+        }
+        let src = random_bands(x);
+        for _ in 0..300 {
+            smooth_bands(&mut shown, &src, frame_dt(x));
+        }
+        for _ in 0..30 {
+            assert!(!smooth_bands(&mut shown, &src, frame_dt(x)), "case {case}: bands moved while settled");
+        }
+        let mut bumped = src.clone();
+        let k = (unit(x) * BANDS as f64) as usize % BANDS;
+        bumped[k] += 0.2;
+        assert!(smooth_bands(&mut shown, &bumped, frame_dt(x)), "case {case}: band {k} did not wake");
+    }
+
+    fn settle_spectrum(x: &mut u64, case: usize) {
+        let mut shown = vec![0.0f64; BANDS];
+        let mut peaks = vec![(0.0f64, 0.0f64); BANDS];
+        for _ in 0..50 {
+            let src = random_bands(x);
+            smooth_spectrum(&mut shown, &mut peaks, &src, frame_dt(x));
+        }
+        let src = random_bands(x);
+        for _ in 0..300 {
+            smooth_spectrum(&mut shown, &mut peaks, &src, frame_dt(x));
+        }
+        for _ in 0..30 {
+            assert!(!smooth_spectrum(&mut shown, &mut peaks, &src, frame_dt(x)), "case {case}: spectrum moved while settled");
+        }
+        let mut bumped = src.clone();
+        let k = (unit(x) * BANDS as f64) as usize % BANDS;
+        bumped[k] += 0.2;
+        assert!(smooth_spectrum(&mut shown, &mut peaks, &bumped, frame_dt(x)), "case {case}: spectrum band {k} did not wake");
+    }
+
+    fn settle_ease(x: &mut u64, case: usize, hi: f64, tau_lo: f64, tau_hi: f64) {
+        let tau = uni(x, tau_lo, tau_hi);
+        let mut cur = uni(x, 0.0, hi);
+        for _ in 0..50 {
+            let t = uni(x, 0.0, hi);
+            cur = ease_toward(cur, t, frame_dt(x), tau, 0.01).0;
+        }
+        let target = uni(x, 0.0, hi);
+        for _ in 0..300 {
+            cur = ease_toward(cur, target, frame_dt(x), tau, 0.01).0;
+        }
+        for _ in 0..30 {
+            let (n, moved) = ease_toward(cur, target, frame_dt(x), tau, 0.01);
+            assert!(!moved, "case {case}: ease moved while settled");
+            cur = n;
+        }
+        let (_, moved) = ease_toward(cur, target + 1.0, frame_dt(x), tau, 0.01);
+        assert!(moved, "case {case}: ease did not wake on +1.0");
+    }
+
+    #[test]
+    fn widgets_settle_and_wake() {
+        let mut x: u64 = 0x5eed;
+        for case in 0..500 {
+            match (unit(&mut x) * 5.0) as u32 {
+                0 => settle_vu(&mut x, case),
+                1 => settle_bands(&mut x, case),
+                2 => settle_spectrum(&mut x, case),
+                3 => settle_ease(&mut x, case, 1024.0, 0.25, 0.25),
+                _ => settle_ease(&mut x, case, 30.0, 0.005, 0.65),
+            }
+        }
+    }
+
+    #[test]
+    fn dial_text_no_overlap() {
+        let w = 124.0_f64;
+        for (title, max, value) in [("AUDIO CPU", 100.0, "888% of 1 core"), ("AUDIO CPU", 100.0, "0% of 1 core"), ("PIPEWIRE FILES", 1024.0, "1024 / 1024")] {
+            let hi = (w * 0.66) as i32 + DIAL_BAND as i32;
+            let h = hi as f64;
+            let surf = cairo::ImageSurface::create(cairo::Format::ARgb32, 124, hi).unwrap();
+            let cr = cairo::Context::new(&surf).unwrap();
+            let items = dial_texts(&cr, w, h, title, max, value);
+            assert_eq!(items.len(), 7);
+            // the title's ink must be real, so this check cannot pass with no font loaded
+            let t: [f64; 4] = items[5].4;
+            assert!(t[2] - t[0] > 20.0, "{title}: title ink width {}", t[2] - t[0]);
+            for (i, a) in items.iter().enumerate() {
+                let r = a.4;
+                assert!(r[0] >= 0.0 && r[1] >= 0.0 && r[2] <= w && r[3] <= h, "item {i} outside the dial: {r:?}");
+                for (j, b) in items.iter().enumerate().skip(i + 1) {
+                    let s = b.4;
+                    let apart = r[2] + 1.0 <= s[0] || s[2] + 1.0 <= r[0] || r[3] + 1.0 <= s[1] || s[3] + 1.0 <= r[1];
+                    assert!(apart, "{value}: items {i} and {j} overlap: {r:?} {s:?}");
+                }
+            }
+            for k in [5, 6] {
+                assert!(items[k].4[1] >= 3.0 + (h - 6.0 - DIAL_BAND), "item {k} sits above the plate: {:?}", items[k].4);
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_dial_unit_is_one_core() {
+        let ui = include_str!("ui.rs");
+        assert!(!ui.contains("AUDIO CPU %"), "the dial still says AUDIO CPU %");
+        assert!(ui.contains("% of 1 core"));
+    }
+
+    #[test]
+    fn one_inf_rms_sample_must_not_kill_the_vu_needle() {
+        let dt = 1.0 / 30.0;
+        let (mut p, mut v) = (VU_MIN - 3.0, 0.0);
+        (p, v, _) = vu_spring(p, v, f64::INFINITY, dt);
+        for _ in 0..150 {
+            (p, v, _) = vu_spring(p, v, -12.0, dt);
+        }
+        assert!((p - 0.0).abs() < 0.5, "needle at {p} (vel {v}) 5 s after one inf sample and steady -12 dBFS; expected about 0 VU");
+    }
+
+    #[test]
+    fn nan_reading_must_not_light_the_meter() {
+        let mut b = Ballistics::new();
+        b.step(f64::NAN, 1.0 / 30.0);
+        assert!(b.level <= M_MIN + 0.5 && b.peak <= M_MIN + 0.5,
+            "a NaN reading lit the meter: level {} peak {} (expected silence at {})", b.level, b.peak, M_MIN);
     }
 }

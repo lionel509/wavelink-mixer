@@ -7,6 +7,11 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Debug, Default)]
 pub struct Stats {
     pub cpu: f64,          // % of one core: pipewire + pipewire-pulse + wireplumber + mixer engine
+    pub gui_cpu: f64,      // % of one core: this mixer window itself
+    pub gui: crate::leak::ProcStats,
+    pub engine: crate::leak::ProcStats,
+    pub expected_taps: u64,
+    pub leaks: Vec<String>, // leak-watch warnings; empty = healthy
     pub fds: u64,          // PipeWire server open files
     pub fd_limit: u64,     // its soft limit
     pub rate: u64,
@@ -52,6 +57,11 @@ pub fn spawn(tx: Sender<Stats>) {
         let mut last = Instant::now();
         let mut warnings = 0u64;
         let mut n = 0u32;
+        let started = Instant::now();
+        let (mut gui_w, mut eng_w) = (crate::leak::Watch::new("window"), crate::leak::Watch::new("engine"));
+        let (mut eng_pid, mut eng_since) = (0u32, Instant::now());
+        let mut leak: (crate::leak::ProcStats, crate::leak::ProcStats, u64, Vec<String>) = Default::default();
+        let mut prev_gui: Option<u64> = None;
         loop {
             let mut st = Stats::default();
             // audio CPU (delta of utime+stime over the interval, 100 ticks/s)
@@ -72,6 +82,54 @@ pub fn spawn(tx: Sender<Stats>) {
                 }
             }
             st.cpu = used as f64 / dt; // ticks per second at 100 Hz == percent of one core
+            // leak watch (every 10 s): this window, the engine, and orphaned meter taps
+            let me = std::process::id();
+            if let Some(t) = ticks(me) {
+                if let Some(o) = prev_gui {
+                    st.gui_cpu = t.saturating_sub(o) as f64 / dt;
+                }
+                prev_gui = Some(t);
+            }
+            if n % 5 == 0 {
+                // snapshot the reaper's held children before the scan: one it reaps after this line is still
+                // excluded, because the scan saw it as a zombie before the reap
+                let held = crate::pw::held();
+                let procs = crate::leak::scan();
+                let gui = crate::leak::read(me, &procs);
+                let gui = crate::leak::ProcStats {
+                    unlinked: crate::leak::UNLINKED.load(std::sync::atomic::Ordering::Relaxed),
+                    // zombies the reaper still holds are transient, not leaks
+                    zombies: crate::leak::zombies_except(&procs, me, &held),
+                    ..gui
+                };
+                let exp = crate::leak::EXPECTED_TAPS.load(std::sync::atomic::Ordering::Relaxed);
+                let exp_taps = if cfg!(target_os = "linux") { Some(exp) } else { None };
+                let mut w = gui_w.update(&gui, exp_taps, started.elapsed().as_secs_f64());
+                let ep = main_pid("wavelink-engine.service").unwrap_or(0);
+                if ep != eng_pid {
+                    eng_pid = ep;
+                    eng_since = Instant::now();
+                    eng_w = crate::leak::Watch::new("engine");
+                }
+                let eng = if ep > 0 { crate::leak::read(ep, &procs) } else { Default::default() };
+                if ep > 0 {
+                    w.extend(eng_w.update(&eng, None, eng_since.elapsed().as_secs_f64()));
+                }
+                let orphans = crate::leak::orphan_taps(&procs);
+                if orphans > 0 {
+                    w.push(format!("{orphans} orphaned meter taps from a closed window"));
+                }
+                for x in &w {
+                    if !leak.3.contains(x) {
+                        eprintln!("leak watch: {x}");
+                    }
+                }
+                leak = (gui, eng, exp, w);
+            }
+            st.gui = leak.0;
+            st.engine = leak.1;
+            st.expected_taps = leak.2;
+            st.leaks = leak.3.clone();
             // PipeWire open files vs limit
             if let Some(pw) = main_pid("pipewire.service") {
                 st.fds = std::fs::read_dir(format!("/proc/{pw}/fd")).map(|d| d.count() as u64).unwrap_or(0);
@@ -125,5 +183,13 @@ mod tests {
         let l = cycle_label(256, 48000);
         assert!(l.ends_with("5.3 ms per cycle"), "{l}");
         assert!(!l.contains("latency"), "{l}");
+    }
+
+    #[test]
+    fn zombie_count_goes_through_held_filter() {
+        // the literals are split so this test's own text cannot satisfy the check
+        let src = include_str!("sysmon.rs");
+        assert!(src.contains(concat!("crate::leak::zombies_", "except(")), "sysmon does not call zombies_except");
+        assert!(!src.contains(concat!("saturating_sub", "(p)")), "the old zombie subtraction is still in sysmon");
     }
 }
