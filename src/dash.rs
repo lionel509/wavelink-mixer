@@ -673,6 +673,7 @@ pub struct Spectrum {
     peaks: std::cell::RefCell<Vec<(f64, f64)>>, // (level, hold time)
     target: std::cell::RefCell<String>,
     born: Instant,
+    compact: std::cell::Cell<bool>,
 }
 
 impl Spectrum {
@@ -686,6 +687,7 @@ impl Spectrum {
             peaks: std::cell::RefCell::new(vec![(0.0, 0.0); BANDS]),
             target: std::cell::RefCell::new(target.to_string()),
             born: Instant::now(),
+            compact: std::cell::Cell::new(false),
         });
         let w = Rc::downgrade(&s);
         area.set_draw_func(move |_, cr, wd, ht| {
@@ -694,6 +696,11 @@ impl Spectrum {
             }
         });
         s
+    }
+
+    /// Compact layout for strips: no dB or Hz labels, bars use the whole area.
+    pub fn set_compact(&self, on: bool) {
+        self.compact.set(on);
     }
 
     /// Which bus this spectrum is labelled and keyed by.
@@ -716,24 +723,27 @@ impl Spectrum {
     }
 
     fn draw(&self, cr: &cairo::Context, w: f64, h: f64) {
-        let (lx, ly, lw, lh) = (30.0, 6.0, w - 36.0, h - 24.0);
+        let compact = self.compact.get();
+        let (lx, ly, lw, lh) = if compact { (2.0, 2.0, w - 4.0, h - 4.0) } else { (30.0, 6.0, w - 36.0, h - 24.0) };
         cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
         cr.set_font_size(9.0);
         cr.set_line_width(1.0);
-        for db in [0, 24, 48] {
-            let y = (ly + lh * db as f64 / 72.0).round() + 0.5;
-            cr.set_source_rgba(1.0, 1.0, 1.0, 0.06);
-            cr.move_to(lx, y);
-            cr.line_to(lx + lw, y);
-            let _ = cr.stroke();
+        if !compact {
+            for db in [0, 24, 48] {
+                let y = (ly + lh * db as f64 / 72.0).round() + 0.5;
+                cr.set_source_rgba(1.0, 1.0, 1.0, 0.06);
+                cr.move_to(lx, y);
+                cr.line_to(lx + lw, y);
+                let _ = cr.stroke();
+                cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
+                cr.move_to(4.0, y + 3.0);
+                let _ = cr.show_text(&if db == 0 { "0".to_string() } else { format!("-{db}") });
+            }
+            let fx = |f: f64| lx + lw * (f / F_LO).ln() / (F_HI / F_LO).ln();
             cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
-            cr.move_to(4.0, y + 3.0);
-            let _ = cr.show_text(&if db == 0 { "0".to_string() } else { format!("-{db}") });
-        }
-        let fx = |f: f64| lx + lw * (f / F_LO).ln() / (F_HI / F_LO).ln();
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
-        for (f, s) in [(50.0, "50"), (100.0, "100"), (250.0, "250"), (500.0, "500"), (1000.0, "1k"), (2500.0, "2.5k"), (5000.0, "5k"), (10000.0, "10k")] {
-            text_centered(cr, fx(f), ly + lh + 10.0, s);
+            for (f, s) in [(50.0, "50"), (100.0, "100"), (250.0, "250"), (500.0, "500"), (1000.0, "1k"), (2500.0, "2.5k"), (5000.0, "5k"), (10000.0, "10k")] {
+                text_centered(cr, fx(f), ly + lh + 10.0, s);
+            }
         }
         // bars: hue runs across the frequency range and slowly cycles
         let t = self.born.elapsed().as_secs_f64();
