@@ -124,7 +124,8 @@ pub fn midi_bytes(tracks: &[Vec<Note>; 3]) -> Vec<u8> {
             let dur = if stem == 0 { DRUM_DUR } else { n.dur };
             let vel = n.vel.clamp(1, 127);
             ev.push((tick(n.t), 1, vec![0x90 | ch, k, vel]));
-            ev.push((tick(n.t + dur), 0, vec![0x80 | ch, k, 0]));
+            // at least one tick after the note-on, so a zero-length note still stops after it starts
+            ev.push((tick(n.t + dur).max(tick(n.t) + 1), 0, vec![0x80 | ch, k, 0]));
         }
         out.extend(track_chunk(&mut ev));
     }
@@ -382,5 +383,23 @@ mod tests {
         let p = synth_props("ch_stems");
         assert!(p.contains("target.object=ch_stems"), "{p}");
         assert!(p.contains("node.name=stems_synth"), "{p}");
+    }
+
+    /// A zero-length note still writes its note-on before its note-off, and back-to-back notes of the
+    /// same pitch keep off-before-on at the shared tick.
+    #[test]
+    fn midi_off_follows_on_and_back_to_back_same_pitch_holds() {
+        let zero = vec![n(0.0, 0.0, 50, 100)];
+        let bytes = midi_bytes(&[vec![], zero, vec![]]);
+        let on = bytes.windows(3).position(|w| (w[0] & 0xf0) == 0x90 && w[1] == 50 && w[2] > 0).unwrap();
+        let off = bytes.windows(3).position(|w| (w[0] & 0xf0) == 0x80 && w[1] == 50).unwrap();
+        assert!(on < off, "zero-length note: off at byte {off} before on at byte {on}");
+
+        let pair = vec![n(1.0, 0.5, 50, 100), n(1.5, 0.5, 50, 100)];
+        let bytes = midi_bytes(&[vec![], pair, vec![]]);
+        let ons: Vec<usize> = bytes.windows(3).enumerate().filter(|(_, w)| (w[0] & 0xf0) == 0x90 && w[1] == 50 && w[2] > 0).map(|(i, _)| i).collect();
+        let offs: Vec<usize> = bytes.windows(3).enumerate().filter(|(_, w)| (w[0] & 0xf0) == 0x80 && w[1] == 50).map(|(i, _)| i).collect();
+        assert_eq!((ons.len(), offs.len()), (2, 2));
+        assert!(offs[0] < ons[1], "the first note's off must come before the second note's on at the shared tick");
     }
 }
