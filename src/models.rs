@@ -8,10 +8,10 @@ pub const RELEASE: &str = "https://github.com/lionel509/wavelink-mixer/releases/
 pub const MODELS: [(&str, &str, &str); 6] = [
     ("stemgenrt-v0.7-independent.onnx", "https://github.com/sweetspotsoundsystem/StemgenRT-5.8/releases/download/v0.7.0/independent.onnx", "0a49388dd2a47986ab9a161c8764c22853b4d601c188ac052eb530f076d513c7"),
     ("basic-pitch-nmp.onnx", "https://raw.githubusercontent.com/spotify/basic-pitch/v0.4.0/basic_pitch/saved_models/icassp_2022/nmp.onnx", "2c3c1d144bfa61ad236e92e169c13535c880469a12a047d4e73451f2c059a0ec"),
-    ("umxhq-vocals.onnx", "https://github.com/lionel509/wavelink-mixer/releases/download/models-v1/umxhq-vocals.onnx", "TODO"),
-    ("umxhq-drums.onnx", "https://github.com/lionel509/wavelink-mixer/releases/download/models-v1/umxhq-drums.onnx", "TODO"),
-    ("umxhq-bass.onnx", "https://github.com/lionel509/wavelink-mixer/releases/download/models-v1/umxhq-bass.onnx", "TODO"),
-    ("umxhq-other.onnx", "https://github.com/lionel509/wavelink-mixer/releases/download/models-v1/umxhq-other.onnx", "TODO"),
+    ("umxhq-vocals.onnx", "https://github.com/lionel509/wavelink-mixer/releases/download/models-v1/umxhq-vocals.onnx", "790c961f72f807a33e29d9b2bc689634d1c0a0049ba5b10c03a248cb83f169df"),
+    ("umxhq-drums.onnx", "https://github.com/lionel509/wavelink-mixer/releases/download/models-v1/umxhq-drums.onnx", "9fb5483ed85ff34cfd494e28309862c0003b9cfdf98b4b3d3097a95b425411db"),
+    ("umxhq-bass.onnx", "https://github.com/lionel509/wavelink-mixer/releases/download/models-v1/umxhq-bass.onnx", "4ed20bddaafefb11326f9e42e806a3673561ed60af078ded7c8ea93e60881763"),
+    ("umxhq-other.onnx", "https://github.com/lionel509/wavelink-mixer/releases/download/models-v1/umxhq-other.onnx", "ffa43a4eafebb9ad8d02c521a59edfe521351772a083da41183e118ac634e3a6"),
 ];
 pub const S_FILES: [&str; 2] = ["stemgenrt-v0.7-independent.onnx", "basic-pitch-nmp.onnx"];
 pub const U_FILES: [&str; 5] = ["umxhq-vocals.onnx", "umxhq-drums.onnx", "umxhq-bass.onnx", "umxhq-other.onnx", "basic-pitch-nmp.onnx"];
