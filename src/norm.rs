@@ -12,6 +12,8 @@ pub const DEADBAND_DB: f64 = 1.0;   // within this of the wanted gain: don't mov
 pub const STEP_DB: f64 = 0.5;       // emit only when the slider would move at least this much
 pub const MIN_EMIT_S: f64 = 0.25;   // at most 4 slider writes per second per channel
 pub const MANUAL_HOLD_S: f64 = 3.0; // after his own move, auto waits this long
+pub const FADER_MIN_DB: f64 = -60.0; // the fader's range (dash.rs taper ends); auto never asks past it
+pub const FADER_MAX_DB: f64 = 12.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Channel {
@@ -21,11 +23,12 @@ pub struct Channel {
     pub hold: f64,          // seconds of manual hold left
     pub since_emit: f64,
     pub emitted: f64,       // last value handed to the slider
+    pub pending: Option<f64>, // his move made before the first reading; becomes the offset then
 }
 
 impl Channel {
     pub fn new(gain_db: f64) -> Channel {
-        Channel { gain: gain_db, offset: 0.0, loud: None, hold: 0.0, since_emit: MIN_EMIT_S, emitted: gain_db }
+        Channel { gain: gain_db, offset: 0.0, loud: None, hold: 0.0, since_emit: MIN_EMIT_S, emitted: gain_db, pending: None }
     }
 
     pub fn loud_db(&self) -> Option<f64> {
@@ -39,6 +42,9 @@ impl Channel {
         self.hold = MANUAL_HOLD_S;
         if let Some(l) = self.loud_db() {
             self.offset = gain_db - (TARGET_DB - l).clamp(MAX_CUT_DB, MAX_BOOST_DB);
+            self.pending = None;
+        } else {
+            self.pending = Some(gain_db);
         }
     }
 
@@ -59,7 +65,11 @@ impl Channel {
             None => p,
         };
         self.loud = Some(l);
-        let want = (TARGET_DB - 10.0 * l.log10()).clamp(MAX_CUT_DB, MAX_BOOST_DB) + self.offset;
+        if let Some(g) = self.pending.take() {
+            self.offset = g - (TARGET_DB - 10.0 * l.log10()).clamp(MAX_CUT_DB, MAX_BOOST_DB);
+        }
+        let want = ((TARGET_DB - 10.0 * l.log10()).clamp(MAX_CUT_DB, MAX_BOOST_DB) + self.offset)
+            .clamp(FADER_MIN_DB, FADER_MAX_DB);
         let diff = want - self.gain;
         if diff.abs() < DEADBAND_DB {
             return None;
