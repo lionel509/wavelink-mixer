@@ -2585,3 +2585,69 @@ pub fn activate(app: &adw::Application) {
     }
     win.present();
 }
+
+/// Whether a (out, in) pair's links must be (re)applied: first sight of the pair (Stereo included), or a side or node-id change.
+#[allow(dead_code)]
+fn needs_relink(_cur: Option<(Side, u64, u64)>, _want: (Side, u64, u64)) -> bool {
+    false
+}
+
+/// FIFO job queue on one long-lived thread, off the GTK thread.
+#[allow(dead_code)]
+pub struct Serial;
+
+#[allow(dead_code)]
+impl Serial {
+    pub fn new() -> Self {
+        Serial
+    }
+    pub fn push(&self, _job: Box<dyn FnOnce() + Send>) {}
+    pub fn flush(&self, _timeout: Duration) -> bool {
+        false
+    }
+}
+
+#[cfg(test)]
+mod serial_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    #[test]
+    fn needs_relink_first_sight_and_id_change() {
+        assert!(needs_relink(None, (Side::Stereo, 1, 2)));
+        assert!(!needs_relink(Some((Side::Stereo, 1, 2)), (Side::Stereo, 1, 2)));
+        assert!(needs_relink(Some((Side::Stereo, 1, 2)), (Side::Stereo, 1, 3)));
+    }
+
+    #[test]
+    fn serial_runs_jobs_in_push_order() {
+        let q = Serial::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        for k in 0..300usize {
+            let seen = seen.clone();
+            q.push(Box::new(move || {
+                std::thread::sleep(Duration::from_millis((k % 3) as u64));
+                seen.lock().unwrap().push(k);
+            }));
+        }
+        assert!(q.flush(Duration::from_secs(5)));
+        assert_eq!(*seen.lock().unwrap(), (0..300).collect::<Vec<usize>>());
+    }
+
+    #[test]
+    fn serial_flush_times_out() {
+        let q = Serial::new();
+        q.push(Box::new(|| std::thread::sleep(Duration::from_secs(2))));
+        let t = Instant::now();
+        assert!(!q.flush(Duration::from_millis(100)));
+        assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn apply_sides_uses_queue_and_no_startup_shortcut() {
+        let s = include_str!("ui.rs");
+        assert!(s.contains(concat!("self.side_q", ".push(")));
+        assert!(!s.contains(concat!("cur.is_none() && s ", "== Side::Stereo")));
+    }
+}
