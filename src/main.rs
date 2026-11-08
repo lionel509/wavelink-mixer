@@ -9,6 +9,9 @@ mod notes;
 mod sep;
 mod stemcfg;
 mod stems;
+#[cfg(test)]
+#[path = "test_breaker_back.rs"]
+mod test_breaker_back;
 mod latency;
 mod leak;
 mod norm;
