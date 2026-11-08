@@ -26,14 +26,18 @@ enum Failure {
 /// One worker per wanted input: keeps a pw-play child fed from its URL.
 #[derive(Default)]
 pub struct In {
-    workers: HashMap<String, (String, Arc<AtomicBool>)>,
+    workers: HashMap<String, (String, Arc<AtomicBool>, std::thread::JoinHandle<()>)>,
 }
 
 impl In {
     pub fn tick(&mut self, cfg: &Config, g: &Graph) {
-        let want: HashMap<String, String> = wanted(cfg, &|n| g.has(n)).into_iter().collect();
+        self.sync(wanted(cfg, &|n| g.has(n)).into_iter().collect());
+    }
+
+    /// Makes the running workers match `want` (input id -> URL).
+    fn sync(&mut self, want: HashMap<String, String>) {
         // stop workers that are no longer wanted or whose URL changed
-        self.workers.retain(|id, (url, stop)| {
+        self.workers.retain(|id, (url, stop, _)| {
             let keep = want.get(id) == Some(url);
             if !keep {
                 stop.store(true, Ordering::Relaxed);
@@ -46,8 +50,8 @@ impl In {
             }
             let stop = Arc::new(AtomicBool::new(false));
             let (w_id, w_url, w_stop) = (id.clone(), url.clone(), stop.clone());
-            std::thread::spawn(move || worker(&w_id, &w_url, &w_stop));
-            self.workers.insert(id, (url, stop));
+            let th = std::thread::spawn(move || worker(&w_id, &w_url, &w_stop));
+            self.workers.insert(id, (url, stop, th));
         }
     }
 }
