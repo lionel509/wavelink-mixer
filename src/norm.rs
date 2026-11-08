@@ -227,4 +227,53 @@ mod tests {
             }
         }
     }
+
+    /// Breaker C feed helper: run `secs` of constant `rms` at step `dt`, collecting slider writes.
+    fn feed(c: &mut Channel, rms: f64, secs: f64, dt: f64) -> Vec<f64> {
+        let n = (secs / dt).round() as usize;
+        let mut out = vec![];
+        for _ in 0..n {
+            if let Some(v) = c.step(rms, dt) {
+                out.push(v);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn manual_before_first_reading_is_kept() {
+        let mut c = Channel::new(0.0);
+        c.manual(-18.0);
+        feed(&mut c, -8.0, 20.0, 0.03);
+        assert!((c.gain - -18.0).abs() <= DEADBAND_DB, "auto snapped the slider back to {:.2} dB; his move was -18.0 dB", c.gain);
+    }
+
+    #[test]
+    fn offset_never_asks_past_fader_top() {
+        let mut c = Channel::new(0.0);
+        feed(&mut c, -8.0, 20.0, 0.03);
+        c.manual(12.0);
+        let mut emits = feed(&mut c, -8.0, 10.0, 0.03);
+        emits.extend(feed(&mut c, -45.0, 30.0, 0.03));
+        let max = emits.iter().cloned().fold(f64::MIN, f64::max);
+        assert!(max <= 12.0 + 1e-9, "auto asked the slider for {max:.2} dB; the fader tops out at +12");
+        assert!(c.gain <= 12.0 + 1e-9, "internal gain {:.2} dB is past the fader top", c.gain);
+    }
+
+    #[test]
+    fn offset_never_asks_past_fader_floor() {
+        let mut c = Channel::new(0.0);
+        feed(&mut c, -40.0, 20.0, 0.03);
+        c.manual(-60.0);
+        let emits = feed(&mut c, -8.0, 30.0, 0.03);
+        let min = emits.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(min >= -60.0 - 1e-9, "auto asked the slider for {min:.2} dB; the fader bottoms out at -60");
+        assert!(c.gain >= -60.0 - 1e-9, "internal gain {:.2} dB is past the fader floor", c.gain);
+    }
+
+    #[test]
+    fn fader_range_matches_taper() {
+        assert_eq!(-60.0, crate::dash::pos_to_db(0.0));
+        assert_eq!(12.0, crate::dash::pos_to_db(1.0));
+    }
 }
