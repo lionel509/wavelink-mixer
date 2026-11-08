@@ -542,7 +542,7 @@ mod tests {
         let pid: u32 = loop {
             let rem = deadline.saturating_duration_since(std::time::Instant::now());
             match rx.recv_timeout(rem) {
-                Ok(l) => { if let Some(p) = l.strip_prefix("PID ") { break p.trim().parse().unwrap(); } }
+                Ok(l) => { if let Some(i) = l.find("PID ") { break l[i + 4..].trim().parse().unwrap(); } }
                 Err(_) => panic!("helper printed no PID line"),
             }
         };
