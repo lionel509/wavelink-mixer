@@ -167,3 +167,46 @@ fn open_rejects_404() {
     });
     assert!(open(&format!("http://127.0.0.1:{port}/missing.wav")).is_err());
 }
+
+/// Serves one connection: reads the request, writes `head` then `body`, then closes.
+fn serve_once(head: &str, body: Vec<u8>) -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let head = head.to_string();
+    std::thread::spawn(move || {
+        let (mut c, _) = l.accept().unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = c.read(&mut buf);
+        let _ = c.write_all(head.as_bytes());
+        let _ = c.write_all(&body);
+    });
+    port
+}
+
+/// A redirect to file:// makes ureq panic. The panic kills the worker thread.
+#[test]
+fn breaker_redirect_to_file_scheme_is_an_error_not_a_panic() {
+    let port = serve_once("HTTP/1.1 302 Found\r\nLocation: file:///etc/hosts\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", vec![]);
+    let url = format!("http://127.0.0.1:{port}/r");
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| open(&url).is_err()));
+    assert!(matches!(r, Ok(true)), "open({url}) panicked or accepted a file:// redirect: {r:?}");
+}
+
+/// A wanted input whose worker thread has ended must get a new worker, not stay silent.
+#[test]
+fn sync_restarts_a_worker_whose_thread_ended() {
+    let mut inn = In::default();
+    let url = "http://127.0.0.1:1/x.wav".to_string();
+    let old_stop = Arc::new(AtomicBool::new(false));
+    let dead = std::thread::spawn(|| {});
+    while !dead.is_finished() {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    inn.workers.insert("n1".into(), (url.clone(), old_stop.clone(), dead));
+    inn.sync(HashMap::from([("n1".to_string(), url.clone())]));
+    let (_, new_stop, th) = &inn.workers["n1"];
+    let running = !th.is_finished();
+    new_stop.store(true, Ordering::Relaxed);
+    old_stop.store(true, Ordering::Relaxed);
+    assert!(running, "worker for n1 ended and was not restarted while n1 is still wanted");
+}
