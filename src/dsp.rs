@@ -325,23 +325,34 @@ mod tests {
     fn onsets_find_click_train() {
         let n = 4 * 44100;
         let mut seed = 3u64;
-        let mut m: Vec<f32> = (0..n).map(|_| (lcg(&mut seed) * 2.0 - 1.0) * 0.001).collect();
-        for i in 0..8usize {
-            let s0 = (i as f64 * 0.5 * 44100.0).round() as usize;
-            for j in 0..44 {
-                if s0 + j < n {
-                    m[s0 + j] = 0.9 * if j % 2 == 0 { 1.0 } else { -1.0 };
+        let noise: Vec<f32> = (0..n).map(|_| (lcg(&mut seed) * 2.0 - 1.0) * 0.001).collect();
+        let sine: Vec<f32> = (0..n).map(|i| (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 44100.0).sin() as f32 * 0.5).collect();
+        // 1 ms clicks (0.9, alternating sign) at 0.25 + 0.5*i s, added on top of `base`.
+        let clicks = |base: &[f32]| -> Vec<f32> {
+            let mut m = base.to_vec();
+            for i in 0..8usize {
+                let s0 = ((0.25 + 0.5 * i as f64) * 44100.0).round() as usize;
+                for j in 0..44 {
+                    m[s0 + j] += 0.9 * if j % 2 == 0 { 1.0 } else { -1.0 };
                 }
             }
+            m
+        };
+        for (name, base) in [("noise", noise.as_slice()), ("sine", sine.as_slice())] {
+            let on = onsets(&clicks(base), 44100);
+            assert_eq!(on.len(), 8, "{name}: onsets {on:?}");
+            for (i, (t, s)) in on.iter().enumerate() {
+                assert!((t - (0.25 + 0.5 * i as f64)).abs() < 0.01, "{name}: onset {i} at {t}");
+                assert!(*s > 0.5, "{name}: onset {i} strength {s}");
+            }
         }
-        let on = onsets(&m, 44100);
-        assert_eq!(on.len(), 8, "onsets {on:?}");
-        for (i, (t, s)) in on.iter().enumerate() {
-            assert!((t - 0.5 * i as f64).abs() < 0.01, "onset {i} at {t}");
-            assert!(*s > 0.5, "onset {i} strength {s}");
-        }
-        let sine: Vec<f32> = (0..n).map(|i| (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 44100.0).sin() as f32 * 0.5).collect();
-        assert!(onsets(&sine, 44100).is_empty());
+        // Sustained tone, noise floor, silence, too short: no fake drum hits, frame 0 included.
+        let on = onsets(&sine, 44100);
+        assert!(on.is_empty(), "sine: {on:?}");
+        let on = onsets(&noise, 44100);
+        assert!(on.is_empty(), "noise: {on:?}");
+        assert!(onsets(&vec![0.0f32; n], 44100).is_empty());
+        assert!(onsets(&[0.1f32; 500], 44100).is_empty());
     }
 
     #[test]
