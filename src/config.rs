@@ -390,7 +390,10 @@ impl Config {
 
     /// Adds a Network bus (#15) that starts as a copy of the main mix. Returns its id.
     pub fn add_network_bus(&mut self, name: &str) -> String {
-        let id = (1..).map(|k| format!("n{k}")).find(|id| !self.buses.iter().any(|b| &b.id == id)).unwrap();
+        let id = (1..)
+            .map(|k| format!("n{k}"))
+            .find(|id| !self.buses.iter().any(|b| &b.id == id) && !self.inputs.iter().any(|i| &i.id == id))
+            .unwrap();
         if let Some(main) = self.buses.iter().find(|b| matches!(b.kind, BusKind::Hardware { .. })).map(|b| b.id.clone()) {
             for i in &mut self.inputs {
                 if let Some(r) = i.routes.get(&main).cloned() {
