@@ -1,8 +1,9 @@
 //! Note data for the Stems feature: the rolling timeline, the SMF writer, and the private fluidsynth player.
-//! Unit 1 skeleton: bodies are `todo!()` until Unit 5.
 #![allow(dead_code, unused_imports, unused_variables)]
 use crate::config::glib_home;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Note {
@@ -18,88 +19,235 @@ pub const MIDI_LAG: f64 = 1.5;
 /// (fluidsynth channel, GM program) for drums, bass and other.
 pub const PROGRAMS: [(u8, u8); 3] = [(9, 0), (1, 33), (2, 0)];
 
-pub struct Timeline {}
+/// Ticks per quarter note in the SMF output.
+const TPQ: u32 = 480;
+/// 120 bpm (500000 us per quarter note) at 480 tpq is 960 ticks per second.
+const TICKS_PER_SEC: f64 = 960.0;
+/// Drum hits are written with a fixed length, as in `synth_events`.
+const DRUM_DUR: f64 = 0.1;
+
+/// Notes per stem, in insertion order.
+pub struct Timeline {
+    notes: [Vec<Note>; 3],
+}
 
 impl Timeline {
     pub fn new() -> Self {
-        todo!()
+        Timeline { notes: [Vec::new(), Vec::new(), Vec::new()] }
     }
 
     pub fn add(&mut self, stem: usize, notes: &[Note]) {
-        todo!()
+        self.notes[stem].extend_from_slice(notes);
     }
 
     /// Notes with t < to and t + dur >= from.
     pub fn window(&self, stem: usize, from: f64, to: f64) -> Vec<Note> {
-        todo!()
+        self.notes[stem].iter().filter(|n| n.t < to && n.t + n.dur >= from).cloned().collect()
     }
 
     /// Drops notes with t + dur < before.
     pub fn prune(&mut self, before: f64) {
-        todo!()
+        for v in self.notes.iter_mut() {
+            v.retain(|n| n.t + n.dur >= before);
+        }
     }
 
     pub fn drain_all(&mut self) -> [Vec<Note>; 3] {
-        todo!()
+        [std::mem::take(&mut self.notes[0]), std::mem::take(&mut self.notes[1]), std::mem::take(&mut self.notes[2])]
     }
+}
+
+/// MIDI key for a note: drum pitch 0 is the GM bass drum (38), everything else is the pitch itself.
+fn key(stem: usize, pitch: u8) -> u8 {
+    if stem == 0 && pitch == 0 {
+        38
+    } else {
+        pitch.min(127)
+    }
+}
+
+fn write_vlq(mut v: u32, out: &mut Vec<u8>) {
+    let mut buf = [0u8; 5];
+    let mut i = 4;
+    buf[i] = (v & 0x7f) as u8;
+    v >>= 7;
+    while v > 0 {
+        i -= 1;
+        buf[i] = ((v & 0x7f) as u8) | 0x80;
+        v >>= 7;
+    }
+    out.extend_from_slice(&buf[i..]);
+}
+
+/// Serialises one track. `events` are (tick, is_note_on, bytes); at equal ticks note-offs come first.
+fn track_chunk(events: &mut Vec<(u64, u8, Vec<u8>)>) -> Vec<u8> {
+    events.sort_by_key(|e| (e.0, e.1));
+    let mut body = Vec::new();
+    let mut prev = 0u64;
+    for (tick, _, bytes) in events.iter() {
+        write_vlq((*tick - prev) as u32, &mut body);
+        body.extend_from_slice(bytes);
+        prev = *tick;
+    }
+    body.extend_from_slice(&[0x00, 0xff, 0x2f, 0x00]);
+    let mut out = Vec::with_capacity(body.len() + 8);
+    out.extend_from_slice(b"MTrk");
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(&body);
+    out
 }
 
 /// SMF 1, 480 tpq. Track 0 is the tempo map; then drums (ch 9, pitch 0 -> key 38), bass (ch 1, prog 33), other (ch 2, prog 0).
 pub fn midi_bytes(tracks: &[Vec<Note>; 3]) -> Vec<u8> {
-    todo!()
+    let t_min = tracks.iter().flatten().map(|n| n.t).fold(f64::INFINITY, f64::min);
+    let t_min = if t_min.is_finite() { t_min } else { 0.0 };
+    let tick = |t: f64| ((t - t_min) * TICKS_PER_SEC).round().max(0.0) as u64;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"MThd");
+    out.extend_from_slice(&6u32.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes()); // format 1
+    out.extend_from_slice(&4u16.to_be_bytes()); // track count: tempo + 3 stems
+    out.extend_from_slice(&(TPQ as u16).to_be_bytes());
+
+    let mut tempo = vec![(0u64, 0u8, vec![0xff, 0x51, 0x03, 0x07, 0xa1, 0x20])];
+    out.extend(track_chunk(&mut tempo));
+
+    for (stem, notes) in tracks.iter().enumerate() {
+        let (ch, prog) = PROGRAMS[stem];
+        let mut ev = Vec::new();
+        if stem != 0 {
+            ev.push((0u64, 0u8, vec![0xc0 | ch, prog]));
+        }
+        for n in notes {
+            let k = key(stem, n.pitch);
+            let dur = if stem == 0 { DRUM_DUR } else { n.dur };
+            let vel = n.vel.clamp(1, 127);
+            ev.push((tick(n.t), 1, vec![0x90 | ch, k, vel]));
+            ev.push((tick(n.t + dur), 0, vec![0x80 | ch, k, 0]));
+        }
+        out.extend(track_chunk(&mut ev));
+    }
+    out
 }
 
 /// Per note: (t + lag, "noteon C K V") and (t + lag + d, "noteoff C K"). Drums: K = 38 if pitch == 0, d = 0.1.
 pub fn synth_events(stem: usize, notes: &[Note], lag: f64) -> Vec<(f64, String)> {
-    todo!()
+    let (c, _) = PROGRAMS[stem];
+    let mut out = Vec::with_capacity(notes.len() * 2);
+    for n in notes {
+        let k = key(stem, n.pitch);
+        let d = if stem == 0 { DRUM_DUR } else { n.dur };
+        let vel = n.vel.clamp(1, 127);
+        out.push((n.t + lag, format!("noteon {c} {k} {vel}")));
+        out.push((n.t + lag + d, format!("noteoff {c} {k}")));
+    }
+    out
 }
 
 /// Removes and returns the lines with time <= now, in ascending time order (stable).
 pub fn due(pending: &mut Vec<(f64, String)>, now: f64) -> Vec<String> {
-    todo!()
+    let mut ready = Vec::new();
+    let mut keep = Vec::new();
+    for e in pending.drain(..) {
+        if e.0 <= now {
+            ready.push(e);
+        } else {
+            keep.push(e);
+        }
+    }
+    *pending = keep;
+    ready.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    ready.into_iter().map(|e| e.1).collect()
 }
 
 pub fn synth_bin() -> &'static str {
-    todo!()
+    for p in ["/home/linuxbrew/.linuxbrew/bin/fluidsynth", "/usr/bin/fluidsynth"] {
+        if Path::new(p).exists() {
+            return p;
+        }
+    }
+    "fluidsynth"
 }
 
 /// glib_home()/.local/share/wavelink/soundfonts/FluidR3_GM.sf2, if it exists.
 pub fn synth_font() -> Option<PathBuf> {
-    todo!()
+    let p = glib_home().join(".local/share/wavelink/soundfonts/FluidR3_GM.sf2");
+    if p.exists() {
+        Some(p)
+    } else {
+        None
+    }
 }
 
 /// ["-a", "pipewire", "-n", "-r", "48000", "-g", "0.6"]; the font is appended by spawn.
 pub fn synth_args() -> Vec<String> {
-    todo!()
+    ["-a", "pipewire", "-n", "-r", "48000", "-g", "0.6"].iter().map(|s| s.to_string()).collect()
 }
 
 /// PipeWire props routing the synth into `node`.
 pub fn synth_props(node: &str) -> String {
-    todo!()
+    format!(
+        "{{ target.object={node} node.name=stems_synth node.description=\"Stems MIDI\" application.name=Stems node.dont-fallback=true }}"
+    )
 }
 
-pub struct Synth {}
+/// The private fluidsynth child. Its stdin carries the shell lines written by `pump`.
+pub struct Synth {
+    child: Child,
+    stdin: ChildStdin,
+    pending: Vec<(f64, String)>,
+}
 
 impl Synth {
     /// PIPEWIRE_PROPS from synth_props; stdin piped; then "prog 1 33\nprog 2 0\n". No font -> Err("soundfont missing").
     pub fn spawn(out_node: &str) -> Result<Synth, String> {
-        todo!()
+        let font = synth_font().ok_or_else(|| "soundfont missing".to_string())?;
+        let mut cmd = Command::new(synth_bin());
+        cmd.args(synth_args())
+            .arg(&font)
+            .env("PIPEWIRE_PROPS", synth_props(out_node))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null());
+        crate::pw::die_with_parent(&mut cmd);
+        let mut child = cmd.spawn().map_err(|e| format!("fluidsynth: {e}"))?;
+        let mut stdin = child.stdin.take().ok_or_else(|| "fluidsynth: no stdin".to_string())?;
+        let wrote = stdin.write_all(b"prog 1 33\nprog 2 0\n");
+        let wrote = wrote.and_then(|_| stdin.flush());
+        if let Err(e) = wrote {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("fluidsynth: {e}"));
+        }
+        Ok(Synth { child, stdin, pending: Vec::new() })
     }
 
     pub fn queue(&mut self, ev: Vec<(f64, String)>) {
-        todo!()
+        self.pending.extend(ev);
     }
 
     /// Writes the due lines and flushes; returns the count.
     pub fn pump(&mut self, now: f64) -> usize {
-        todo!()
+        let lines = due(&mut self.pending, now);
+        let mut n = 0;
+        for l in &lines {
+            if writeln!(self.stdin, "{l}").is_err() {
+                break;
+            }
+            n += 1;
+        }
+        let _ = self.stdin.flush();
+        n
     }
 }
 
 impl Drop for Synth {
     /// Writes "reset\n", kills and waits.
     fn drop(&mut self) {
-        todo!()
+        let _ = writeln!(self.stdin, "reset");
+        let _ = self.stdin.flush();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

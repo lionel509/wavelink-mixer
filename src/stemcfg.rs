@@ -1,8 +1,7 @@
 //! Stems settings (~/.config/wavelink-mixer/stems.json) and the rules for which channel is the source.
-//! Unit 1 skeleton: bodies are `todo!()` until Unit 5.
 #![allow(dead_code, unused_imports, unused_variables)]
 use crate::config::{glib_home, names, flat_eq, BusKind, Config, Input, InputKind, Rack, Route};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// The id of the input the feature creates.
@@ -38,56 +37,119 @@ pub struct StemsCfg {
 /// source "spotify", engine Live, plays Midi, replaced None.
 impl Default for StemsCfg {
     fn default() -> Self {
-        todo!()
+        StemsCfg {
+            source: "spotify".to_string(),
+            engine: SepEngine::Live,
+            plays: Plays::Midi,
+            replaced: None,
+        }
     }
 }
 
 impl StemsCfg {
     /// Writes to a temp file, then renames it into path().
     pub fn save(&self) {
-        todo!()
+        let p = path();
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = p.with_extension("json.tmp");
+        if let Ok(s) = serde_json::to_string_pretty(self) {
+            if std::fs::write(&tmp, s).is_ok() {
+                let _ = std::fs::rename(&tmp, &p);
+            }
+        }
     }
 }
 
 /// glib_home()/.config/wavelink-mixer/stems.json
 pub fn path() -> PathBuf {
-    todo!()
+    glib_home().join(".config/wavelink-mixer/stems.json")
 }
 
 pub fn load() -> StemsCfg {
-    todo!()
+    load_from(&path())
 }
 
 /// Missing or invalid file -> default.
 pub fn load_from(p: &Path) -> StemsCfg {
-    todo!()
+    std::fs::read_to_string(p).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
 /// (id, name) of every input except CHANNEL_ID, in config order.
 pub fn sources(cfg: &Config) -> Vec<(String, String)> {
-    todo!()
+    cfg.inputs.iter().filter(|i| i.id != CHANNEL_ID).map(|i| (i.id.clone(), i.name.clone())).collect()
 }
 
 /// `wanted` if it is a source, else "spotify" if it is one, else the first source, else None.
 pub fn resolve(cfg: &Config, wanted: &str) -> Option<String> {
-    todo!()
+    let srcs = sources(cfg);
+    let has = |id: &str| srcs.iter().any(|(s, _)| s == id);
+    if has(wanted) {
+        Some(wanted.to_string())
+    } else if has("spotify") {
+        Some("spotify".to_string())
+    } else {
+        srcs.first().map(|(id, _)| id.clone())
+    }
 }
 
 /// Virtual -> (names::ch(id), true); Source { target } -> (target, false).
 pub fn tap(inp: &Input) -> (String, bool) {
-    todo!()
+    match &inp.kind {
+        InputKind::Virtual => (names::ch(&inp.id), true),
+        InputKind::Source { target } => (target.clone(), false),
+    }
 }
 
 /// If an input with id CHANNEL_ID exists, returns false and leaves cfg alone. Otherwise appends the
 /// "Stems" Virtual input (Hardware buses copied from `source` and Virtual buses off; at least one Hardware
 /// bus on) and returns true. Never edits another input.
 pub fn ensure_channel(cfg: &mut Config, source: &str) -> bool {
-    todo!()
+    if cfg.inputs.iter().any(|i| i.id == CHANNEL_ID) {
+        return false;
+    }
+    let off = Route { on: false, level_db: 0.0 };
+    let src = cfg.inputs.iter().find(|i| i.id == source).cloned();
+    let mut routes: BTreeMap<String, Route> = BTreeMap::new();
+    for b in &cfg.buses {
+        let r = match b.kind {
+            BusKind::Hardware { .. } => src.as_ref().map(|s| s.route(&b.id)).unwrap_or_else(|| off.clone()),
+            BusKind::Virtual { .. } => off.clone(),
+        };
+        routes.insert(b.id.clone(), r);
+    }
+    let hw: Vec<String> = cfg
+        .buses
+        .iter()
+        .filter(|b| matches!(b.kind, BusKind::Hardware { .. }))
+        .map(|b| b.id.clone())
+        .collect();
+    if !hw.is_empty() && !hw.iter().any(|id| routes.get(id).map_or(false, |r| r.on)) {
+        routes.insert(hw[0].clone(), Route { on: true, level_db: 0.0 });
+    }
+    cfg.inputs.push(Input {
+        id: CHANNEL_ID.into(),
+        name: "Stems".into(),
+        color: "#ff9f43".into(),
+        kind: InputKind::Virtual,
+        fx: "clean".into(),
+        eq: flat_eq(),
+        gain_db: 0.0,
+        mute: false,
+        routes,
+        default_sink: false,
+        rack: Rack::default(),
+        normalize: false,
+        norm_base: None,
+        norm_out: None,
+    });
+    true
 }
 
 /// cfg_mute || (!solo.is_empty() && !solo.contains(id)) || replaced == Some(id)
 pub fn effective_mute(cfg_mute: bool, id: &str, solo: &HashSet<String>, replaced: Option<&str>) -> bool {
-    todo!()
+    cfg_mute || (!solo.is_empty() && !solo.contains(id)) || replaced == Some(id)
 }
 
 #[cfg(test)]
