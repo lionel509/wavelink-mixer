@@ -1777,4 +1777,23 @@ mod redraw_tests {
         assert!(!ui.contains("AUDIO CPU %"), "the dial still says AUDIO CPU %");
         assert!(ui.contains("% of 1 core"));
     }
+
+    #[test]
+    fn one_inf_rms_sample_must_not_kill_the_vu_needle() {
+        let dt = 1.0 / 30.0;
+        let (mut p, mut v) = (VU_MIN - 3.0, 0.0);
+        (p, v, _) = vu_spring(p, v, f64::INFINITY, dt);
+        for _ in 0..150 {
+            (p, v, _) = vu_spring(p, v, -12.0, dt);
+        }
+        assert!((p - 0.0).abs() < 0.5, "needle at {p} (vel {v}) 5 s after one inf sample and steady -12 dBFS; expected about 0 VU");
+    }
+
+    #[test]
+    fn nan_reading_must_not_light_the_meter() {
+        let mut b = Ballistics::new();
+        b.step(f64::NAN, 1.0 / 30.0);
+        assert!(b.level <= M_MIN + 0.5 && b.peak <= M_MIN + 0.5,
+            "a NaN reading lit the meter: level {} peak {} (expected silence at {})", b.level, b.peak, M_MIN);
+    }
 }
