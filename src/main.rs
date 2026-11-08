@@ -1,6 +1,10 @@
 //! wavelink-mixer: a Voicemeeter-style mixer for PipeWire.
 //!   wavelink-mixer           open the mixer window
 //!   wavelink-mixer engine    run the routing engine (systemd user service)
+//!   wavelink-mixer dlna-scan             list DLNA renderers on the LAN
+//!   wavelink-mixer net-add <name> [renderer]  add a Network bus (optionally play it on a renderer)
+//!   wavelink-mixer net-in <name> <url>   add a Network stream input (WAV or LPCM URL)
+//!   wavelink-mixer net-rm <id>           remove a bus or input added by net-add / net-in
 mod config;
 mod dash;
 mod latency;
@@ -8,8 +12,11 @@ mod leak;
 mod norm;
 mod engine;
 mod midi;
+mod netin;
 mod player;
 mod spotify;
+mod swyh;
+mod swyh_ui;
 mod sysmon;
 mod pw;
 mod ui;
@@ -61,6 +68,10 @@ fn main() -> glib::ExitCode {
     }
     if std::env::args().nth(1).as_deref() == Some("latency") {
         std::process::exit(latency::run(std::env::args().skip(2).collect()));
+    }
+    let a: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = swyh::cli(&a).or_else(|| netin::cli(&a)) {
+        std::process::exit(code);
     }
     let app = adw::Application::builder().application_id("local.wavelink.Mixer").build();
     app.connect_activate(ui::activate);

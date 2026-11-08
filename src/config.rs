@@ -191,6 +191,8 @@ pub enum BusKind {
     Hardware { target: String },
     /// Virtual microphone other apps can record (OBS, Discord).
     Virtual { node: String, description: String },
+    /// Streams over the network (DLNA renderer and/or HTTP URL, #15).
+    Network,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -201,6 +203,13 @@ pub struct Bus {
     pub kind: BusKind,
     pub gain_db: f64,
     pub mute: bool,
+}
+
+/// A DLNA media renderer picked for a Network bus (#15).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct Renderer {
+    pub udn: String,
+    pub name: String,
 }
 
 /// Piano synth settings (FluidSynth playing your MIDI keyboard into the Piano channel).
@@ -243,6 +252,12 @@ pub struct Config {
     /// Graph quantum forced by the engine (`pw-metadata clock.force-quantum`); 0 = don't force.
     #[serde(default = "default_quantum", deserialize_with = "lenient_quantum")]
     pub quantum: u32,
+    /// Network bus id -> DLNA renderer it plays on (#15). Not part of `structure()`: changing it never restarts the graph.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub net_out: BTreeMap<String, Renderer>,
+    /// Stream input id -> URL it pulls audio from (#15). Not part of `structure()`: changing it never restarts the graph.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub net_in: BTreeMap<String, String>,
 }
 
 fn default_quantum() -> u32 {
@@ -373,6 +388,76 @@ impl Config {
         id
     }
 
+    /// Adds a Network bus (#15) that starts as a copy of the main mix. Returns its id.
+    pub fn add_network_bus(&mut self, name: &str) -> String {
+        let id = (1..)
+            .map(|k| format!("n{k}"))
+            .find(|id| !self.buses.iter().any(|b| &b.id == id) && !self.inputs.iter().any(|i| &i.id == id))
+            .unwrap();
+        if let Some(main) = self.buses.iter().find(|b| matches!(b.kind, BusKind::Hardware { .. })).map(|b| b.id.clone()) {
+            for i in &mut self.inputs {
+                if let Some(r) = i.routes.get(&main).cloned() {
+                    i.routes.insert(id.clone(), r);
+                }
+            }
+        }
+        self.net_out.remove(&id);
+        let name = name.trim();
+        let name = if name.is_empty() { "Network" } else { name };
+        self.buses.push(Bus {
+            id: id.clone(),
+            name: name.into(),
+            color: "#30d158".into(),
+            kind: BusKind::Network,
+            gain_db: 0.0,
+            mute: false,
+        });
+        self.buses.sort_by(|a, b| a.id.cmp(&b.id));
+        id
+    }
+
+    /// Adds a Virtual input that pulls `url` (#15). Returns its id.
+    pub fn add_stream_input(&mut self, name: &str, url: &str) -> String {
+        let name = name.trim();
+        let name = if name.is_empty() { "Stream" } else { name };
+        let id = self.new_id(name);
+        let mut routes = BTreeMap::new();
+        if let Some(first) = self.buses.first() {
+            routes.insert(first.id.clone(), Route { on: true, level_db: 0.0 });
+        }
+        self.inputs.push(Input {
+            id: id.clone(),
+            name: name.into(),
+            color: "#30d158".into(),
+            kind: InputKind::Virtual,
+            fx: "clean".into(),
+            eq: flat_eq(),
+            gain_db: 0.0,
+            mute: false,
+            routes,
+            default_sink: false,
+            rack: Rack::default(),
+            normalize: false,
+            norm_base: None,
+            norm_out: None,
+        });
+        self.net_in.insert(id.clone(), url.trim().to_string());
+        id
+    }
+
+    /// Removes an input or bus and every reference to it, including the #15 maps.
+    pub fn remove_id(&mut self, id: &str) -> bool {
+        let before = self.inputs.len() + self.buses.len();
+        self.inputs.retain(|i| i.id != id);
+        self.buses.retain(|b| b.id != id);
+        for i in &mut self.inputs {
+            i.routes.remove(id);
+        }
+        self.net_in.remove(id);
+        self.net_out.remove(id);
+        self.inputs.len() + self.buses.len() != before
+    }
+
     pub fn default_config() -> Config {
         let r = |pairs: &[(&str, bool, f64)]| -> BTreeMap<String, Route> {
             pairs.iter().map(|&(b, on, db)| (b.to_string(), Route { on, level_db: db })).collect()
@@ -384,6 +469,8 @@ impl Config {
         Config {
             piano: PianoCfg::default(),
             quantum: 256,
+            net_out: BTreeMap::new(),
+            net_in: BTreeMap::new(),
             inputs: vec![
                 input("system", "System", "#8e8e93", "clean", r(&[("a1", true, 0.0), ("b1", true, -13.3)])),
                 input("spotify", "Spotify", "#1ed760", "music", r(&[("a1", true, -4.2), ("b1", true, -36.0)])),
@@ -538,5 +625,89 @@ mod tests {
         let old: Input = serde_json::from_value(v).unwrap();
         assert_eq!((old.norm_base, old.norm_out), (None, None));
         assert_eq!(old.gain_db, -40.0);
+    }
+
+    #[test]
+    fn old_config_without_net_maps_loads() {
+        let mut v = serde_json::to_value(Config::default_config()).unwrap();
+        v.as_object_mut().unwrap().remove("net_out");
+        v.as_object_mut().unwrap().remove("net_in");
+        let c: Config = serde_json::from_value(v).unwrap();
+        assert!(c.net_out.is_empty() && c.net_in.is_empty());
+    }
+
+    #[test]
+    fn network_bus_kind_roundtrips() {
+        let k: BusKind = serde_json::from_str(r#"{"type":"network"}"#).unwrap();
+        assert_eq!(k, BusKind::Network);
+        assert_eq!(serde_json::to_string(&BusKind::Network).unwrap(), r#"{"type":"network"}"#);
+    }
+
+    #[test]
+    fn add_network_bus_copies_main_mix_routes() {
+        let mut c = Config::default_config();
+        let id = c.add_network_bus("Cast");
+        assert_eq!(id, "n1");
+        let b = c.buses.iter().find(|b| b.id == "n1").unwrap();
+        assert_eq!(b.kind, BusKind::Network);
+        assert_eq!(b.name, "Cast");
+        for i in &c.inputs {
+            assert_eq!(i.routes.get("n1"), i.routes.get("a1"), "input {}", i.id);
+        }
+        assert!(!c.net_out.contains_key("n1"));
+        assert_eq!(c.add_network_bus("Other"), "n2");
+        // a renderer left under a reused id must not survive the new bus
+        let mut c = Config::default_config();
+        c.net_out.insert("n1".into(), Renderer { udn: "uuid:old".into(), name: "Old".into() });
+        c.add_network_bus("");
+        assert!(!c.net_out.contains_key("n1"));
+        assert_eq!(c.buses.iter().find(|b| b.id == "n1").unwrap().name, "Network");
+    }
+
+    /// `add_network_bus` must not reuse an input's id, or `remove_id` on the bus deletes the input too.
+    #[test]
+    fn bus_id_never_reuses_input_id() {
+        let mut c = Config::default_config();
+        let inp = c.add_stream_input("n1", "http://10.0.0.1:5959/s.wav");
+        let bus = c.add_network_bus("Cast");
+        assert_ne!(bus, inp, "network bus took the id of input {inp}");
+        c.remove_id(&bus);
+        assert!(c.inputs.iter().any(|i| i.id == inp), "removing bus {bus} also deleted input {inp}");
+    }
+
+    #[test]
+    fn add_stream_input_sets_url_and_route() {
+        let mut c = Config::default_config();
+        let id = c.add_stream_input("  Tone ", " http://10.0.0.1:5959/stream/n1.wav ");
+        let i = c.inputs.iter().find(|i| i.id == id).unwrap();
+        assert_eq!(i.name, "Tone");
+        assert_eq!(i.kind, InputKind::Virtual);
+        assert_eq!(c.net_in.get(&id).map(String::as_str), Some("http://10.0.0.1:5959/stream/n1.wav"));
+        assert!(i.route("a1").on);
+    }
+
+    #[test]
+    fn remove_id_clears_maps_and_routes() {
+        let mut c = Config::default_config();
+        let inp = c.add_stream_input("Tone", "http://10.0.0.1:5959/s.wav");
+        let out = c.add_network_bus("Cast");
+        c.net_out.insert(out.clone(), Renderer { udn: "uuid:x".into(), name: "TV".into() });
+        assert!(c.remove_id(&out));
+        assert!(!c.net_out.contains_key(&out));
+        assert!(!c.buses.iter().any(|b| b.id == out));
+        assert!(c.inputs.iter().all(|i| !i.routes.contains_key(&out)));
+        assert!(c.remove_id(&inp));
+        assert!(!c.net_in.contains_key(&inp));
+        assert!(!c.inputs.iter().any(|i| i.id == inp));
+        assert!(!c.remove_id("nope"));
+    }
+
+    #[test]
+    fn net_maps_do_not_change_structure() {
+        let mut c = Config::default_config();
+        let before = c.structure();
+        c.net_out.insert("a1".into(), Renderer { udn: "uuid:x".into(), name: "TV".into() });
+        c.net_in.insert("system".into(), "http://10.0.0.1:5959/s.wav".into());
+        assert_eq!(c.structure(), before);
     }
 }
