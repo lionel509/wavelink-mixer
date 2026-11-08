@@ -5,6 +5,8 @@ mod config;
 mod dash;
 mod discord;
 mod latency;
+mod leak;
+mod norm;
 mod engine;
 mod midi;
 mod player;

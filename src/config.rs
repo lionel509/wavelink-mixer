@@ -475,4 +475,29 @@ mod tests {
         assert_eq!(bad.unwrap(), truncated);
         assert_eq!(bad1.unwrap(), second);
     }
+
+    #[test]
+    fn normalize_defaults_off_and_round_trips() {
+        let i = Input {
+            id: "x".into(),
+            name: "x".into(),
+            color: "#fff".into(),
+            kind: InputKind::Virtual,
+            fx: "clean".into(),
+            eq: flat_eq(),
+            gain_db: 0.0,
+            mute: false,
+            routes: Default::default(),
+            default_sink: false,
+            rack: Rack::default(),
+            normalize: true,
+        };
+        let s = serde_json::to_string(&i).unwrap();
+        let back: Input = serde_json::from_str(&s).unwrap();
+        assert!(back.normalize);
+        let mut v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        v.as_object_mut().unwrap().remove("normalize");
+        let old: Input = serde_json::from_value(v).unwrap();
+        assert!(!old.normalize);
+    }
 }

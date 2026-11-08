@@ -1354,3 +1354,319 @@ impl Dial {
         let _ = cr.restore();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic uniform [0, 1) from an LCG (no `rand` crate).
+    fn unit(x: &mut u64) -> f64 {
+        *x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*x >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    #[test]
+    fn zone_matches_scarlett_3rd_gen() {
+        assert_eq!(zone(-24.0), Zone::Green);
+        assert_eq!(zone(-6.01), Zone::Green);
+        assert_eq!(zone(-6.0), Zone::Amber);
+        assert_eq!(zone(-0.01), Zone::Amber);
+        assert_eq!(zone(0.0), Zone::Red);
+        assert_eq!(zone(3.0), Zone::Red);
+        assert_eq!(zone(SILENT_DB), Zone::Green);
+        assert!(AMBER_DB == -6.0 && RED_DB == 0.0);
+    }
+
+    #[test]
+    fn zone_is_monotonic() {
+        for k in 0..=1020 {
+            let db = -90.0 + k as f64 * 0.1;
+            assert!(zone(db) >= zone(db - 0.1), "db {db}");
+        }
+    }
+
+    #[test]
+    fn peak_held_for_hold_s() {
+        assert_eq!(HOLD_S, 3.0);
+        let mut b = Ballistics::new();
+        b.step(-10.0, 0.016);
+        for _ in 0..180 {
+            b.step(SILENT_DB, 0.016);
+        }
+        assert_eq!(b.peak, -10.0);
+        assert!(b.level < -10.0);
+    }
+
+    #[test]
+    fn peak_falls_after_hold() {
+        let mut b = Ballistics::new();
+        b.step(-10.0, 0.016);
+        for _ in 0..250 {
+            b.step(SILENT_DB, 0.016);
+        }
+        assert!(b.peak < -10.0);
+        assert!(b.peak >= b.level);
+        for _ in 250..1000 {
+            b.step(SILENT_DB, 0.016);
+        }
+        assert_eq!(b.peak, M_MIN);
+        assert_eq!(b.level, M_MIN);
+    }
+
+    #[test]
+    fn higher_peak_restarts_hold() {
+        let mut b = Ballistics::new();
+        b.step(-20.0, 0.016);
+        for _ in 0..100 {
+            b.step(SILENT_DB, 0.016);
+        }
+        b.step(-10.0, 0.016);
+        assert_eq!(b.peak, -10.0);
+        assert_eq!(b.hold, HOLD_S);
+    }
+
+    #[test]
+    fn release_is_24_db_per_s() {
+        let mut b = Ballistics::new();
+        b.step(-10.0, 0.016);
+        for _ in 0..50 {
+            b.step(M_MIN, 0.01);
+        }
+        assert!((b.level - -22.0).abs() < 1e-9, "level {}", b.level);
+    }
+
+    #[test]
+    fn step_reports_motion_only() {
+        let mut b = Ballistics::new();
+        for _ in 0..1000 {
+            b.step(SILENT_DB, 0.016);
+        }
+        assert!(!b.step(SILENT_DB, 0.016));
+        assert!(b.step(-10.0, 0.016));
+    }
+
+    #[test]
+    fn ballistics_invariant_under_random_feed() {
+        let mut x: u64 = 1;
+        let mut b = Ballistics::new();
+        let mut since = 0.0_f64; // time since the peak was last set
+        let mut silent_left = 0u32;
+        for i in 0..100_000u32 {
+            let v = if silent_left > 0 {
+                silent_left -= 1;
+                SILENT_DB
+            } else if i % 50 == 0 {
+                silent_left = 300;
+                SILENT_DB
+            } else {
+                -90.0 + 102.0 * unit(&mut x)
+            };
+            let dt = 0.001 + 0.049 * unit(&mut x);
+            let prev_peak = b.peak;
+            let vc = v.min(M_MAX);
+            b.step(v, dt);
+            assert!(b.level >= M_MIN && b.level <= M_MAX, "step {i}: level {}", b.level);
+            assert!(b.level <= b.peak && b.peak <= M_MAX, "step {i}: peak {} level {}", b.peak, b.level);
+            if vc >= prev_peak {
+                assert_eq!(b.peak, vc, "step {i}: a higher reading must set the peak");
+                since = 0.0;
+            } else {
+                since += dt;
+            }
+            if since < HOLD_S {
+                assert!(b.peak >= prev_peak, "step {i}: peak fell {prev_peak} -> {} inside its hold", b.peak);
+            }
+        }
+    }
+
+    #[test]
+    fn send_db_math() {
+        assert_eq!(send_db(-10.0, true, -6.0), -16.0);
+        assert_eq!(send_db(-10.0, false, 0.0), SILENT_DB);
+        assert_eq!(send_db(-10.0, true, crate::config::MIN_DB), SILENT_DB);
+        assert_eq!(send_db(-3.0, true, 6.0), 3.0);
+        assert_eq!(zone(send_db(-3.0, true, 6.0)), Zone::Red);
+    }
+
+    #[test]
+    fn send_level_db_is_amplitude_db() {
+        for d in [-50.0, -20.0, -6.0, 0.0, 6.0] {
+            let v = crate::config::db_to_vol(d).powi(3);
+            assert!((v - 10f64.powf(d / 20.0)).abs() < 1e-9, "d {d}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod redraw_tests {
+    use super::*;
+
+    /// Deterministic uniform [0, 1) from an LCG (no `rand` crate).
+    fn unit(x: &mut u64) -> f64 {
+        *x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*x >> 11) as f64 / (1u64 << 53) as f64
+    }
+    fn uni(x: &mut u64, lo: f64, hi: f64) -> f64 {
+        lo + (hi - lo) * unit(x)
+    }
+    /// Frame dt in the range FrameCap emits at 60-240 Hz.
+    fn frame_dt(x: &mut u64) -> f64 {
+        uni(x, 1.0 / 40.0, 1.0 / 27.0)
+    }
+
+    #[test]
+    fn frame_cap_rates() {
+        for hz in [60.0_f64, 75.0, 120.0, 144.0, 165.0, 240.0] {
+            let cap = FrameCap::new();
+            let dt = 1.0 / hz;
+            let (mut n, mut sum) = (0usize, 0.0_f64);
+            for _ in 0..(10.0 / dt).round() as usize {
+                if let Some(d) = cap.tick(dt) {
+                    n += 1;
+                    sum += d;
+                }
+            }
+            assert!((270..=300).contains(&n), "{hz} Hz: {n} emits in 10 s");
+            // time still accumulating after the last emit is never returned, so allow one emit period
+            assert!((sum - 10.0).abs() <= 1.0 / METER_FPS + 1e-9, "{hz} Hz: summed dt {sum}");
+        }
+        let cap = FrameCap::new();
+        assert_eq!(cap.tick(0.5), Some(0.1));
+    }
+
+    fn settle_vu(x: &mut u64, case: usize) {
+        let (mut pos, mut vel) = (VU_MIN, 0.0_f64);
+        for _ in 0..50 {
+            let db = uni(x, -90.0, 6.0);
+            let (p, v, _) = vu_spring(pos, vel, db, frame_dt(x));
+            pos = p;
+            vel = v;
+        }
+        let hold = uni(x, -30.0, -12.0);
+        for _ in 0..300 {
+            let (p, v, _) = vu_spring(pos, vel, hold, frame_dt(x));
+            pos = p;
+            vel = v;
+        }
+        for _ in 0..30 {
+            let (p, v, moved) = vu_spring(pos, vel, hold, frame_dt(x));
+            assert!(!moved, "case {case}: vu moved while settled");
+            pos = p;
+            vel = v;
+        }
+        let (_, _, moved) = vu_spring(pos, vel, hold + 10.0, frame_dt(x));
+        assert!(moved, "case {case}: vu did not wake on +10 dB");
+    }
+
+    fn random_bands(x: &mut u64) -> Vec<f32> {
+        (0..BANDS).map(|_| uni(x, 0.0, 1.0) as f32).collect()
+    }
+
+    fn settle_bands(x: &mut u64, case: usize) {
+        let mut shown = vec![0.0f64; BANDS];
+        for _ in 0..50 {
+            let src = random_bands(x);
+            smooth_bands(&mut shown, &src, frame_dt(x));
+        }
+        let src = random_bands(x);
+        for _ in 0..300 {
+            smooth_bands(&mut shown, &src, frame_dt(x));
+        }
+        for _ in 0..30 {
+            assert!(!smooth_bands(&mut shown, &src, frame_dt(x)), "case {case}: bands moved while settled");
+        }
+        let mut bumped = src.clone();
+        let k = (unit(x) * BANDS as f64) as usize % BANDS;
+        bumped[k] += 0.2;
+        assert!(smooth_bands(&mut shown, &bumped, frame_dt(x)), "case {case}: band {k} did not wake");
+    }
+
+    fn settle_spectrum(x: &mut u64, case: usize) {
+        let mut shown = vec![0.0f64; BANDS];
+        let mut peaks = vec![(0.0f64, 0.0f64); BANDS];
+        for _ in 0..50 {
+            let src = random_bands(x);
+            smooth_spectrum(&mut shown, &mut peaks, &src, frame_dt(x));
+        }
+        let src = random_bands(x);
+        for _ in 0..300 {
+            smooth_spectrum(&mut shown, &mut peaks, &src, frame_dt(x));
+        }
+        for _ in 0..30 {
+            assert!(!smooth_spectrum(&mut shown, &mut peaks, &src, frame_dt(x)), "case {case}: spectrum moved while settled");
+        }
+        let mut bumped = src.clone();
+        let k = (unit(x) * BANDS as f64) as usize % BANDS;
+        bumped[k] += 0.2;
+        assert!(smooth_spectrum(&mut shown, &mut peaks, &bumped, frame_dt(x)), "case {case}: spectrum band {k} did not wake");
+    }
+
+    fn settle_ease(x: &mut u64, case: usize, hi: f64, tau_lo: f64, tau_hi: f64) {
+        let tau = uni(x, tau_lo, tau_hi);
+        let mut cur = uni(x, 0.0, hi);
+        for _ in 0..50 {
+            let t = uni(x, 0.0, hi);
+            cur = ease_toward(cur, t, frame_dt(x), tau, 0.01).0;
+        }
+        let target = uni(x, 0.0, hi);
+        for _ in 0..300 {
+            cur = ease_toward(cur, target, frame_dt(x), tau, 0.01).0;
+        }
+        for _ in 0..30 {
+            let (n, moved) = ease_toward(cur, target, frame_dt(x), tau, 0.01);
+            assert!(!moved, "case {case}: ease moved while settled");
+            cur = n;
+        }
+        let (_, moved) = ease_toward(cur, target + 1.0, frame_dt(x), tau, 0.01);
+        assert!(moved, "case {case}: ease did not wake on +1.0");
+    }
+
+    #[test]
+    fn widgets_settle_and_wake() {
+        let mut x: u64 = 0x5eed;
+        for case in 0..500 {
+            match (unit(&mut x) * 5.0) as u32 {
+                0 => settle_vu(&mut x, case),
+                1 => settle_bands(&mut x, case),
+                2 => settle_spectrum(&mut x, case),
+                3 => settle_ease(&mut x, case, 1024.0, 0.25, 0.25),
+                _ => settle_ease(&mut x, case, 30.0, 0.005, 0.65),
+            }
+        }
+    }
+
+    #[test]
+    fn dial_text_no_overlap() {
+        let w = 124.0_f64;
+        for (title, max, value) in [("AUDIO CPU", 100.0, "888% of 1 core"), ("AUDIO CPU", 100.0, "0% of 1 core"), ("PIPEWIRE FILES", 1024.0, "1024 / 1024")] {
+            let hi = (w * 0.66) as i32 + DIAL_BAND as i32;
+            let h = hi as f64;
+            let surf = cairo::ImageSurface::create(cairo::Format::ARgb32, 124, hi).unwrap();
+            let cr = cairo::Context::new(&surf).unwrap();
+            let items = dial_texts(&cr, w, h, title, max, value);
+            assert_eq!(items.len(), 7);
+            // the title's ink must be real, so this check cannot pass with no font loaded
+            let t: [f64; 4] = items[5].4;
+            assert!(t[2] - t[0] > 20.0, "{title}: title ink width {}", t[2] - t[0]);
+            for (i, a) in items.iter().enumerate() {
+                let r = a.4;
+                assert!(r[0] >= 0.0 && r[1] >= 0.0 && r[2] <= w && r[3] <= h, "item {i} outside the dial: {r:?}");
+                for (j, b) in items.iter().enumerate().skip(i + 1) {
+                    let s = b.4;
+                    let apart = r[2] + 1.0 <= s[0] || s[2] + 1.0 <= r[0] || r[3] + 1.0 <= s[1] || s[3] + 1.0 <= r[1];
+                    assert!(apart, "{value}: items {i} and {j} overlap: {r:?} {s:?}");
+                }
+            }
+            for k in [5, 6] {
+                assert!(items[k].4[1] >= 3.0 + (h - 6.0 - DIAL_BAND), "item {k} sits above the plate: {:?}", items[k].4);
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_dial_unit_is_one_core() {
+        let ui = include_str!("ui.rs");
+        assert!(!ui.contains("AUDIO CPU %"), "the dial still says AUDIO CPU %");
+        assert!(ui.contains("% of 1 core"));
+    }
+}
