@@ -167,3 +167,13 @@ fn open_rejects_404() {
     });
     assert!(open(&format!("http://127.0.0.1:{port}/missing.wav")).is_err());
 }
+
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use std::time::Instant;
+#[cfg(test)]
+include!("netin_breaker_tests.rs");
