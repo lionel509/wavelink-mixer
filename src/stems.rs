@@ -35,8 +35,11 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Writes the status only while the handle's session is still the current one (see `Shared::live`).
 fn set_status(shared: &Shared, s: impl Into<String>) {
-    *lock(&shared.status) = s.into();
+    if let Some(_g) = shared.live() {
+        *lock(&shared.status) = s.into();
+    }
 }
 
 fn frames(secs: f64) -> usize {
@@ -232,12 +235,16 @@ pub fn chunk_header(id: u64, notes: &[Vec<Note>; 3]) -> ChunkHeader {
 }
 
 /// Shared with the UI: bands are 3 x BANDS; played is in frames at 44.1 kHz.
+/// `current` counts sessions. `Session::start` gives its handle a new `gen` and bumps `current`; a handle
+/// whose `gen` is no longer current (a stopped or replaced session) cannot write any more.
 #[derive(Clone)]
 pub struct Shared {
     pub bands: Vec<Arc<Mutex<Vec<f32>>>>,
     pub timeline: Arc<Mutex<Timeline>>,
     pub played: Arc<AtomicU64>,
     pub status: Arc<Mutex<String>>,
+    current: Arc<AtomicU64>,
+    gen: u64,
 }
 
 impl Shared {
@@ -247,12 +254,22 @@ impl Shared {
             timeline: Arc::new(Mutex::new(Timeline::new())),
             played: Arc::new(AtomicU64::new(0)),
             status: Arc::new(Mutex::new(String::new())),
+            current: Arc::new(AtomicU64::new(0)),
+            gen: 0,
         }
     }
 
     /// played / 44100.
     pub fn now(&self) -> f64 {
         self.played.load(Ordering::Relaxed) as f64 / RATE as f64
+    }
+
+    /// The timeline lock, but only while this handle's session is current. Every session write takes it
+    /// first, and `Session::start` bumps `current` before it takes the same lock to clear, so a stale
+    /// write either lands before the clear or is refused.
+    fn live(&self) -> Option<MutexGuard<'_, Timeline>> {
+        let g = lock(&self.timeline);
+        (self.current.load(Ordering::SeqCst) == self.gen).then_some(g)
     }
 }
 
@@ -332,10 +349,20 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn start(o: Opts, shared: Shared, chunks: Option<mpsc::Sender<(u64, [Vec<f32>; 3])>>) -> Session {
+    pub fn start(o: Opts, ui: Shared, chunks: Option<mpsc::Sender<(u64, [Vec<f32>; 3])>>) -> Session {
         let stop = Arc::new(AtomicBool::new(false));
         let kids = Arc::new(Kids::new());
-        shared.played.store(0, Ordering::Relaxed);
+        let gen = ui.current.fetch_add(1, Ordering::SeqCst) + 1;
+        let shared = Shared { gen, ..ui };
+        // A new run starts from nothing: no notes, no bands, clock at 0. Notes from the last run stay
+        // until this point, so Stop → Save MIDI still works.
+        if let Some(mut tl) = shared.live() {
+            *tl = Timeline::new();
+            shared.played.store(0, Ordering::Relaxed);
+            for b in &shared.bands {
+                lock(b).iter_mut().for_each(|x| *x = 0.0);
+            }
+        }
         set_status(&shared, "fetching models…");
         let (s2, k2) = (stop.clone(), kids.clone());
         std::thread::spawn(move || {
@@ -411,7 +438,9 @@ impl Out {
             for f in 0..n {
                 self.ffts[i].push(s[2 * f], s[2 * f + 1]);
                 if let Some(b) = self.ffts[i].take() {
-                    *lock(&self.shared.bands[i]) = b;
+                    if let Some(_g) = self.shared.live() {
+                        *lock(&self.shared.bands[i]) = b;
+                    }
                 }
             }
             self.rings[i].extend_from_slice(s);
@@ -423,7 +452,9 @@ impl Out {
         }
         let before = self.played;
         self.played += n as u64;
-        self.shared.played.store(self.played, Ordering::Relaxed);
+        if let Some(_g) = self.shared.live() {
+            self.shared.played.store(self.played, Ordering::Relaxed);
+        }
         if self.played / CHUNK as u64 > before / CHUNK as u64 {
             let snap = [tail(&self.rings[0]), tail(&self.rings[1]), tail(&self.rings[2])];
             let _ = self.tx.try_send((self.played, snap));
@@ -454,7 +485,10 @@ impl Out {
         }
         if self.played - self.last_prune >= 30 * RATE as u64 {
             self.last_prune = self.played;
-            lock(&self.shared.timeline).prune(self.shared.now() - 1200.0);
+            let before = self.shared.now() - 1200.0;
+            if let Some(mut tl) = self.shared.live() {
+                tl.prune(before);
+            }
         }
         true
     }
@@ -806,7 +840,9 @@ fn transcribe(mut tr: Transcriber, rx: mpsc::Receiver<(u64, [Vec<f32>; 3])>, tx:
                     }
                 }
             };
-            lock(&shared.timeline).add(stem, &kept);
+            if let Some(mut tl) = shared.live() {
+                tl.add(stem, &kept);
+            }
             let _ = tx.send((stem, kept));
         }
     }
@@ -1130,5 +1166,23 @@ mod tests {
                 assert!(!src.contains(n.as_str()), "{name} matches {n}");
             }
         }
+    }
+
+    /// A handle from an older session cannot add notes or set status once a newer session has started.
+    #[test]
+    fn stale_session_handle_cannot_write() {
+        let ui = Shared::new();
+        let old = Shared { gen: ui.current.fetch_add(1, Ordering::SeqCst) + 1, ..ui.clone() };
+        set_status(&old, "old run");
+        assert_eq!(*lock(&ui.status), "old run", "the current session should write its status");
+        if let Some(mut tl) = old.live() {
+            tl.add(1, &[Note { t: 1.0, dur: 0.5, pitch: 40, vel: 90 }]);
+        }
+        let newer = Shared { gen: ui.current.fetch_add(1, Ordering::SeqCst) + 1, ..ui.clone() };
+        assert!(old.live().is_none(), "a handle from a replaced session must be refused");
+        set_status(&old, "late write");
+        assert_eq!(*lock(&ui.status), "old run", "a stale status write got through");
+        let n: usize = newer.live().expect("the newer handle is current").drain_all().iter().map(|v| v.len()).sum();
+        assert_eq!(n, 1, "only the note written before the replacement may be there");
     }
 }
