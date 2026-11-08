@@ -19,6 +19,9 @@ mod spotify;
 mod sysmon;
 mod pw;
 mod ui;
+#[cfg(test)]
+#[path = "breaker_front.rs"]
+mod breaker_front;
 
 use adw::prelude::*;
 use gtk::glib;
