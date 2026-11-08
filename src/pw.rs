@@ -140,6 +140,13 @@ static PENDING: AtomicU64 = AtomicU64::new(0);
 pub fn pending() -> u64 {
     PENDING.load(Ordering::SeqCst)
 }
+/// Pids of the children the reaper holds (spawned, not yet reaped).
+pub fn held() -> Vec<u32> {
+    todo!("G3-r3: held")
+}
+fn spawn_pid(_cmd: &str, _args: &[&str]) -> Option<u32> {
+    todo!("G3-r3: spawn_pid")
+}
 /// Fire-and-forget command whose exit is always reaped (no zombies); hung ones are killed after 3 s.
 pub fn spawn(cmd: &str, args: &[&str]) {
     let Ok(c) = Command::new(cmd).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return };
@@ -389,6 +396,68 @@ mod tests {
             .filter(|l| { let f: Vec<&str> = l.split_whitespace().collect(); f.len() >= 3 && f[1] == me && f[2].starts_with('Z') })
             .map(|l| l.trim().to_string())
             .collect()
+    }
+
+    /// `ps` as leak::Proc rows (pid, ppid, state, last path part of comm); works on macOS and Linux.
+    fn ps_procs() -> Vec<crate::leak::Proc> {
+        let out = Command::new("ps").args(["-axo", "pid=,ppid=,stat=,comm="]).output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+        out.lines()
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                if f.len() < 4 {
+                    return None;
+                }
+                let comm = f[3..].join(" ");
+                Some(crate::leak::Proc {
+                    pid: f[0].parse().ok()?,
+                    ppid: f[1].parse().ok()?,
+                    state: f[2].chars().next()?,
+                    comm: comm.rsplit('/').next().unwrap_or("").to_string(),
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn held_tracks_spawned_children() {
+        let _serial = child_lock();
+        let pid = spawn_pid("sleep", &["1"]).expect("spawn sleep");
+        assert!(held().contains(&pid), "{pid} not held right after spawn");
+        let t = Instant::now();
+        while held().contains(&pid) {
+            assert!(t.elapsed() < Duration::from_millis(3500), "{pid} still held after 3.5 s");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn real_zombie_counts_under_spawn_load() {
+        let _serial = child_lock();
+        let me = std::process::id();
+        // one real zombie: a child the reaper never sees (the guard reaps it even when the test panics)
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.wait();
+            }
+        }
+        let _real = Reap(Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap());
+        std::thread::sleep(Duration::from_millis(300));
+        let t = Instant::now();
+        let mut samples = 0;
+        while t.elapsed() < Duration::from_secs(3) {
+            // two running sleeps per 500 ms: they are held, so they must never count
+            spawn("sleep", &["4"]);
+            spawn("sleep", &["4"]);
+            std::thread::sleep(Duration::from_millis(500));
+            let h = held();
+            let procs: Vec<_> = ps_procs().into_iter().filter(|p| p.comm == "sh" || p.comm == "sleep").collect();
+            let n = crate::leak::zombies_except(&procs, me, &h);
+            assert_eq!(n, 1, "sample {samples}: {} held, zombies_except {n}", h.len());
+            samples += 1;
+        }
+        assert!(samples >= 5, "only {samples} samples");
     }
 
     #[test]

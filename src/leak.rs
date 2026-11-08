@@ -69,6 +69,11 @@ pub fn zombies(procs: &[Proc], pid: u32) -> u64 {
     procs.iter().filter(|p| p.ppid == pid && p.state == 'Z').count() as u64
 }
 
+/// Zombie children of `pid` that the reaper does not hold. Held children are transient (exited, not yet reaped).
+pub fn zombies_except(_procs: &[Proc], _pid: u32, _held: &[u32]) -> u64 {
+    todo!("G3-r3: zombies_except")
+}
+
 #[cfg(target_os = "linux")]
 pub fn read(pid: u32, procs: &[Proc]) -> ProcStats {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
@@ -179,6 +184,15 @@ mod tests {
     fn unit(x: &mut u64) -> f64 {
         *x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         (*x >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    #[test]
+    fn zombies_except_skips_only_held() {
+        let p = |pid, ppid, state| Proc { pid, ppid, state, comm: "sleep".into() };
+        // me = 1: two zombies (10, 11), one running child (12), one zombie with another parent (13)
+        let procs = vec![p(10, 1, 'Z'), p(11, 1, 'Z'), p(12, 1, 'S'), p(13, 99, 'Z')];
+        assert_eq!(zombies_except(&procs, 1, &[10, 12]), 1, "held zombie 10 must not count");
+        assert_eq!(zombies_except(&procs, 1, &[]), 2, "unheld zombies must count");
     }
 
     fn base_stats(rss_kb: u64, fds: u64, threads: u64) -> ProcStats {

@@ -183,4 +183,12 @@ mod tests {
         assert!(l.ends_with("5.3 ms per cycle"), "{l}");
         assert!(!l.contains("latency"), "{l}");
     }
+
+    #[test]
+    fn zombie_count_goes_through_held_filter() {
+        // the literals are split so this test's own text cannot satisfy the check
+        let src = include_str!("sysmon.rs");
+        assert!(src.contains(concat!("crate::leak::zombies_", "except(")), "sysmon does not call zombies_except");
+        assert!(!src.contains(concat!("saturating_sub", "(p)")), "the old zombie subtraction is still in sysmon");
+    }
 }
