@@ -61,7 +61,7 @@ pub fn ease_toward(cur: f64, target: f64, dt: f64, tau: f64, eps: f64) -> (f64, 
 /// One damped-spring step of the VU needle; `moved` = the needle travelled more than 0.01.
 pub fn vu_spring(pos: f64, vel: f64, dbfs: f64, dt: f64) -> (f64, f64, bool) {
     // fed with RMS; 0 VU = -12 dBFS RMS (suits mastered music, which averages ~-14..-9)
-    let target = (dbfs + 12.0).max(VU_MIN - 3.0);
+    let target = if dbfs.is_nan() { VU_MIN - 3.0 } else { (dbfs + 12.0).clamp(VU_MIN - 3.0, VU_MAX + 1.0) };
     let (k, c) = (110.0, 19.0);
     let a = k * (target - pos) - c * vel;
     let v = vel + a * dt;
@@ -170,7 +170,7 @@ impl Ballistics {
     /// One frame: `v` = new peak reading in dBFS, `dt` seconds. Returns true if level or peak moved.
     pub fn step(&mut self, v: f64, dt: f64) -> bool {
         let before = (self.level, self.peak);
-        let v = v.min(M_MAX);
+        let v = if v.is_nan() { SILENT_DB } else { v.min(M_MAX) };
         self.level = if v > self.level { v } else { (self.level - RELEASE_DB_S * dt).max(v).max(M_MIN) };
         if v >= self.peak { self.peak = v; self.hold = HOLD_S; }
         else if self.hold > 0.0 { self.hold -= dt; }
