@@ -49,6 +49,7 @@ pub fn spawn(tx: Sender<Midi>) {
                     if let (Ok(c), Ok(v)) = (c.trim().parse::<u8>(), v.trim().parse::<u8>()) {
                         if tx.send(Midi::Cc(c, v)).is_err() {
                             let _ = child.kill();
+                            let _ = child.wait();
                             return;
                         }
                     }

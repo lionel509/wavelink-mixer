@@ -1,6 +1,7 @@
 //! Thin helpers around the PipeWire command-line tools.
 use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -133,10 +134,19 @@ pub fn output_timeout(cmd: &str, args: &[&str], limit: Duration) -> Option<Vec<u
 fn run(cmd: &str, args: &[&str]) {
     let _ = output_timeout(cmd, args, Duration::from_secs(3));
 }
+/// Fire-and-forget children the reaper still holds. A reaped child is never a zombie, but a child
+/// that exited a moment ago is, until the reaper's next pass; the leak watch subtracts this.
+static PENDING: AtomicU64 = AtomicU64::new(0);
+pub fn pending() -> u64 {
+    PENDING.load(Ordering::SeqCst)
+}
 /// Fire-and-forget command whose exit is always reaped (no zombies); hung ones are killed after 3 s.
 pub fn spawn(cmd: &str, args: &[&str]) {
     let Ok(c) = Command::new(cmd).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return };
-    let _ = reaper().send(c);
+    PENDING.fetch_add(1, Ordering::SeqCst);
+    if reaper().send(c).is_err() {
+        PENDING.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 fn reaper() -> &'static mpsc::Sender<std::process::Child> {
     static R: OnceLock<mpsc::Sender<std::process::Child>> = OnceLock::new();
@@ -151,10 +161,14 @@ fn reaper() -> &'static mpsc::Sender<std::process::Child> {
                     Err(mpsc::RecvTimeoutError::Disconnected) if live.is_empty() => return,
                     Err(_) => {}
                 }
-                live.retain_mut(|(c, t0)| match c.try_wait() {
-                    Ok(None) if t0.elapsed() < Duration::from_secs(3) => true,
-                    Ok(None) => { let _ = c.kill(); let _ = c.wait(); false }
-                    _ => false,
+                live.retain_mut(|(c, t0)| {
+                    let keep = match c.try_wait() {
+                        Ok(None) if t0.elapsed() < Duration::from_secs(3) => true,
+                        Ok(None) => { let _ = c.kill(); let _ = c.wait(); false }
+                        _ => false,
+                    };
+                    if !keep { PENDING.fetch_sub(1, Ordering::SeqCst); }
+                    keep
                 });
             }
         });
@@ -328,6 +342,7 @@ mod tests {
 
     #[test]
     fn spawn_reaps_every_child() {
+        let _serial = child_lock();
         for _ in 0..50 { spawn("true", &[]); }
         let t = std::time::Instant::now();
         loop {
@@ -340,6 +355,7 @@ mod tests {
 
     #[test]
     fn spawn_reaps_mixed_children() {
+        let _serial = child_lock();
         // the real caller shapes: fails fast, finishes slowly, hangs (capped at 5 hangs)
         let mut x: u64 = 7;
         let mut hangs = 0;
@@ -357,6 +373,96 @@ mod tests {
             assert!(t.elapsed() < Duration::from_secs(5), "left {:?}", kids(&["false", "sh", "sleep"]));
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Tests that count this process's children run one at a time (they share the same child set).
+    fn child_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Zombie children of this test process as `ps` lines (macOS and Linux).
+    fn my_zombies() -> Vec<String> {
+        let me = std::process::id().to_string();
+        let out = Command::new("ps").args(["-axo", "pid=,ppid=,stat=,comm="]).output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+        out.lines()
+            .filter(|l| { let f: Vec<&str> = l.split_whitespace().collect(); f.len() >= 3 && f[1] == me && f[2].starts_with('Z') })
+            .map(|l| l.trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn steady_spawns_do_not_trip_zombie_rule() {
+        let _serial = child_lock();
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        // phase 1: a burst of spawns drains out of the reaper's pending count
+        for _ in 0..20 { spawn("true", &[]); }
+        let t = Instant::now();
+        loop {
+            if pending() == 0 { break; }
+            assert!(t.elapsed() < Duration::from_secs(10), "reaper still holds {} spawned children", pending());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // phase 2: ~30 spawns/s while the leak watch samples zombies every 10 s
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = stop.clone();
+        let feeder = std::thread::spawn(move || {
+            while !s2.load(Ordering::Relaxed) {
+                spawn("true", &[]);
+                std::thread::sleep(Duration::from_millis(33));
+            }
+        });
+        let mut w = crate::leak::Watch::new("window");
+        let base = crate::leak::ProcStats::default();
+        w.update(&base, None, 60.0);
+        let mut warns: Vec<String> = vec![];
+        let mut seen = vec![];
+        for k in 1..=2u64 {
+            std::thread::sleep(Duration::from_secs(10));
+            let p0 = pending();
+            let z = my_zombies().len() as u64;
+            let p = p0.max(pending());
+            seen.push((z, p));
+            let s = crate::leak::ProcStats { zombies: z.saturating_sub(p), ..base };
+            warns.extend(w.update(&s, None, 60.0 + 10.0 * k as f64));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = feeder.join();
+        assert!(warns.is_empty(), "zombie warning under steady spawns: {warns:?} (zombies, pending at scans {seen:?})");
+    }
+
+    #[test]
+    fn midi_cc_send_failure_reaps_child() {
+        let _serial = child_lock();
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("wavelink-midi-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stdbuf = dir.join("stdbuf");
+        std::fs::write(
+            &stdbuf,
+            "#!/bin/sh\necho 'Waiting for data. Press Ctrl+C to end.'\nsleep 0.3\necho '  36:0   Control change          0, controller 41, value 79'\nexec sleep 30\n",
+        ).unwrap();
+        std::fs::set_permissions(&stdbuf, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let old = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{old}", dir.display()));
+        std::env::remove_var("MIXER_NO_AUDIO");
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::midi::spawn(tx);
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(crate::midi::Midi::Connected(true)) => {}
+            _ => panic!("no Connected(true) from fake aseqdump"),
+        }
+        drop(rx); // the next CC send fails, so the reader gives up
+        std::thread::sleep(Duration::from_secs(2));
+        let t = Instant::now();
+        let left = loop {
+            let z = my_zombies();
+            if z.is_empty() || t.elapsed() >= Duration::from_secs(3) { break z; }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(left.is_empty(), "zombie children after midi reader gave up: {left:?}");
     }
 
     #[cfg(target_os = "linux")]
@@ -416,6 +522,9 @@ mod tests {
         assert_eq!(include_str!("ui.rs").matches("Command::new(\"pw-record\")").count(), 1, "only the meter tap spawns pw-record");
         assert!(include_str!("ui.rs").contains("die_with_parent(&mut cmd)"));
         assert!(include_str!("midi.rs").contains("die_with_parent(&mut cmd)"));
+        assert!(include_str!("ui.rs").contains("m.area.set_halign(gtk::Align::Center)"));
+        assert!(include_str!("ui.rs").contains("format!(\"{name}.{}\", std::process::id())"));
+        assert_eq!(include_str!("ui.rs").matches("meter(&").count(), 3);
     }
 
     #[test]

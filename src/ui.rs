@@ -369,6 +369,8 @@ pub struct App {
     /// last (side, node ids) pushed to the graph per (out, in) link
     side_applied: RefCell<HashMap<(String, String), (Side, u64, u64)>>,
     side_clear: RefCell<Option<gtk::Button>>,
+    /// link batches for the L/R solo, run one at a time in push order (off the GTK thread)
+    side_q: Serial,
     apps: gtk::ListBox,
     apps_sig: RefCell<String>,
     css: gtk::CssProvider,
@@ -902,21 +904,18 @@ impl App {
             let (Some(a), Some(b)) = (g.node(&o), g.node(&i)) else { continue };
             let (a_id, b_id) = (a.id, b.id);
             let cur = self.side_applied.borrow().get(&(o.clone(), i.clone())).copied();
-            if cur.is_none() && s == Side::Stereo {
-                self.side_applied.borrow_mut().insert((o, i), (s, a_id, b_id));
-                continue;
-            }
-            if cur != Some((s, a_id, b_id)) {
-                self.side_applied.borrow_mut().insert((o.clone(), i.clone()), (s, a_id, b_id));
+            let want = (s, a_id, b_id);
+            if needs_relink(cur, want) {
+                self.side_applied.borrow_mut().insert((o.clone(), i.clone()), want);
                 work.push((o, i, s));
             }
         }
         if !work.is_empty() {
-            std::thread::spawn(move || {
+            self.side_q.push(Box::new(move || {
                 for (o, i, s) in work {
                     pw::link_side(&o, &i, s);
                 }
-            });
+            }));
         }
         let any = self.sides.borrow().values().any(|c| c.get() != Side::Stereo);
         if let Some(btn) = self.side_clear.borrow().as_ref() {
@@ -2392,6 +2391,7 @@ pub fn activate(app: &adw::Application) {
         side_btns: RefCell::new(vec![]),
         side_applied: RefCell::new(HashMap::new()),
         side_clear: RefCell::new(None),
+        side_q: Serial::new(),
         apps,
         apps_sig: RefCell::new(String::new()),
         css: dynamic,
@@ -2533,11 +2533,18 @@ pub fn activate(app: &adw::Application) {
             for c in st2.sides.borrow().values() {
                 c.set(Side::Stereo);
             }
+            let mut restore = vec![];
             for (o, i, s) in st2.desired_sides() {
                 if st2.side_applied.borrow().get(&(o.clone(), i.clone())).map(|r| r.0).unwrap_or(Side::Stereo) != Side::Stereo {
-                    pw::link_side(&o, &i, s);
+                    restore.push((o, i, s));
                 }
             }
+            st2.side_q.push(Box::new(move || {
+                for (o, i, s) in restore {
+                    pw::link_side(&o, &i, s);
+                }
+            }));
+            st2.side_q.flush(Duration::from_secs(5));
             st2.meters.borrow_mut().clear();
             crate::leak::EXPECTED_TAPS.store(0, std::sync::atomic::Ordering::Relaxed);
             if st2.norm_moved.get() {
@@ -2584,4 +2591,82 @@ pub fn activate(app: &adw::Application) {
         win.maximize();
     }
     win.present();
+}
+
+/// Whether a (out, in) pair's links must be (re)applied: first sight of the pair (Stereo included), or a side or node-id change.
+fn needs_relink(cur: Option<(Side, u64, u64)>, want: (Side, u64, u64)) -> bool {
+    cur != Some(want)
+}
+
+/// FIFO job queue on one long-lived named thread, off the GTK thread: jobs run strictly in push order.
+pub struct Serial {
+    tx: mpsc::Sender<Box<dyn FnOnce() + Send>>,
+}
+
+impl Serial {
+    pub fn new() -> Self {
+        let (tx, rx) = mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        let _ = std::thread::Builder::new().name("side-links".into()).spawn(move || {
+            for job in rx {
+                job();
+            }
+        });
+        Serial { tx }
+    }
+    pub fn push(&self, job: Box<dyn FnOnce() + Send>) {
+        let _ = self.tx.send(job);
+    }
+    /// Wait until every job pushed before this call has run; false if `timeout` passes first.
+    pub fn flush(&self, timeout: Duration) -> bool {
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        self.push(Box::new(move || {
+            let _ = done_tx.send(());
+        }));
+        done_rx.recv_timeout(timeout).is_ok()
+    }
+}
+
+#[cfg(test)]
+mod serial_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    #[test]
+    fn needs_relink_first_sight_and_id_change() {
+        assert!(needs_relink(None, (Side::Stereo, 1, 2)));
+        assert!(!needs_relink(Some((Side::Stereo, 1, 2)), (Side::Stereo, 1, 2)));
+        assert!(needs_relink(Some((Side::Stereo, 1, 2)), (Side::Stereo, 1, 3)));
+    }
+
+    #[test]
+    fn serial_runs_jobs_in_push_order() {
+        let q = Serial::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        for k in 0..300usize {
+            let seen = seen.clone();
+            q.push(Box::new(move || {
+                std::thread::sleep(Duration::from_millis((k % 3) as u64));
+                seen.lock().unwrap().push(k);
+            }));
+        }
+        assert!(q.flush(Duration::from_secs(5)));
+        assert_eq!(*seen.lock().unwrap(), (0..300).collect::<Vec<usize>>());
+    }
+
+    #[test]
+    fn serial_flush_times_out() {
+        let q = Serial::new();
+        q.push(Box::new(|| std::thread::sleep(Duration::from_secs(2))));
+        let t = Instant::now();
+        assert!(!q.flush(Duration::from_millis(100)));
+        assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn apply_sides_uses_queue_and_no_startup_shortcut() {
+        let s = include_str!("ui.rs");
+        assert!(s.contains(concat!("self.side_q", ".push(")));
+        assert!(!s.contains(concat!("cur.is_none() && s ", "== Side::Stereo")));
+    }
 }
