@@ -70,8 +70,8 @@ pub fn zombies(procs: &[Proc], pid: u32) -> u64 {
 }
 
 /// Zombie children of `pid` that the reaper does not hold. Held children are transient (exited, not yet reaped).
-pub fn zombies_except(_procs: &[Proc], _pid: u32, _held: &[u32]) -> u64 {
-    todo!("G3-r3: zombies_except")
+pub fn zombies_except(procs: &[Proc], pid: u32, held: &[u32]) -> u64 {
+    procs.iter().filter(|p| p.ppid == pid && p.state == 'Z' && !held.contains(&p.pid)).count() as u64
 }
 
 #[cfg(target_os = "linux")]

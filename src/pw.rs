@@ -2,7 +2,7 @@
 use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, OnceLock};
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Default)]
@@ -134,26 +134,36 @@ pub fn output_timeout(cmd: &str, args: &[&str], limit: Duration) -> Option<Vec<u
 fn run(cmd: &str, args: &[&str]) {
     let _ = output_timeout(cmd, args, Duration::from_secs(3));
 }
-/// Fire-and-forget children the reaper still holds. A reaped child is never a zombie, but a child
-/// that exited a moment ago is, until the reaper's next pass; the leak watch subtracts this.
+/// Count of fire-and-forget children the reaper still holds. Tests use it to wait for the reaper to drain.
 static PENDING: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
 pub fn pending() -> u64 {
     PENDING.load(Ordering::SeqCst)
 }
-/// Pids of the children the reaper holds (spawned, not yet reaped).
+/// Pids of the children the reaper still holds (spawned, not yet reaped). An exited child stays in
+/// this list until the reaper's `try_wait` reaps it, so the leak watch can tell it from a real zombie.
+static HELD: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 pub fn held() -> Vec<u32> {
-    todo!("G3-r3: held")
+    HELD.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
-fn spawn_pid(_cmd: &str, _args: &[&str]) -> Option<u32> {
-    todo!("G3-r3: spawn_pid")
+fn forget_held(pid: u32) {
+    HELD.lock().unwrap_or_else(|e| e.into_inner()).retain(|&p| p != pid);
 }
 /// Fire-and-forget command whose exit is always reaped (no zombies); hung ones are killed after 3 s.
 pub fn spawn(cmd: &str, args: &[&str]) {
-    let Ok(c) = Command::new(cmd).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return };
+    let _ = spawn_pid(cmd, args);
+}
+fn spawn_pid(cmd: &str, args: &[&str]) -> Option<u32> {
+    let c = Command::new(cmd).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().ok()?;
+    let pid = c.id();
     PENDING.fetch_add(1, Ordering::SeqCst);
+    HELD.lock().unwrap_or_else(|e| e.into_inner()).push(pid);
     if reaper().send(c).is_err() {
         PENDING.fetch_sub(1, Ordering::SeqCst);
+        forget_held(pid);
+        return None;
     }
+    Some(pid)
 }
 fn reaper() -> &'static mpsc::Sender<std::process::Child> {
     static R: OnceLock<mpsc::Sender<std::process::Child>> = OnceLock::new();
@@ -174,7 +184,10 @@ fn reaper() -> &'static mpsc::Sender<std::process::Child> {
                         Ok(None) => { let _ = c.kill(); let _ = c.wait(); false }
                         _ => false,
                     };
-                    if !keep { PENDING.fetch_sub(1, Ordering::SeqCst); }
+                    if !keep {
+                        PENDING.fetch_sub(1, Ordering::SeqCst);
+                        forget_held(c.id());
+                    }
                     keep
                 });
             }
@@ -399,21 +412,23 @@ mod tests {
     }
 
     /// `ps` as leak::Proc rows (pid, ppid, state, last path part of comm); works on macOS and Linux.
+    /// A macOS zombie's comm is `<defunct>`; it is mapped to empty here.
     fn ps_procs() -> Vec<crate::leak::Proc> {
         let out = Command::new("ps").args(["-axo", "pid=,ppid=,stat=,comm="]).output()
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
         out.lines()
             .filter_map(|l| {
                 let f: Vec<&str> = l.split_whitespace().collect();
-                if f.len() < 4 {
+                if f.len() < 3 {
                     return None;
                 }
-                let comm = f[3..].join(" ");
+                let comm = f[3.min(f.len())..].join(" ");
+                let comm = if comm == "<defunct>" { String::new() } else { comm.rsplit('/').next().unwrap_or("").to_string() };
                 Some(crate::leak::Proc {
                     pid: f[0].parse().ok()?,
                     ppid: f[1].parse().ok()?,
                     state: f[2].chars().next()?,
-                    comm: comm.rsplit('/').next().unwrap_or("").to_string(),
+                    comm,
                 })
             })
             .collect()
@@ -452,7 +467,8 @@ mod tests {
             spawn("sleep", &["4"]);
             std::thread::sleep(Duration::from_millis(500));
             let h = held();
-            let procs: Vec<_> = ps_procs().into_iter().filter(|p| p.comm == "sh" || p.comm == "sleep").collect();
+            // only this test's children: the empty comm is a macOS zombie, sh/sleep are ours (Linux)
+            let procs: Vec<_> = ps_procs().into_iter().filter(|p| p.comm.is_empty() || p.comm == "sh" || p.comm == "sleep").collect();
             let n = crate::leak::zombies_except(&procs, me, &h);
             assert_eq!(n, 1, "sample {samples}: {} held, zombies_except {n}", h.len());
             samples += 1;
@@ -487,13 +503,13 @@ mod tests {
         w.update(&base, None, 60.0);
         let mut warns: Vec<String> = vec![];
         let mut seen = vec![];
+        let me = std::process::id();
         for k in 1..=2u64 {
             std::thread::sleep(Duration::from_secs(10));
-            let p0 = pending();
-            let z = my_zombies().len() as u64;
-            let p = p0.max(pending());
-            seen.push((z, p));
-            let s = crate::leak::ProcStats { zombies: z.saturating_sub(p), ..base };
+            let h = held();
+            let z = crate::leak::zombies_except(&ps_procs(), me, &h);
+            seen.push((z, h.len()));
+            let s = crate::leak::ProcStats { zombies: z, ..base };
             warns.extend(w.update(&s, None, 60.0 + 10.0 * k as f64));
         }
         stop.store(true, Ordering::Relaxed);
