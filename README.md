@@ -11,6 +11,12 @@ Wave Link-style mixer for the PipeWire channel/mix setup.
 - Spotify player page using the Web API for browsing and control; audio comes from librespot.
 - System monitor: read-only health view of the audio system (CPU, open files, latency, dropouts, services).
 
+## Network audio (SWYH)
+
+- **Network bus** (Add bus → Network, or `wavelink-mixer net-add <name> [renderer]`): route channels into it like any bus. It serves `http://<pc-ip>:5959/stream/<bus>.wav` and plays on a DLNA renderer when one is picked (`dlna-scan` lists them).
+- **Network stream input** (Add input → Network stream, or `wavelink-mixer net-in <name> <url>`): pulls another machine's stream into a mixer channel. WAV and LPCM (`audio/L16`) only; other formats are refused.
+- CLI: `dlna-scan`, `net-add <name> [renderer]`, `net-in <name> <url>`, `net-rm <id>`.
+
 ## Build
 
 ```sh
