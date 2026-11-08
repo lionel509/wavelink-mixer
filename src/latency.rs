@@ -63,20 +63,59 @@ pub fn median(xs: &[f64]) -> f64 {
     }
 }
 
-/// Human summary: medians, the added delay (via − direct) and the total game → ears estimate.
+/// Medians, mins and the delay split for one latency run. `added_ms` is clamped at zero: a
+/// via-mixer median below the direct one is measurement noise, not a negative delay.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Summary {
+    pub direct_median_ms: f64,
+    pub direct_min_ms: f64,
+    pub via_median_ms: f64,
+    pub via_min_ms: f64,
+    pub device_ms: f64,
+    pub added_ms: f64,
+    pub total_ms: f64,
+    pub below_noise: bool,
+}
+
+pub fn summarize(direct_ms: &[f64], via_ms: &[f64], device_ms: f64) -> Summary {
+    let direct_median_ms = median(direct_ms);
+    let via_median_ms = median(via_ms);
+    let added_ms = (via_median_ms - direct_median_ms).max(0.0);
+    Summary {
+        direct_median_ms,
+        direct_min_ms: direct_ms.iter().copied().fold(f64::INFINITY, f64::min),
+        via_median_ms,
+        via_min_ms: via_ms.iter().copied().fold(f64::INFINITY, f64::min),
+        device_ms,
+        added_ms,
+        total_ms: device_ms + added_ms,
+        below_noise: via_median_ms < direct_median_ms,
+    }
+}
+
+/// Human summary of `summarize`: medians, the added delay (via − direct) and the total game → ears estimate.
 pub fn summary(direct_ms: &[f64], via_ms: &[f64], device_ms: f64) -> String {
-    let d = median(direct_ms);
-    let v = median(via_ms);
-    let added = v - d;
-    let dmin = direct_ms.iter().copied().fold(f64::INFINITY, f64::min);
-    let vmin = via_ms.iter().copied().fold(f64::INFINITY, f64::min);
+    let s = summarize(direct_ms, via_ms, device_ms);
+    let added = if s.below_noise {
+        format!(
+            "0.0 ms (below measurement noise: via mixer median {:.1} ms < direct median {:.1} ms)",
+            s.via_median_ms, s.direct_median_ms
+        )
+    } else {
+        format!("{:.1} ms", s.added_ms)
+    };
     format!(
-        "direct: median {d:.1} ms (min {dmin:.1})\n\
-         via mixer: median {v:.1} ms (min {vmin:.1})\n\
-         added by mixer: {added:.1} ms\n\
-         device (PipeWire-reported): {device_ms:.1} ms\n\
+        "direct: median {:.1} ms (min {:.1})\n\
+         via mixer: median {:.1} ms (min {:.1})\n\
+         added by mixer: {added}\n\
+         device (PipeWire-reported): {:.1} ms\n\
          total game → ears ≈ {:.1} ms",
-        added + device_ms
+        s.direct_median_ms,
+        s.direct_min_ms,
+        s.via_median_ms,
+        s.via_min_ms,
+        s.device_ms,
+        s.total_ms
     )
 }
 
