@@ -532,7 +532,9 @@ fn handle(mut s: TcpStream, allowed: &Mutex<Vec<(String, String)>>) -> std::io::
         Some(mut out) => {
             // A reader thread hands the tap's bytes over, so this loop wakes up every 500 ms even
             // when the tap is silent and can check the bus and the client socket.
-            let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+            // Bounded (16 chunks, about 64 KiB): a client that stops reading makes `send` block, so
+            // the tap's pipe pushes back and engine RAM stays flat. Dropping `rx` unblocks it.
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(16);
             std::thread::spawn(move || {
                 let mut b = [0u8; 4096];
                 loop {
