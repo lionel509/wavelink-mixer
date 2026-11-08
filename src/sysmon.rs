@@ -91,9 +91,16 @@ pub fn spawn(tx: Sender<Stats>) {
                 prev_gui = Some(t);
             }
             if n % 5 == 0 {
+                let p0 = crate::pw::pending();
                 let procs = crate::leak::scan();
                 let gui = crate::leak::read(me, &procs);
-                let gui = crate::leak::ProcStats { unlinked: crate::leak::UNLINKED.load(std::sync::atomic::Ordering::Relaxed), ..gui };
+                // zombies the reaper still holds are transient, not leaks
+                let p = p0.max(crate::pw::pending());
+                let gui = crate::leak::ProcStats {
+                    unlinked: crate::leak::UNLINKED.load(std::sync::atomic::Ordering::Relaxed),
+                    zombies: gui.zombies.saturating_sub(p),
+                    ..gui
+                };
                 let exp = crate::leak::EXPECTED_TAPS.load(std::sync::atomic::Ordering::Relaxed);
                 let exp_taps = if cfg!(target_os = "linux") { Some(exp) } else { None };
                 let mut w = gui_w.update(&gui, exp_taps, started.elapsed().as_secs_f64());

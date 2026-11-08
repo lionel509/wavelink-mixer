@@ -1,6 +1,7 @@
 //! Thin helpers around the PipeWire command-line tools.
 use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -133,12 +134,19 @@ pub fn output_timeout(cmd: &str, args: &[&str], limit: Duration) -> Option<Vec<u
 fn run(cmd: &str, args: &[&str]) {
     let _ = output_timeout(cmd, args, Duration::from_secs(3));
 }
-/// Stub for the failing-test commit; the real counter lands in the fix commit.
-pub fn pending() -> u64 { 0 }
+/// Fire-and-forget children the reaper still holds. A reaped child is never a zombie, but a child
+/// that exited a moment ago is, until the reaper's next pass; the leak watch subtracts this.
+static PENDING: AtomicU64 = AtomicU64::new(0);
+pub fn pending() -> u64 {
+    PENDING.load(Ordering::SeqCst)
+}
 /// Fire-and-forget command whose exit is always reaped (no zombies); hung ones are killed after 3 s.
 pub fn spawn(cmd: &str, args: &[&str]) {
     let Ok(c) = Command::new(cmd).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return };
-    let _ = reaper().send(c);
+    PENDING.fetch_add(1, Ordering::SeqCst);
+    if reaper().send(c).is_err() {
+        PENDING.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 fn reaper() -> &'static mpsc::Sender<std::process::Child> {
     static R: OnceLock<mpsc::Sender<std::process::Child>> = OnceLock::new();
@@ -153,10 +161,14 @@ fn reaper() -> &'static mpsc::Sender<std::process::Child> {
                     Err(mpsc::RecvTimeoutError::Disconnected) if live.is_empty() => return,
                     Err(_) => {}
                 }
-                live.retain_mut(|(c, t0)| match c.try_wait() {
-                    Ok(None) if t0.elapsed() < Duration::from_secs(3) => true,
-                    Ok(None) => { let _ = c.kill(); let _ = c.wait(); false }
-                    _ => false,
+                live.retain_mut(|(c, t0)| {
+                    let keep = match c.try_wait() {
+                        Ok(None) if t0.elapsed() < Duration::from_secs(3) => true,
+                        Ok(None) => { let _ = c.kill(); let _ = c.wait(); false }
+                        _ => false,
+                    };
+                    if !keep { PENDING.fetch_sub(1, Ordering::SeqCst); }
+                    keep
                 });
             }
         });
