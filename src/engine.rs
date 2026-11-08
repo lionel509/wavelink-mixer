@@ -328,6 +328,7 @@ pub fn run() {
     // piano synth (FluidSynth) feeding the "piano" input channel; stdin kept open = stays alive
     let mut piano: Option<(Child, std::process::ChildStdin)> = None;
     let mut piano_sent: Option<crate::config::PianoCfg> = None;
+    let mut last_quantum: Option<u32> = None;
     eprintln!("wavelink engine: config {}", Config::path().display());
 
     loop {
@@ -336,6 +337,10 @@ pub fn run() {
         if m != mtime {
             mtime = m;
             cfg = Config::load();
+        }
+        // graph quantum: forced through metadata (live, no restart), re-applied when the value changes
+        if last_quantum != Some(cfg.quantum) && pw::force_quantum(cfg.quantum) {
+            last_quantum = Some(cfg.quantum);
         }
         let Some(g) = Graph::read() else {
             std::thread::sleep(Duration::from_secs(1));

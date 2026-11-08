@@ -136,6 +136,27 @@ fn spawn(cmd: &str, args: &[&str]) {
     let _ = Command::new(cmd).args(args).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
 }
 
+/// Forces the graph quantum (frames per cycle) through PipeWire metadata; 0 releases the force.
+/// Returns true once the value reads back, so the caller can retry a failed write.
+pub fn force_quantum(q: u32) -> bool {
+    run("pw-metadata", &["-n", "settings", "0", "clock.force-quantum", &q.to_string()]);
+    let meta = output_timeout("pw-metadata", &["-n", "settings"], Duration::from_secs(3))
+        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .unwrap_or_default();
+    quantum_confirmed(q, &meta)
+}
+
+/// Whether a `pw-metadata` dump confirms that `force_quantum(q)` took effect.
+pub fn quantum_confirmed(q: u32, meta: &str) -> bool {
+    let got = meta_value(meta, "clock.force-quantum");
+    if q == 0 {
+        // releasing: the key reads 0, or is removed while the dump is still a settings dump
+        got == Some(0) || (got.is_none() && meta_value(meta, "clock.quantum").is_some())
+    } else {
+        got == Some(q as u64)
+    }
+}
+
 pub fn set_volume(id: u64, v: f64) {
     spawn("wpctl", &["set-volume", &id.to_string(), &format!("{v:.4}")]);
 }
@@ -170,4 +191,48 @@ pub fn create_null_sink(name: &str, desc: &str, priority: u32) {
          object.linger=true priority.session={priority} wavelink.owned=true }}"
     );
     run("pw-cli", &["create-node", "adapter", &props]);
+}
+
+/// Value of a `pw-metadata -n settings` key, e.g. `clock.force-quantum`.
+pub fn meta_value(meta: &str, key: &str) -> Option<u64> {
+    meta.lines()
+        .find(|l| l.contains(&format!("'{key}'")))?
+        .split("value:'")
+        .nth(1)?
+        .split('\'')
+        .next()?
+        .parse()
+        .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meta_value_reads_keys() {
+        let meta = "update: id:0 key:'clock.quantum-limit' value:'8192' type:''\nupdate: id:0 key:'clock.quantum' value:'1024' type:''\nupdate: id:0 key:'clock.min-quantum' value:'32' type:''\nupdate: id:0 key:'clock.force-quantum' value:'256' type:''\n";
+        assert_eq!(meta_value(meta, "clock.force-quantum"), Some(256));
+        assert_eq!(meta_value(meta, "clock.quantum"), Some(1024));
+        assert_eq!(meta_value(meta, "clock.rate"), None);
+    }
+
+    #[test]
+    fn quantum_confirmed_rules() {
+        let f0 = "update: id:0 key:'clock.quantum' value:'1024' type:''\nupdate: id:0 key:'clock.force-quantum' value:'0' type:''\n";
+        let f256 = "update: id:0 key:'clock.quantum' value:'1024' type:''\nupdate: id:0 key:'clock.force-quantum' value:'256' type:''\n";
+        let nokey = "update: id:0 key:'clock.quantum' value:'1024' type:''\n";
+        let cases = [
+            (0, "", false),
+            (0, f0, true),
+            (0, nokey, true),
+            (0, f256, false),
+            (256, f256, true),
+            (256, "", false),
+            (512, f256, false),
+        ];
+        for (q, meta, want) in cases {
+            assert_eq!(quantum_confirmed(q, meta), want, "q={q} meta={meta:?}");
+        }
+    }
 }

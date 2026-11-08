@@ -2048,7 +2048,7 @@ pub fn activate(app: &adw::Application) {
             while let Ok(st) = srx.try_recv() {
                 cd.set(st.cpu, &format!("{:.1}%", st.cpu));
                 fdd.set(st.fds as f64 * 1024.0 / st.fd_limit.max(1) as f64, &format!("{} / {}", st.fds, st.fd_limit));
-                cl.set_label(&format!("{} samples · {} kHz\n{:.1} ms latency", st.quantum, st.rate as f64 / 1000.0, st.quantum as f64 * 1000.0 / st.rate.max(1) as f64));
+                cl.set_label(&crate::sysmon::cycle_label(st.quantum, st.rate));
                 wl.set_label(&format!("{}", st.warnings));
                 if st.warnings > 0 { wl.add_css_class("warn") } else { wl.remove_css_class("warn") }
                 while let Some(c) = lr.first_child() {

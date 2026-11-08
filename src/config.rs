@@ -232,6 +232,35 @@ pub struct Config {
     pub buses: Vec<Bus>,
     #[serde(default)]
     pub piano: PianoCfg,
+    /// Graph quantum forced by the engine (`pw-metadata clock.force-quantum`); 0 = don't force.
+    #[serde(default = "default_quantum", deserialize_with = "lenient_quantum")]
+    pub quantum: u32,
+}
+
+fn default_quantum() -> u32 {
+    256
+}
+
+/// Graph quantum from config: 0 = don't force, otherwise a power of two in 32..=2048.
+/// Anything else is normalised (or 256 with a message) so a bad value can't fail the whole load.
+pub fn normalize_quantum(v: &serde_json::Value) -> u32 {
+    let n = v
+        .as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        .or_else(|| v.as_f64().filter(|f| *f >= 0.0 && f.fract() == 0.0).map(|f| f as u64));
+    match n {
+        Some(0) => 0,
+        Some(n) => (n.clamp(32, 2048) as u32).next_power_of_two(),
+        None => {
+            eprintln!("wavelink: config quantum {v} is invalid, using 256");
+            256
+        }
+    }
+}
+
+fn lenient_quantum<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(normalize_quantum(&v))
 }
 
 pub fn db_to_vol(db: f64) -> f64 {
@@ -268,14 +297,41 @@ impl Config {
     }
 
     pub fn load() -> Config {
-        std::fs::read(Self::path())
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_else(|| {
-                let c = Config::default_config();
-                c.save();
-                c
-            })
+        let path = Self::path();
+        let fresh = || {
+            let c = Config::default_config();
+            c.save();
+            c
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            return fresh();
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(c) => c,
+            Err(_) => {
+                // keep the user's bytes before defaults overwrite the file; never overwrite an earlier backup
+                let mut bad = path.with_extension("json.bad");
+                let mut n = 1;
+                while bad.exists() {
+                    bad = path.with_extension(format!("json.bad.{n}"));
+                    n += 1;
+                }
+                match std::fs::write(&bad, &bytes) {
+                    Ok(()) => {
+                        eprintln!("wavelink: {} is unreadable, saved a copy to {}", path.display(), bad.display());
+                        fresh()
+                    }
+                    Err(we) => {
+                        eprintln!(
+                            "wavelink: {} is unreadable and the copy to {} failed ({we}); using defaults without saving",
+                            path.display(),
+                            bad.display()
+                        );
+                        Config::default_config()
+                    }
+                }
+            }
+        }
     }
 
     pub fn save(&self) {
@@ -319,6 +375,7 @@ impl Config {
         };
         Config {
             piano: PianoCfg::default(),
+            quantum: 256,
             inputs: vec![
                 input("system", "System", "#8e8e93", "clean", r(&[("a1", true, 0.0), ("b1", true, -13.3)])),
                 input("spotify", "Spotify", "#1ed760", "music", r(&[("a1", true, -4.2), ("b1", true, -36.0)])),
@@ -350,4 +407,72 @@ impl Config {
 
 pub fn glib_home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_quantum_defaults_to_256() {
+        let mut v = serde_json::to_value(Config::default_config()).unwrap();
+        v.as_object_mut().unwrap().remove("quantum");
+        let c: Config = serde_json::from_value(v).unwrap();
+        assert_eq!(c.quantum, 256);
+        let mut v = serde_json::to_value(Config::default_config()).unwrap();
+        v["quantum"] = serde_json::json!(512);
+        let c: Config = serde_json::from_value(v).unwrap();
+        assert_eq!(c.quantum, 512);
+    }
+
+    fn quantum_of(v: serde_json::Value) -> Result<u32, serde_json::Error> {
+        let mut j = serde_json::to_value(Config::default_config()).unwrap();
+        j["quantum"] = v;
+        serde_json::from_value::<Config>(j).map(|c| c.quantum)
+    }
+
+    #[test]
+    fn quantum_bad_values_normalised() {
+        use serde_json::json;
+        let cases = [
+            (json!("256"), 256), (json!(-1), 256), (json!(null), 256), (json!(1.5), 256),
+            (json!(0), 0), (json!(1), 32), (json!(16), 32), (json!(300), 512),
+            (json!(512), 512), (json!(2048), 2048), (json!(4096), 2048),
+            (json!("0"), 0), (json!(0.0), 0), (json!(" 512 "), 512), (json!(256.0), 256), (json!("abc"), 256),
+        ];
+        for (v, want) in cases {
+            let got = quantum_of(v.clone()).unwrap_or_else(|e| panic!("{v} failed to parse: {e}"));
+            assert_eq!(got, want, "quantum {v}");
+        }
+        let mut j = serde_json::to_value(Config::default_config()).unwrap();
+        j["quantum"] = json!("256");
+        let c: Config = serde_json::from_value(j).unwrap();
+        assert_eq!(c.buses.len(), Config::default_config().buses.len());
+    }
+
+    #[test]
+    fn load_backs_up_unparseable_config() {
+        let home = std::env::temp_dir().join(format!("wavelink-load-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let dir = home.join(".config/wavelink-mixer");
+        std::fs::create_dir_all(&dir).unwrap();
+        let truncated: &[u8] = b"{\"buses\": [";
+        std::fs::write(dir.join("config.json"), truncated).unwrap();
+        let old = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        let _ = Config::load();
+        // a second bad save must not overwrite the first backup
+        let second: &[u8] = b"{oops";
+        std::fs::write(dir.join("config.json"), second).unwrap();
+        let _ = Config::load();
+        match old {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        let bad = std::fs::read(dir.join("config.json.bad"));
+        let bad1 = std::fs::read(dir.join("config.json.bad.1"));
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(bad.unwrap(), truncated);
+        assert_eq!(bad1.unwrap(), second);
+    }
 }

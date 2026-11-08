@@ -4,6 +4,7 @@
 mod config;
 mod dash;
 mod discord;
+mod latency;
 mod engine;
 mod midi;
 mod player;
@@ -57,6 +58,9 @@ fn main() -> glib::ExitCode {
     if std::env::args().nth(1).as_deref() == Some("engine") {
         engine::run();
         return glib::ExitCode::SUCCESS;
+    }
+    if std::env::args().nth(1).as_deref() == Some("latency") {
+        std::process::exit(latency::run(std::env::args().skip(2).collect()));
     }
     let app = adw::Application::builder().application_id("local.wavelink.Mixer").build();
     app.connect_activate(ui::activate);
