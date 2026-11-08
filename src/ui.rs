@@ -1575,6 +1575,7 @@ impl App {
         let (app, p2, id) = (self.clone(), pop.clone(), inp.id.clone());
         remove.connect_clicked(move |_| {
             app.cfg.borrow_mut().inputs.retain(|i| i.id != id);
+            app.cfg.borrow_mut().net_in.remove(&id);
             app.norm.borrow_mut().remove(&id);
             p2.popdown();
             app.structural();
@@ -1607,7 +1608,7 @@ impl App {
                 d.chars().take(22).collect::<String>()
             }
             BusKind::Virtual { description, .. } => format!("mic: {description}"),
-            BusKind::Network => todo!("#15 U1 stub"),
+            BusKind::Network => self.cfg.borrow().net_out.get(&bus.id).map(|r| format!("dlna: {}", r.name)).unwrap_or_else(|| "stream URL".into()),
         };
         let s = label(&sub, "small");
         s.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -1662,6 +1663,7 @@ impl App {
         let entry = gtk::Entry::builder().text(&bus.name).build();
         b.append(&entry);
         let dev;
+        let net;
         match &bus.kind {
             BusKind::Hardware { target } => {
                 b.append(&label("OUTPUT DEVICE", "small"));
@@ -1674,12 +1676,14 @@ impl App {
                 dd.set_selected(list.iter().position(|s| &s.0 == target).unwrap_or(0) as u32);
                 b.append(&dd);
                 dev = Some((dd, list));
+                net = None;
             }
             BusKind::Virtual { description, .. } => {
                 b.append(&label("VIRTUAL MIC NAME (shown in OBS / Discord)", "small"));
                 let e2 = gtk::Entry::builder().text(description).build();
                 b.append(&e2);
                 dev = None;
+                net = None;
                 let (app, id) = (self.clone(), bus.id.clone());
                 e2.connect_activate(move |e| {
                     if let Some(bu) = app.cfg.borrow_mut().buses.iter_mut().find(|b| b.id == id) {
@@ -1690,7 +1694,18 @@ impl App {
                     app.structural();
                 });
             }
-            BusKind::Network => todo!("#15 U1 stub"),
+            BusKind::Network => {
+                b.append(&label("STREAM URL (VLC or any DLNA app)", "small"));
+                let url = gtk::Label::new(Some(&crate::swyh::stream_url(&bus.id, None)));
+                url.set_selectable(true);
+                url.set_halign(gtk::Align::Start);
+                b.append(&url);
+                b.append(&label("PLAY ON (DLNA RENDERER)", "small"));
+                let p = crate::swyh_ui::NetPick::new(self.cfg.borrow().net_out.get(&bus.id).cloned());
+                b.append(&p.widget);
+                dev = None;
+                net = Some(p);
+            }
         }
         let apply = gtk::Button::with_label("Apply");
         apply.add_css_class("suggested-action");
@@ -1711,6 +1726,16 @@ impl App {
                 if let Some((dd, list)) = &dev {
                     bu.kind = BusKind::Hardware { target: list[dd.selected() as usize].0.clone() };
                 }
+                if let Some(p) = &net {
+                    match p.selected() {
+                        Some(r) => {
+                            c.net_out.insert(id.clone(), r);
+                        }
+                        None => {
+                            c.net_out.remove(&id);
+                        }
+                    }
+                }
             }
             p2.popdown();
             app.structural();
@@ -1723,6 +1748,7 @@ impl App {
                 for i in &mut c.inputs {
                     i.routes.remove(&id);
                 }
+                c.net_out.remove(&id);
             }
             p2.popdown();
             app.structural();
@@ -1741,8 +1767,15 @@ impl App {
         let entry = gtk::Entry::builder().placeholder_text("Name, e.g. Music 2").build();
         b.append(&entry);
         let opts = Rc::new(RefCell::new(Vec::<(String, String)>::new()));
-        let dd = gtk::DropDown::from_strings(&["Virtual input (apps play into it)"]);
+        let dd = gtk::DropDown::from_strings(&["Virtual input (apps play into it)", "Network stream (URL, e.g. another PC's SWYH)"]);
         b.append(&dd);
+        let url = gtk::Entry::builder().placeholder_text("http://192.168.1.20:5901/stream/swyh.wav").visible(false).build();
+        b.append(&url);
+        let (o3, u3) = (opts.clone(), url.clone());
+        dd.connect_selected_notify(move |d| {
+            let is_url = o3.borrow().get(d.selected() as usize).map(|s| s.0 == "#url").unwrap_or(false);
+            u3.set_visible(is_url);
+        });
         let add = gtk::Button::with_label("Add input");
         add.add_css_class("suggested-action");
         b.append(&add);
@@ -1750,6 +1783,7 @@ impl App {
         let (app, o2, dd2) = (self.clone(), opts.clone(), dd.clone());
         pop.connect_show(move |_| {
             let mut list = vec![(String::new(), "Virtual input (apps play into it)".to_string())];
+            list.push(("#url".into(), "Network stream (URL, e.g. another PC's SWYH)".into()));
             for n in app.graph.borrow().sources() {
                 list.push((n.name.clone(), format!("Device: {}", if n.desc.is_empty() { &n.name } else { &n.desc })));
             }
@@ -1762,9 +1796,23 @@ impl App {
             let name = entry.text().trim().to_string();
             let name = if name.is_empty() { "Input".to_string() } else { name };
             let sel = opts.borrow().get(dd.selected() as usize).map(|s| s.0.clone()).unwrap_or_default();
+            if sel == "#url" {
+                let u = url.text().trim().to_string();
+                if !crate::netin::valid_url(&u) {
+                    url.add_css_class("error");
+                    return;
+                }
+                app.cfg.borrow_mut().add_stream_input(&name, &u);
+                entry.set_text("");
+                url.set_text("");
+                p2.popdown();
+                app.structural();
+                return;
+            }
             {
                 let mut c = app.cfg.borrow_mut();
                 let id = c.new_id(&name);
+                c.net_in.remove(&id);
                 let mut routes = std::collections::BTreeMap::new();
                 if let Some(first) = c.buses.first() {
                     routes.insert(first.id.clone(), Route { on: true, level_db: 0.0 });
@@ -1804,7 +1852,7 @@ impl App {
         let entry = gtk::Entry::builder().placeholder_text("Name, e.g. Speakers").build();
         b.append(&entry);
         let opts = Rc::new(RefCell::new(Vec::<(String, String)>::new()));
-        let dd = gtk::DropDown::from_strings(&["Virtual mic (for OBS / Discord)"]);
+        let dd = gtk::DropDown::from_strings(&["Virtual mic (for OBS / Discord)", "Network: DLNA renderer / stream URL"]);
         b.append(&dd);
         let add = gtk::Button::with_label("Add bus");
         add.add_css_class("suggested-action");
@@ -1813,6 +1861,7 @@ impl App {
         let (app, o2, dd2) = (self.clone(), opts.clone(), dd.clone());
         pop.connect_show(move |_| {
             let mut list = vec![(String::new(), "Virtual mic (for OBS / Discord)".to_string())];
+            list.push(("#network".into(), "Network: DLNA renderer / stream URL".into()));
             for n in app.graph.borrow().hardware_sinks() {
                 list.push((n.name.clone(), format!("Output: {}", n.desc)));
             }
@@ -1823,6 +1872,13 @@ impl App {
         let (app, p2) = (self.clone(), pop.clone());
         add.connect_clicked(move |_| {
             let sel = opts.borrow().get(dd.selected() as usize).map(|s| s.0.clone()).unwrap_or_default();
+            if sel == "#network" {
+                app.cfg.borrow_mut().add_network_bus(entry.text().trim());
+                entry.set_text("");
+                p2.popdown();
+                app.structural();
+                return;
+            }
             {
                 let mut c = app.cfg.borrow_mut();
                 let hw = !sel.is_empty();
@@ -2055,7 +2111,7 @@ impl App {
                 let dest = match &b.kind {
                     BusKind::Hardware { target } => g.node(target).map(|n| n.desc.clone()).unwrap_or_else(|| "(not connected)".into()),
                     BusKind::Virtual { description, .. } => format!("{description} (virtual mic)"),
-                    BusKind::Network => todo!("#15 U1 stub"),
+                    BusKind::Network => cfg.net_out.get(&b.id).map(|r| format!("{} (DLNA)", r.name)).unwrap_or_else(|| "network stream URL".into()),
                 };
                 (format!("{} · {}", b.id.to_uppercase(), b.name), dest)
             })

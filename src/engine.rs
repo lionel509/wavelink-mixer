@@ -258,8 +258,7 @@ pub fn apply_levels(cfg: &Config, g: &Graph) {
 pub fn bus_fader_node(b: &crate::config::Bus) -> String {
     match &b.kind {
         BusKind::Hardware { target } => target.clone(),
-        BusKind::Virtual { .. } => names::bus(&b.id),
-        BusKind::Network => todo!("#15 U1 stub"),
+        BusKind::Virtual { .. } | BusKind::Network => names::bus(&b.id),
     }
 }
 
@@ -330,6 +329,8 @@ pub fn run() {
     let mut piano: Option<(Child, std::process::ChildStdin)> = None;
     let mut piano_sent: Option<crate::config::PianoCfg> = None;
     let mut last_quantum: Option<u32> = None;
+    let mut net_out = crate::swyh::Out::default();
+    let mut net_in = crate::netin::In::default();
     eprintln!("wavelink engine: config {}", Config::path().display());
 
     loop {
@@ -466,6 +467,8 @@ pub fn run() {
                 }
             }
         }
+        net_out.tick(&cfg, &g);
+        net_in.tick(&cfg, &g);
         let stale: Vec<String> = hw.keys().filter(|k| !cfg.buses.iter().any(|b| &b.id == *k && matches!(b.kind, BusKind::Hardware { .. }))).cloned().collect();
         for k in stale {
             if let Some((mut c, _)) = hw.remove(&k) {

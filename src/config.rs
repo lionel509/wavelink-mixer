@@ -389,18 +389,70 @@ impl Config {
     }
 
     /// Adds a Network bus (#15) that starts as a copy of the main mix. Returns its id.
-    pub fn add_network_bus(&mut self, _name: &str) -> String {
-        todo!("#15 U1 stub")
+    pub fn add_network_bus(&mut self, name: &str) -> String {
+        let id = (1..).map(|k| format!("n{k}")).find(|id| !self.buses.iter().any(|b| &b.id == id)).unwrap();
+        if let Some(main) = self.buses.iter().find(|b| matches!(b.kind, BusKind::Hardware { .. })).map(|b| b.id.clone()) {
+            for i in &mut self.inputs {
+                if let Some(r) = i.routes.get(&main).cloned() {
+                    i.routes.insert(id.clone(), r);
+                }
+            }
+        }
+        self.net_out.remove(&id);
+        let name = name.trim();
+        let name = if name.is_empty() { "Network" } else { name };
+        self.buses.push(Bus {
+            id: id.clone(),
+            name: name.into(),
+            color: "#30d158".into(),
+            kind: BusKind::Network,
+            gain_db: 0.0,
+            mute: false,
+        });
+        self.buses.sort_by(|a, b| a.id.cmp(&b.id));
+        id
     }
 
     /// Adds a Virtual input that pulls `url` (#15). Returns its id.
-    pub fn add_stream_input(&mut self, _name: &str, _url: &str) -> String {
-        todo!("#15 U1 stub")
+    pub fn add_stream_input(&mut self, name: &str, url: &str) -> String {
+        let name = name.trim();
+        let name = if name.is_empty() { "Stream" } else { name };
+        let id = self.new_id(name);
+        let mut routes = BTreeMap::new();
+        if let Some(first) = self.buses.first() {
+            routes.insert(first.id.clone(), Route { on: true, level_db: 0.0 });
+        }
+        self.inputs.push(Input {
+            id: id.clone(),
+            name: name.into(),
+            color: "#30d158".into(),
+            kind: InputKind::Virtual,
+            fx: "clean".into(),
+            eq: flat_eq(),
+            gain_db: 0.0,
+            mute: false,
+            routes,
+            default_sink: false,
+            rack: Rack::default(),
+            normalize: false,
+            norm_base: None,
+            norm_out: None,
+        });
+        self.net_in.insert(id.clone(), url.trim().to_string());
+        id
     }
 
     /// Removes an input or bus and every reference to it, including the #15 maps.
-    pub fn remove_id(&mut self, _id: &str) -> bool {
-        todo!("#15 U1 stub")
+    pub fn remove_id(&mut self, id: &str) -> bool {
+        let before = self.inputs.len() + self.buses.len();
+        self.inputs.retain(|i| i.id != id);
+        self.buses.retain(|b| b.id != id);
+        for i in &mut self.inputs {
+            i.routes.remove(id);
+        }
+        self.net_in.remove(id);
+        self.net_out.remove(id);
+        self.inputs.len() + self.buses.len() != before
     }
 
     pub fn default_config() -> Config {
