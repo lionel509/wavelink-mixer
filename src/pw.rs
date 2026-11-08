@@ -568,7 +568,7 @@ mod tests {
     fn deathsig_helper() {
         if std::env::var_os("WAVELINK_DEATHSIG_HELPER").is_none() { return; }
         use std::io::Write;
-        let child = die_with_parent(&mut Command::new("sleep")).arg("30").stdout(Stdio::null()).spawn().unwrap();
+        let child = die_with_parent(&mut Command::new("sh")).args(["-c", "trap '' TERM; exec sleep 30"]).stdout(Stdio::null()).spawn().unwrap();
         println!("PID {}", child.id());
         std::io::stdout().flush().unwrap();
         std::thread::sleep(Duration::from_secs(30));
