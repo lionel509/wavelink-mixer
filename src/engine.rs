@@ -259,6 +259,7 @@ pub fn bus_fader_node(b: &crate::config::Bus) -> String {
     match &b.kind {
         BusKind::Hardware { target } => target.clone(),
         BusKind::Virtual { .. } => names::bus(&b.id),
+        BusKind::Network => todo!("#15 U1 stub"),
     }
 }
 

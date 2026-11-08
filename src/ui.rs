@@ -1607,6 +1607,7 @@ impl App {
                 d.chars().take(22).collect::<String>()
             }
             BusKind::Virtual { description, .. } => format!("mic: {description}"),
+            BusKind::Network => todo!("#15 U1 stub"),
         };
         let s = label(&sub, "small");
         s.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -1689,6 +1690,7 @@ impl App {
                     app.structural();
                 });
             }
+            BusKind::Network => todo!("#15 U1 stub"),
         }
         let apply = gtk::Button::with_label("Apply");
         apply.add_css_class("suggested-action");
@@ -2053,6 +2055,7 @@ impl App {
                 let dest = match &b.kind {
                     BusKind::Hardware { target } => g.node(target).map(|n| n.desc.clone()).unwrap_or_else(|| "(not connected)".into()),
                     BusKind::Virtual { description, .. } => format!("{description} (virtual mic)"),
+                    BusKind::Network => todo!("#15 U1 stub"),
                 };
                 (format!("{} · {}", b.id.to_uppercase(), b.name), dest)
             })
