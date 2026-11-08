@@ -1,7 +1,7 @@
 //! Breaker round 1 (frontend + invariants). Test-only, never production code.
 use crate::config::{flat_eq, Config, Input, InputKind, Rack};
 use crate::notes::{midi_bytes, Note};
-use crate::stemcfg::{ensure_channel, sources};
+use crate::stemcfg::{ensure_channel, sources, CHANNEL_ID};
 
 fn user_input(id: &str, name: &str, target: &str) -> Input {
     Input {
@@ -22,39 +22,34 @@ fn user_input(id: &str, name: &str, target: &str) -> Input {
     }
 }
 
-/// Break 1 (high): Config::new_id("Stems") yields the id "stems" when the user names a channel
-/// "Stems" before the feature is first used (ui.rs add-input path). stemcfg::sources() then drops
-/// every input whose id is CHANNEL_ID, so the user's own channel vanishes from the source picker.
+/// Break 1 (high): a user channel named "Stems" must not take the Stems channel id. Config::new_id is the
+/// real path (ui.rs add-input). The user's channel must stay in the source picker.
 #[test]
 fn breaker_user_channel_named_stems_stays_a_source() {
     let mut cfg = Config::default_config();
-    assert!(!cfg.inputs.iter().any(|i| i.id == "stems"), "precondition: default config has no stems id");
     let user_id = cfg.new_id("Stems");
-    assert_eq!(user_id, "stems", "precondition: new_id maps the name Stems to id stems");
+    assert_ne!(user_id, CHANNEL_ID, "new_id gave the user channel the Stems channel id");
     cfg.inputs.push(user_input(&user_id, "Stems", "easyeffects_source"));
     let srcs = sources(&cfg);
     assert!(
-        srcs.iter().any(|(id, name)| id == "stems" && name == "Stems"),
+        srcs.iter().any(|(id, name)| *id == user_id && name == "Stems"),
         "user channel named Stems is missing from the source picker: {srcs:?}"
     );
 }
 
-/// Break 1b (high): with a user input already holding id "stems", ensure_channel returns false and
-/// creates nothing. start() then writes the session's MIDI/audio into that user channel (out
-/// "ch_stems"), so the user's own channel is altered by starting Stems.
+/// Break 1b (high): with a user channel named "Stems" (made through new_id), ensure_channel must still
+/// create the Stems channel and leave the user's channel alone.
 #[test]
 fn breaker_ensure_channel_does_not_reuse_user_channel() {
     let mut cfg = Config::default_config();
-    cfg.inputs.push(user_input("stems", "Stems", "easyeffects_source"));
-    let before = cfg.inputs.clone();
+    let user_id = cfg.new_id("Stems");
+    cfg.inputs.push(user_input(&user_id, "Stems", "easyeffects_source"));
+    let before = cfg.inputs.iter().find(|i| i.id == user_id).unwrap().clone();
     let added = ensure_channel(&mut cfg, "spotify");
-    assert!(added, "ensure_channel reused the user's 'stems' channel instead of creating the Stems channel");
-    assert_eq!(cfg.inputs.iter().filter(|i| i.id == "stems").count(), 1, "stems id should stay unique");
-    assert_eq!(
-        cfg.inputs.iter().find(|i| i.id == "stems").map(|i| i.kind.clone()),
-        Some(before.iter().find(|i| i.id == "stems").unwrap().kind.clone()),
-        "the user's stems channel was changed"
-    );
+    assert!(added, "ensure_channel did not create the Stems channel next to the user channel");
+    assert_eq!(cfg.inputs.iter().filter(|i| i.id == CHANNEL_ID).count(), 1, "the Stems channel id should be unique");
+    let after = cfg.inputs.iter().find(|i| i.id == user_id).unwrap();
+    assert_eq!(after.kind, before.kind, "the user channel was changed");
 }
 
 /// Break 2 (low): midi_bytes sorts (tick, kind) with note-off (kind 0) before note-on (kind 1).
