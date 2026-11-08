@@ -96,7 +96,7 @@ pub fn summarize(direct_ms: &[f64], via_ms: &[f64], device_ms: f64) -> Summary {
 /// Human summary of `summarize`: medians, the added delay (via − direct) and the total game → ears estimate.
 pub fn summary(direct_ms: &[f64], via_ms: &[f64], device_ms: f64) -> String {
     let s = summarize(direct_ms, via_ms, device_ms);
-    let added = if s.below_noise {
+    let added = if s.below_noise && format!("{:.1}", s.via_median_ms) != format!("{:.1}", s.direct_median_ms) {
         format!(
             "0.0 ms (below measurement noise: via mixer median {:.1} ms < direct median {:.1} ms)",
             s.via_median_ms, s.direct_median_ms
