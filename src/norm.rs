@@ -203,7 +203,6 @@ mod tests {
     #[test]
     fn normalizer_bounded_under_random_feed() {
         let mut x: u64 = 11;
-        let rate = ATTACK_DB_S.max(RELEASE_DB_S);
         for case in 0..200 {
             let mut c = Channel::new(0.0);
             let mut hold_left = 0.0_f64;
@@ -220,7 +219,10 @@ mod tests {
                 let before = c.gain;
                 let r = c.step(rms, dt);
                 t += dt;
-                assert!((c.gain - before).abs() <= rate * dt + 1e-9, "case {case}: moved {}", c.gain - before);
+                assert!(c.gain - before <= RELEASE_DB_S * dt + 1e-9, "case {case}: rose {}", c.gain - before);
+                if before - c.gain > ATTACK_DB_S * dt + 1e-9 {
+                    assert!(c.gain >= c.base - 1e-9, "case {case}: fast cut ended at {} below his position {}", c.gain, c.base);
+                }
                 if rms < GATE_DB {
                     assert!(c.gain == before && r.is_none(), "case {case}: moved below the gate");
                 }
@@ -283,7 +285,198 @@ mod tests {
 
     #[test]
     fn fader_range_matches_taper() {
-        assert_eq!(-60.0, crate::dash::pos_to_db(0.0));
-        assert_eq!(12.0, crate::dash::pos_to_db(1.0));
+        assert_eq!(FADER_MIN_DB, crate::dash::pos_to_db(0.0));
+        assert_eq!(FADER_MAX_DB, crate::dash::pos_to_db(1.0));
+    }
+
+    #[test]
+    fn xb1_fade_in_before_first_play_keeps_his_move() {
+        let mut c = Channel::new(0.0);
+        c.manual(-18.0);
+        let mut w = feed(&mut c, -80.0, 4.0, 0.03);
+        w.extend(feed(&mut c, -49.0, 0.03, 0.03));
+        w.extend(feed(&mut c, -8.0, 20.0, 0.03));
+        assert!(w.is_empty(), "auto wrote {w:?} after his move");
+        assert_eq!(c.gain, -18.0);
+        assert!(!c.pending);
+    }
+
+    #[test]
+    fn xb1_click_before_first_play_keeps_his_move() {
+        let mut c = Channel::new(0.0);
+        c.manual(-18.0);
+        let mut w = feed(&mut c, -80.0, 4.0, 0.03);
+        w.extend(feed(&mut c, -2.0, 0.03, 0.03));
+        w.extend(feed(&mut c, -8.0, 20.0, 0.03));
+        assert!(w.is_empty(), "auto wrote {w:?} after his move");
+        assert_eq!(c.gain, -18.0);
+        assert!((c.out - -25.93).abs() < 0.1, "out {:.2}", c.out);
+    }
+
+    #[test]
+    fn xb2_move_in_silence_after_play_keeps_his_move() {
+        let mut c = Channel::new(0.0);
+        feed(&mut c, -8.0, 20.0, 0.03);
+        feed(&mut c, -80.0, 60.0, 0.03);
+        c.manual(-18.0);
+        let w = feed(&mut c, -80.0, 4.0, 0.03);
+        let w2 = feed(&mut c, -30.0, 20.0, 0.03);
+        assert!(w.is_empty() && w2.is_empty(), "auto wrote {w:?} {w2:?} after his move");
+        assert_eq!(c.gain, -18.0);
+        feed(&mut c, -10.0, 20.0, 0.03);
+        assert!((c.gain - -38.0).abs() <= 1.0, "gain {:.2}", c.gain);
+    }
+
+    #[test]
+    fn move_right_after_resume_keeps_his_move() {
+        let mut c = Channel::new(0.0);
+        feed(&mut c, -8.0, 20.0, 0.03);
+        feed(&mut c, -80.0, 60.0, 0.03);
+        feed(&mut c, -30.0, 1.0, 0.03);
+        c.manual(-18.0);
+        let w = feed(&mut c, -30.0, 20.0, 0.03);
+        assert!(w.is_empty(), "auto wrote {w:?} after his move");
+        assert_eq!(c.gain, -18.0);
+    }
+
+    #[test]
+    fn move_in_short_gap_uses_settled_loudness() {
+        let mut c = Channel::new(0.0);
+        feed(&mut c, -8.0, 20.0, 0.03);
+        feed(&mut c, -80.0, 1.0, 0.03);
+        c.manual(-18.0);
+        assert!(c.pending);
+        let w = feed(&mut c, -8.0, 20.0, 0.03);
+        assert!(w.is_empty(), "auto wrote {w:?} after his move");
+        assert_eq!(c.gain, -18.0);
+        feed(&mut c, -4.0, 20.0, 0.03);
+        assert!((c.gain - -22.0).abs() <= 1.0, "gain {:.2}", c.gain);
+    }
+
+    #[test]
+    fn burst_after_quiet_ambience_is_cut_fast() {
+        let dt: f64 = 0.03;
+        let mut c = Channel::new(0.0);
+        feed(&mut c, -40.0, 30.0, dt);
+        assert!((c.gain - 12.0).abs() <= 1.0, "ambience gain {:.2}", c.gain);
+        let mut t = 0.0;
+        for step in 0..200 {
+            t += dt;
+            let r = c.step(-6.0, dt);
+            if step == 0 {
+                assert!(r.is_some(), "first burst step did not write");
+            }
+            if t <= 0.3 {
+                assert!(c.emitted - 6.0 <= 0.0, "t={t:.2}: slider at {:.2}", c.emitted);
+            } else {
+                assert!(c.emitted - 6.0 <= -5.0, "t={t:.2}: slider at {:.2}", c.emitted);
+            }
+        }
+        assert!(c.emitted <= -8.0, "slider at {:.2} after 6 s of burst", c.emitted);
+    }
+
+    #[test]
+    fn measurement_runs_during_hold() {
+        let mut c = Channel::new(0.0);
+        feed(&mut c, -8.0, 20.0, 0.03);
+        c.manual(-18.0);
+        let mut w = feed(&mut c, -8.0, 0.5, 0.03);
+        w.extend(feed(&mut c, -4.0, 2.4, 0.03));
+        assert!(w.is_empty(), "auto wrote {w:?} inside the hold");
+        assert!(c.loud_db().unwrap() > -6.0, "loud {:?}", c.loud_db());
+        feed(&mut c, -4.0, 1.5, 0.03);
+        assert!(c.gain <= -19.5, "gain {:.2}", c.gain);
+    }
+
+    #[test]
+    fn manual_ignores_non_finite() {
+        let mut c = Channel::new(0.0);
+        feed(&mut c, -8.0, 20.0, 0.03);
+        let before = c;
+        c.manual(f64::NAN);
+        c.manual(f64::INFINITY);
+        c.manual(f64::NEG_INFINITY);
+        assert_eq!(c, before);
+        feed(&mut c, -4.0, 20.0, 0.03);
+        assert!((c.gain - -16.0).abs() <= 1.1, "gain {:.2}", c.gain);
+    }
+
+    #[test]
+    fn boost_capped_above_his_position() {
+        let mut c = Channel::new(0.0);
+        feed(&mut c, -8.0, 20.0, 0.03);
+        c.manual(-18.0);
+        let mut w = feed(&mut c, -8.0, 5.0, 0.03);
+        w.extend(feed(&mut c, -80.0, 60.0, 0.03));
+        w.extend(feed(&mut c, -45.0, 30.0, 0.03));
+        let max = w.iter().cloned().fold(f64::MIN, f64::max);
+        assert!(max <= -6.0 + 0.05, "auto asked for {max:.2} dB; his position is -18, so the cap is -6");
+        assert!((c.gain - -6.0).abs() <= 1.0, "gain {:.2}", c.gain);
+    }
+
+    #[test]
+    fn silence_resets_loudness_memory() {
+        let mut c = Channel::new(0.0);
+        feed(&mut c, -8.0, 20.0, 0.03);
+        feed(&mut c, -80.0, 2.9, 0.03);
+        assert!(c.loud_db().is_some());
+        feed(&mut c, -80.0, 0.2, 0.03);
+        assert!(c.loud_db().is_none());
+        feed(&mut c, -80.0, 56.9, 0.03);
+        feed(&mut c, -30.0, 2.0, 0.03);
+        assert!((c.loud_db().unwrap() - -30.0).abs() <= 0.5, "loud {:?}", c.loud_db());
+        feed(&mut c, -30.0, 18.0, 0.03);
+        assert!((c.gain - 10.0).abs() <= 1.1, "gain {:.2}", c.gain);
+    }
+
+    #[test]
+    fn manual_move_wins_under_segment_feed() {
+        let mut x: u64 = 7;
+        let mut fast_cuts = 0usize;
+        let mut pending_steps = 0usize;
+        for case in 0..300 {
+            let mut c = Channel::new(0.0);
+            let mut last_manual: Option<f64> = None;
+            for seg in 0..40 {
+                let silent = unit(&mut x) < 0.3;
+                let level = if silent { -80.0 } else { -60.0 + 60.0 * unit(&mut x) };
+                let dur = 0.2 + 14.8 * unit(&mut x);
+                if silent && unit(&mut x) < 0.3 {
+                    let g = -60.0 + 72.0 * unit(&mut x);
+                    c.manual(g);
+                    last_manual = Some(g);
+                }
+                let mut used = 0.0;
+                while used < dur {
+                    if unit(&mut x) < 1.0 / 400.0 {
+                        let g = -60.0 + 72.0 * unit(&mut x);
+                        c.manual(g);
+                        last_manual = Some(g);
+                    }
+                    let dt = 1.0 / 40.0 + (1.0 / 27.0 - 1.0 / 40.0) * unit(&mut x);
+                    used += dt;
+                    let pend = c.pending;
+                    let before = c.gain;
+                    let r = c.step(level, dt);
+                    let cap = last_manual.unwrap_or(0.0) + MAX_BOOST_DB;
+                    if pend {
+                        pending_steps += 1;
+                        assert!(r.is_none() && c.gain == before, "case {case} seg {seg}: moved while his move was pending");
+                    }
+                    assert!(c.gain <= cap + 1e-9, "case {case} seg {seg}: gain {:.2} above his position + 12 = {cap:.2}", c.gain);
+                    if let Some(v) = r {
+                        assert!(v <= cap + 0.05 + 1e-9, "case {case} seg {seg}: asked {v:.2}, cap {cap:.2}");
+                    }
+                    assert!(c.gain - before <= RELEASE_DB_S * dt + 1e-9, "case {case} seg {seg}: rose {}", c.gain - before);
+                    if before - c.gain > ATTACK_DB_S * dt + 1e-9 {
+                        fast_cuts += 1;
+                        assert!(c.gain >= c.base - 1e-9, "case {case} seg {seg}: fast cut ended at {:.2}, below his position {:.2}", c.gain, c.base);
+                    }
+                    assert!(c.gain.is_finite(), "case {case} seg {seg}: gain not finite");
+                }
+            }
+        }
+        assert!(fast_cuts > 0, "no fast cut happened, so the property is vacuous");
+        assert!(pending_steps > 0, "no pending step happened, so the property is vacuous");
     }
 }
