@@ -88,6 +88,7 @@ fn play_args_pin_the_channel() {
 fn wanted_only_virtual_inputs_with_valid_urls() {
     let mut s = SEED;
     let urls = ["http://a.b/x", "ftp://x", "http://a b", "", "http://h/s.wav"];
+    let mut hits = 0;
     for _ in 0..300 {
         let mut cfg = Config::default_config();
         for _ in 0..3 {
@@ -113,7 +114,15 @@ fn wanted_only_virtual_inputs_with_valid_urls() {
             .filter(|_| rng(&mut s) % 3 != 0)
             .collect();
         let present = |n: &str| present_names.iter().any(|p| p == n);
-        for (id, url) in wanted(&cfg, &present) {
+        let got = wanted(&cfg, &present);
+        // positive case: every present Virtual input with a valid URL is wanted
+        for i in cfg.inputs.iter().filter(|i| matches!(i.kind, InputKind::Virtual) && present(&names::ch(&i.id))) {
+            if let Some(url) = cfg.net_in.get(&i.id).filter(|u| valid_url(u)) {
+                assert!(got.iter().any(|(g, _)| g == &i.id), "input {} with a valid url is not wanted", i.id);
+                hits += 1;
+            }
+        }
+        for (id, url) in got {
             let inp = cfg.inputs.iter().find(|i| i.id == id).expect("wanted id is an input");
             assert!(matches!(inp.kind, InputKind::Virtual), "{id} is not a Virtual input");
             assert!(valid_url(&url), "{id} has an invalid url {url:?}");
@@ -121,6 +130,7 @@ fn wanted_only_virtual_inputs_with_valid_urls() {
             assert!(present(&names::ch(&id)), "{id} is not present");
         }
     }
+    assert!(hits > 0, "no round had a wanted input, so the test checked nothing");
 }
 
 #[test]

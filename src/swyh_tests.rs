@@ -153,6 +153,7 @@ fn tap_args_pin_the_bus() {
 #[test]
 fn allowed_and_pushes_only_network_buses() {
     let mut s = SEED;
+    let mut hits = 0;
     for _ in 0..300 {
         let mut cfg = Config::default_config();
         if rng(&mut s) % 2 == 0 {
@@ -181,11 +182,21 @@ fn allowed_and_pushes_only_network_buses() {
             assert!(matches!(b.kind, BusKind::Network), "{id} is not a Network bus");
             assert!(present(&names::bus(id)), "{id} is not present");
         }
-        for (id, r) in wanted_pushes(&cfg, &present) {
+        // positive case: every present Network bus is allowed, and one with a renderer is pushed
+        let pushes = wanted_pushes(&cfg, &present);
+        for b in cfg.buses.iter().filter(|b| matches!(b.kind, BusKind::Network) && present(&names::bus(&b.id))) {
+            assert!(al.iter().any(|(a, _)| a == &b.id), "present Network bus {} is not allowed", b.id);
+            hits += 1;
+            if cfg.net_out.contains_key(&b.id) {
+                assert!(pushes.iter().any(|(p, _)| p == &b.id), "allowed bus {} with a renderer is not pushed", b.id);
+            }
+        }
+        for (id, r) in pushes {
             assert!(al.iter().any(|(a, _)| a == &id), "{id} pushed but not allowed");
             assert_eq!(Some(&r), cfg.net_out.get(&id), "{id} pushed to the wrong renderer");
         }
     }
+    assert!(hits > 0, "no round had a present Network bus, so the test checked nothing");
 }
 
 #[test]
