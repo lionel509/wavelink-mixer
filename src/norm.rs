@@ -1,9 +1,10 @@
 //! Auto-normalize: moves a channel's gain slider so its short-term loudness sits at TARGET_DB.
 //! Fed by the pre-fader RMS the IN meter tap already computes (no extra tap, no audio-path change).
+//! His own slider move always wins; a fast burst detector drops auto's boost above his position at once.
 
 pub const TARGET_DB: f64 = -20.0;   // short-term RMS dBFS the sliders aim for
 pub const GATE_DB: f64 = -50.0;     // quieter than this is silence: hold, never pump noise up
-pub const MAX_BOOST_DB: f64 = 12.0; // auto's own gain range, before his offset
+pub const MAX_BOOST_DB: f64 = 12.0; // auto's own gain range, above his position
 pub const MAX_CUT_DB: f64 = -24.0;
 pub const WINDOW_S: f64 = 3.0;      // loudness window (power-domain EMA), like short-term LUFS
 pub const ATTACK_DB_S: f64 = 4.0;   // too loud: slider falls at most this fast
@@ -14,68 +15,118 @@ pub const MIN_EMIT_S: f64 = 0.25;   // at most 4 slider writes per second per ch
 pub const MANUAL_HOLD_S: f64 = 3.0; // after his own move, auto waits this long
 pub const FADER_MIN_DB: f64 = -60.0; // the fader's range (dash.rs taper ends); auto never asks past it
 pub const FADER_MAX_DB: f64 = 12.0;
+pub const SETTLE_S: f64 = 3.0;       // audio heard since the last reset before a move made without it is anchored
+pub const RESET_S: f64 = 3.0;        // this much continuous silence forgets the loudness (the next song is measured fresh)
+pub const FAST_WINDOW_S: f64 = 0.25; // burst detector window (power EMA)
+pub const FAST_OVER_DB: f64 = 9.0;   // short-term output this far over `out` removes auto's boost at once
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Channel {
     pub gain: f64,          // slider dB as auto believes it is
-    pub offset: f64,        // his preference relative to the target, set by manual()
-    pub loud: Option<f64>,  // smoothed power (linear); None until the first non-silent reading
+    pub base: f64,          // his slider position; 0.0 until his first move
+    pub out: f64,           // wanted output loudness, dBFS (loudness + gain); TARGET_DB until anchored
+    pub pending: bool,      // his move awaits SETTLE_S of audio before it can be anchored
+    pub loud: Option<f64>,  // slow smoothed power (linear); None when nothing was heard since the last reset
+    pub acc: f64,           // slow EMA numerator (power)
+    pub wsum: f64,          // slow EMA weight (bias correction)
+    pub facc: f64,          // fast EMA numerator (power)
+    pub fwsum: f64,         // fast EMA weight
+    pub heard: f64,         // seconds above the gate since the last reset
+    pub quiet: f64,         // seconds of continuous silence
     pub hold: f64,          // seconds of manual hold left
     pub since_emit: f64,
     pub emitted: f64,       // last value handed to the slider
-    pub pending: Option<f64>, // his move made before the first reading; becomes the offset then
 }
 
 impl Channel {
     pub fn new(gain_db: f64) -> Channel {
-        Channel { gain: gain_db, offset: 0.0, loud: None, hold: 0.0, since_emit: MIN_EMIT_S, emitted: gain_db, pending: None }
+        Channel {
+            gain: gain_db, base: 0.0, out: TARGET_DB, pending: false, loud: None,
+            acc: 0.0, wsum: 0.0, facc: 0.0, fwsum: 0.0, heard: 0.0, quiet: 0.0,
+            hold: 0.0, since_emit: MIN_EMIT_S, emitted: gain_db,
+        }
     }
 
     pub fn loud_db(&self) -> Option<f64> {
         self.loud.map(|p| 10.0 * p.log10())
     }
 
-    /// He (or MIDI) moved the slider: his position wins and becomes the preference; auto pauses MANUAL_HOLD_S.
+    /// His move wins: the slider stays where he put it; it becomes his position (`base`) and, once measured against settled audio, his wanted output level (`out`).
     pub fn manual(&mut self, gain_db: f64) {
-        self.gain = gain_db;
-        self.emitted = gain_db;
+        if !gain_db.is_finite() {
+            return;
+        }
+        let g = gain_db.clamp(FADER_MIN_DB, FADER_MAX_DB);
+        self.gain = g;
+        self.emitted = g;
+        self.base = g;
         self.hold = MANUAL_HOLD_S;
-        if let Some(l) = self.loud_db() {
-            self.offset = gain_db - (TARGET_DB - l).clamp(MAX_CUT_DB, MAX_BOOST_DB);
-            self.pending = None;
-        } else {
-            self.pending = Some(gain_db);
+        match self.loud_db() {
+            Some(l) if self.heard >= SETTLE_S && self.quiet == 0.0 => {
+                self.out = l + g;
+                self.pending = false;
+            }
+            _ => self.pending = true,
         }
     }
 
     /// One tick with the channel's pre-fader RMS (dBFS). Some(db) = move the slider there.
     pub fn step(&mut self, rms_db: f64, dt: f64) -> Option<f64> {
         self.since_emit += dt;
+        let audible = rms_db.is_finite() && rms_db >= GATE_DB;
+        if audible {
+            let p = 10f64.powf(rms_db / 10.0);
+            let a = 1.0 - (-dt / WINDOW_S).exp();
+            self.acc += (p - self.acc) * a;
+            self.wsum += (1.0 - self.wsum) * a;
+            self.loud = Some(self.acc / self.wsum);
+            let af = 1.0 - (-dt / FAST_WINDOW_S).exp();
+            self.facc += (p - self.facc) * af;
+            self.fwsum += (1.0 - self.fwsum) * af;
+            self.heard += dt;
+            self.quiet = 0.0;
+            if self.pending && self.heard >= SETTLE_S {
+                self.out = 10.0 * (self.acc / self.wsum).log10() + self.base;
+                self.pending = false;
+            }
+        } else {
+            self.quiet += dt;
+            if self.quiet >= RESET_S {
+                self.loud = None;
+                self.acc = 0.0;
+                self.wsum = 0.0;
+                self.facc = 0.0;
+                self.fwsum = 0.0;
+                self.heard = 0.0;
+            }
+        }
         if self.hold > 0.0 {
             self.hold -= dt;
             return None;
         }
-        if !rms_db.is_finite() || rms_db < GATE_DB {
+        if !audible || self.pending {
             return None;
         }
-        let p = 10f64.powf(rms_db / 10.0);
-        let a = 1.0 - (-dt / WINDOW_S).exp();
-        let l = match self.loud {
-            Some(l) => l + (p - l) * a,
-            None => p,
-        };
-        self.loud = Some(l);
-        if let Some(g) = self.pending.take() {
-            self.offset = g - (TARGET_DB - 10.0 * l.log10()).clamp(MAX_CUT_DB, MAX_BOOST_DB);
+        let l = 10.0 * (self.acc / self.wsum).log10();
+        let f = 10.0 * (self.facc / self.fwsum).log10();
+        if self.gain > self.base && self.gain + f > self.out + FAST_OVER_DB {
+            // burst: drop auto's boost now, never below his position
+            self.gain = (self.out + FAST_OVER_DB - f).max(self.base);
+        } else {
+            let want = (self.out - l)
+                .clamp(self.base + MAX_CUT_DB, self.base + MAX_BOOST_DB)
+                .clamp(FADER_MIN_DB, FADER_MAX_DB);
+            let diff = want - self.gain;
+            if diff.abs() < DEADBAND_DB {
+                return None;
+            }
+            // never raise while short-term output is at or over his level
+            if diff > 0.0 && self.gain + f >= self.out {
+                return None;
+            }
+            let rate = if diff < 0.0 { ATTACK_DB_S } else { RELEASE_DB_S };
+            self.gain += diff.signum() * (rate * dt).min(diff.abs());
         }
-        let want = ((TARGET_DB - 10.0 * l.log10()).clamp(MAX_CUT_DB, MAX_BOOST_DB) + self.offset)
-            .clamp(FADER_MIN_DB, FADER_MAX_DB);
-        let diff = want - self.gain;
-        if diff.abs() < DEADBAND_DB {
-            return None;
-        }
-        let rate = if diff < 0.0 { ATTACK_DB_S } else { RELEASE_DB_S };
-        self.gain += diff.signum() * (rate * dt).min(diff.abs());
         if self.since_emit >= MIN_EMIT_S && (self.gain - self.emitted).abs() >= STEP_DB {
             self.since_emit = 0.0;
             self.emitted = (self.gain * 10.0).round() / 10.0;
