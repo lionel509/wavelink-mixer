@@ -328,7 +328,6 @@ pub struct App {
     content: gtk::Box,
     /// Spotify client page (kept alive for the window's lifetime)
     _player: Rc<crate::player::Player>,
-    _voice: Rc<crate::voice::Voice>,
     /// the Rack page: every input's outboard gear and EQ, all dials visible
     rack_page: gtk::Box,
     /// system gauges, shown under the output strips
@@ -2255,11 +2254,6 @@ pub fn activate(app: &adw::Application) {
     patch_panel.append(&patch.area);
     stack.add_titled(&spec_panel, Some("spectrum"), "Spectrum");
     stack.add_titled(&patch_panel, Some("patch"), "Patch Bay");
-    let voice = crate::voice::Voice::new();
-    let voice_panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    voice_panel.add_css_class("spectrum");
-    voice_panel.append(&voice.root);
-    stack.add_titled(&voice_panel, Some("call"), "Discord Call");
     // System monitor: read-only health of the audio system (lives under the output strips)
     let sys_panel = gtk::Box::new(gtk::Orientation::Vertical, 6);
     sys_panel.add_css_class("syspanel");
@@ -2371,7 +2365,6 @@ pub fn activate(app: &adw::Application) {
         dirty: Cell::new(false),
         content,
         _player: player.clone(),
-        _voice: voice.clone(),
         rack_page: rack_page.clone(),
         sys_panel: sys_panel.clone(),
         faders: RefCell::new(vec![]),
