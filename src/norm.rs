@@ -1,6 +1,82 @@
 //! Auto-normalize: moves a channel's gain slider so its short-term loudness sits at TARGET_DB.
 //! Fed by the pre-fader RMS the IN meter tap already computes (no extra tap, no audio-path change).
 
+pub const TARGET_DB: f64 = -20.0;   // short-term RMS dBFS the sliders aim for
+pub const GATE_DB: f64 = -50.0;     // quieter than this is silence: hold, never pump noise up
+pub const MAX_BOOST_DB: f64 = 12.0; // auto's own gain range, before his offset
+pub const MAX_CUT_DB: f64 = -24.0;
+pub const WINDOW_S: f64 = 3.0;      // loudness window (power-domain EMA), like short-term LUFS
+pub const ATTACK_DB_S: f64 = 4.0;   // too loud: slider falls at most this fast
+pub const RELEASE_DB_S: f64 = 1.5;  // too quiet: slider rises at most this fast
+pub const DEADBAND_DB: f64 = 1.0;   // within this of the wanted gain: don't move
+pub const STEP_DB: f64 = 0.5;       // emit only when the slider would move at least this much
+pub const MIN_EMIT_S: f64 = 0.25;   // at most 4 slider writes per second per channel
+pub const MANUAL_HOLD_S: f64 = 3.0; // after his own move, auto waits this long
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Channel {
+    pub gain: f64,          // slider dB as auto believes it is
+    pub offset: f64,        // his preference relative to the target, set by manual()
+    pub loud: Option<f64>,  // smoothed power (linear); None until the first non-silent reading
+    pub hold: f64,          // seconds of manual hold left
+    pub since_emit: f64,
+    pub emitted: f64,       // last value handed to the slider
+}
+
+impl Channel {
+    pub fn new(gain_db: f64) -> Channel {
+        Channel { gain: gain_db, offset: 0.0, loud: None, hold: 0.0, since_emit: MIN_EMIT_S, emitted: gain_db }
+    }
+
+    pub fn loud_db(&self) -> Option<f64> {
+        self.loud.map(|p| 10.0 * p.log10())
+    }
+
+    /// He (or MIDI) moved the slider: his position wins and becomes the preference; auto pauses MANUAL_HOLD_S.
+    pub fn manual(&mut self, gain_db: f64) {
+        self.gain = gain_db;
+        self.emitted = gain_db;
+        self.hold = MANUAL_HOLD_S;
+        if let Some(l) = self.loud_db() {
+            self.offset = gain_db - (TARGET_DB - l).clamp(MAX_CUT_DB, MAX_BOOST_DB);
+        }
+    }
+
+    /// One tick with the channel's pre-fader RMS (dBFS). Some(db) = move the slider there.
+    pub fn step(&mut self, rms_db: f64, dt: f64) -> Option<f64> {
+        self.since_emit += dt;
+        if self.hold > 0.0 {
+            self.hold -= dt;
+            return None;
+        }
+        if !rms_db.is_finite() || rms_db < GATE_DB {
+            return None;
+        }
+        let p = 10f64.powf(rms_db / 10.0);
+        let a = 1.0 - (-dt / WINDOW_S).exp();
+        let l = match self.loud {
+            Some(l) => l + (p - l) * a,
+            None => p,
+        };
+        self.loud = Some(l);
+        let want = (TARGET_DB - 10.0 * l.log10()).clamp(MAX_CUT_DB, MAX_BOOST_DB) + self.offset;
+        let diff = want - self.gain;
+        if diff.abs() < DEADBAND_DB {
+            return None;
+        }
+        let rate = if diff < 0.0 { ATTACK_DB_S } else { RELEASE_DB_S };
+        self.gain += diff.signum() * (rate * dt).min(diff.abs());
+        if self.since_emit >= MIN_EMIT_S && (self.gain - self.emitted).abs() >= STEP_DB {
+            self.since_emit = 0.0;
+            self.emitted = (self.gain * 10.0).round() / 10.0;
+            Some(self.emitted)
+        } else {
+            None
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
