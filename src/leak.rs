@@ -1,5 +1,173 @@
 //! Leak watch: the mixer's own memory, files, threads and child processes, read from /proc.
 //! Only `scan`, `read` and `orphan_taps` touch /proc; on other OSes they return empty/zero and the Watch stays quiet.
+use std::sync::atomic::AtomicU64;
+
+/// Meter taps the GUI expects to be running (stored by `ui::rebuild`).
+pub static EXPECTED_TAPS: AtomicU64 = AtomicU64::new(0);
+/// Meters whose strip and tap both exist but have no link (stored by `ui::sync`).
+pub static UNLINKED: AtomicU64 = AtomicU64::new(0);
+pub const WARMUP_S: f64 = 60.0;
+pub const RSS_GROW_KB: u64 = 65_536;
+pub const FD_GROW: u64 = 32;
+pub const THREAD_GROW: u64 = 16;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ProcStats {
+    pub rss_kb: u64,
+    pub fds: u64,
+    pub threads: u64,
+    pub zombies: u64,
+    pub taps: u64,
+    pub unlinked: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Proc {
+    pub pid: u32,
+    pub ppid: u32,
+    pub state: char,
+    pub comm: String,
+}
+
+/// `comm` is the text between the first '(' and the LAST ')', because it can hold both.
+pub fn parse_stat(s: &str) -> Option<Proc> {
+    let open = s.find('(')?;
+    let close = s.rfind(')')?;
+    if close < open {
+        return None;
+    }
+    let pid = s[..open].trim().parse().ok()?;
+    let comm = s[open + 1..close].to_string();
+    let mut f = s[close + 1..].split_whitespace();
+    let state = f.next()?.chars().next()?;
+    let ppid = f.next()?.parse().ok()?;
+    Some(Proc { pid, ppid, state, comm })
+}
+
+/// Every numeric entry of /proc; unreadable entries are skipped.
+#[cfg(target_os = "linux")]
+pub fn scan() -> Vec<Proc> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    dir.flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|pid| parse_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?))
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn scan() -> Vec<Proc> {
+    Vec::new()
+}
+
+pub fn children_named(procs: &[Proc], pid: u32, comm: &str) -> u64 {
+    procs.iter().filter(|p| p.ppid == pid && p.comm == comm && p.state != 'Z').count() as u64
+}
+
+pub fn zombies(procs: &[Proc], pid: u32) -> u64 {
+    procs.iter().filter(|p| p.ppid == pid && p.state == 'Z').count() as u64
+}
+
+#[cfg(target_os = "linux")]
+pub fn read(pid: u32, procs: &[Proc]) -> ProcStats {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    let field = |key: &str| {
+        status
+            .lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    ProcStats {
+        rss_kb: field("VmRSS:"),
+        fds: std::fs::read_dir(format!("/proc/{pid}/fd")).map(|d| d.count() as u64).unwrap_or(0),
+        threads: field("Threads:"),
+        zombies: zombies(procs, pid),
+        taps: children_named(procs, pid, "pw-record"),
+        unlinked: 0,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read(_pid: u32, _procs: &[Proc]) -> ProcStats {
+    ProcStats::default()
+}
+
+/// NUL-separated argv; true if any argument is a meter or spectrum tap.
+pub fn is_meter_tap_cmdline(raw: &[u8]) -> bool {
+    raw.split(|b| *b == 0).any(|a| {
+        let s = String::from_utf8_lossy(a);
+        s.contains("node.name=meter_") || s.contains("node.name=spectrum")
+    })
+}
+
+/// Meter taps whose parent is not the mixer window (or has gone), i.e. left behind by a closed window.
+#[cfg(target_os = "linux")]
+pub fn orphan_taps(procs: &[Proc]) -> u64 {
+    procs
+        .iter()
+        .filter(|p| p.comm == "pw-record" && p.state != 'Z')
+        .filter(|p| procs.iter().find(|q| q.pid == p.ppid).map_or(true, |parent| parent.comm != "wavelink-mixer"))
+        .filter(|p| std::fs::read(format!("/proc/{}/cmdline", p.pid)).map(|c| is_meter_tap_cmdline(&c)).unwrap_or(false))
+        .count() as u64
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn orphan_taps(_procs: &[Proc]) -> u64 {
+    0
+}
+
+/// Judges one reading at a time. A zombie, tap or link problem must persist for two scans; growth is
+/// judged against the baseline taken at the end of the warm-up.
+pub struct Watch {
+    who: &'static str,
+    base: Option<ProcStats>,
+    z: u32,
+    t: u32,
+    u: u32,
+}
+
+impl Watch {
+    pub fn new(who: &'static str) -> Watch {
+        Watch { who, base: None, z: 0, t: 0, u: 0 }
+    }
+
+    /// One scan. Returns the warnings that hold now (empty when healthy).
+    pub fn update(&mut self, now: &ProcStats, expected_taps: Option<u64>, uptime_s: f64) -> Vec<String> {
+        let who = self.who;
+        let mut out = Vec::new();
+        if self.base.is_none() && uptime_s >= WARMUP_S {
+            self.base = Some(*now);
+        }
+        self.z = if now.zombies > 0 { self.z + 1 } else { 0 };
+        if self.z >= 2 {
+            out.push(format!("{who}: {} zombie children", now.zombies));
+        }
+        if let Some(e) = expected_taps {
+            self.t = if now.taps != e { self.t + 1 } else { 0 };
+            if self.t >= 2 {
+                out.push(format!("{who}: {} meter taps, expected {e}", now.taps));
+            }
+        }
+        self.u = if now.unlinked > 0 { self.u + 1 } else { 0 };
+        if self.u >= 2 {
+            out.push(format!("{who}: {} meter taps not linked", now.unlinked));
+        }
+        if let Some(b) = self.base {
+            if now.rss_kb > b.rss_kb + RSS_GROW_KB.max(b.rss_kb / 4) {
+                out.push(format!("{who}: memory {} MB → {} MB", b.rss_kb / 1024, now.rss_kb / 1024));
+            }
+            if now.fds > b.fds + FD_GROW {
+                out.push(format!("{who}: open files {} → {}", b.fds, now.fds));
+            }
+            if now.threads > b.threads + THREAD_GROW {
+                out.push(format!("{who}: threads {} → {}", b.threads, now.threads));
+            }
+        }
+        out
+    }
+}
 
 #[cfg(test)]
 mod tests {
