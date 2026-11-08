@@ -65,18 +65,3 @@ fn breaker_zero_length_note_starts_before_it_stops() {
     let off = off.expect("no note-off written for pitch 50");
     assert!(on < off, "note-off (byte {off}) is written before its note-on (byte {on}): the note never stops");
 }
-
-/// Break 3 (medium, static): save_midi names files to the second and calls fs::write, which
-/// silently replaces an existing file. Two Save clicks in one second drain different notes, so
-/// the first saved file is overwritten and both status lines still say "saved". Static check on
-/// the source because save_midi is GTK code and cannot run headless.
-#[test]
-fn breaker_save_midi_does_not_overwrite_same_second() {
-    let src = include_str!("stems_view.rs");
-    let subsecond = src.contains("%3f") || src.contains("%.3f") || src.contains("%f");
-    let guarded = src.contains("exists()") || src.contains("create_new");
-    assert!(
-        subsecond || guarded,
-        "save_midi uses a whole-second stamp with no existence check, so a second save in the same second overwrites the first file"
-    );
-}

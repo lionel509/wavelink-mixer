@@ -10,6 +10,7 @@ use crate::stems::{Opts, Session, Shared};
 use gtk::prelude::*;
 use gtk::{glib, Orientation};
 use std::cell::{Cell, RefCell};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -285,6 +286,27 @@ pub(super) fn midi_path(home: &Path, source: &str, stamp: &str) -> PathBuf {
     home.join("Music").join("wavelink").join(format!("stems-{source}-{stamp}.mid"))
 }
 
+/// Creates the first free name from `midi_path`, then `-2`, `-3`... on a clash, so a save never replaces
+/// an earlier file (two saves in the same second share a stamp). Never overwrites: `create_new`.
+pub(super) fn create_midi(home: &Path, source: &str, stamp: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let first = midi_path(home, source, stamp);
+    if let Some(dir) = first.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut path = first.clone();
+    let mut n = 1u32;
+    loop {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(f) => return Ok((path, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                n += 1;
+                path = first.with_file_name(format!("stems-{source}-{stamp}-{n}.mid"));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 // ---------- helpers ----------
 
 /// The pickers as they stand now, with the replace marker from memory.
@@ -430,12 +452,10 @@ fn save_midi(app: &Rc<App>, v: &View) {
         .and_then(|d| d.format("%Y%m%d-%H%M%S"))
         .map(|s| s.to_string())
         .unwrap_or_else(|_| "unknown-time".into());
-    let path = midi_path(&glib_home(), &src, &stamp);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    match std::fs::write(&path, midi_bytes(&tracks)) {
-        Ok(()) => v.status.set_text(&format!("saved {} ({} notes)", path.display(), n)),
+    let bytes = midi_bytes(&tracks);
+    let written = create_midi(&glib_home(), &src, &stamp).and_then(|(path, mut f)| f.write_all(&bytes).map(|_| path));
+    match written {
+        Ok(path) => v.status.set_text(&format!("saved {} ({} notes)", path.display(), n)),
         Err(e) => {
             // put the notes back so a retry can still save them
             let mut tl = app.stems.shared.timeline.lock().unwrap();
@@ -480,5 +500,22 @@ mod tests {
             midi_path(Path::new("/h"), "spotify", "20261108-120000"),
             PathBuf::from("/h/Music/wavelink/stems-spotify-20261108-120000.mid")
         );
+    }
+
+    /// Two saves in the same second (same stamp) keep both files and both notes lists.
+    #[test]
+    fn save_in_same_second_keeps_both_files() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let home = std::env::temp_dir().join(format!("wl-save-test-{}-{nanos}", std::process::id()));
+        let (p1, mut f1) = create_midi(&home, "spotify", "20261108-120000").unwrap();
+        f1.write_all(b"first").unwrap();
+        drop(f1);
+        let (p2, mut f2) = create_midi(&home, "spotify", "20261108-120000").unwrap();
+        f2.write_all(b"second").unwrap();
+        drop(f2);
+        assert_ne!(p1, p2, "the second save replaced the first file");
+        assert_eq!(std::fs::read(&p1).unwrap(), b"first", "the first save was overwritten");
+        assert_eq!(std::fs::read(&p2).unwrap(), b"second");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
