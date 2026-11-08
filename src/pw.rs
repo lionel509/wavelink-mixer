@@ -143,18 +143,18 @@ pub fn force_quantum(q: u32) -> bool {
     let meta = output_timeout("pw-metadata", &["-n", "settings"], Duration::from_secs(3))
         .map(|b| String::from_utf8_lossy(&b).to_string())
         .unwrap_or_default();
-    let got = meta_value(&meta, "clock.force-quantum");
-    if q == 0 {
-        // releasing: the key may read 0 or be removed entirely
-        got.unwrap_or(0) == 0
-    } else {
-        got == Some(q as u64)
-    }
+    quantum_confirmed(q, &meta)
 }
 
 /// Whether a `pw-metadata` dump confirms that `force_quantum(q)` took effect.
 pub fn quantum_confirmed(q: u32, meta: &str) -> bool {
-    todo!()
+    let got = meta_value(meta, "clock.force-quantum");
+    if q == 0 {
+        // releasing: the key reads 0, or is removed while the dump is still a settings dump
+        got == Some(0) || (got.is_none() && meta_value(meta, "clock.quantum").is_some())
+    } else {
+        got == Some(q as u64)
+    }
 }
 
 pub fn set_volume(id: u64, v: f64) {

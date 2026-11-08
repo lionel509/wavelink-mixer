@@ -244,7 +244,11 @@ fn default_quantum() -> u32 {
 /// Graph quantum from config: 0 = don't force, otherwise a power of two in 32..=2048.
 /// Anything else is normalised (or 256 with a message) so a bad value can't fail the whole load.
 pub fn normalize_quantum(v: &serde_json::Value) -> u32 {
-    match v.as_u64() {
+    let n = v
+        .as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        .or_else(|| v.as_f64().filter(|f| *f >= 0.0 && f.fract() == 0.0).map(|f| f as u64));
+    match n {
         Some(0) => 0,
         Some(n) => (n.clamp(32, 2048) as u32).next_power_of_two(),
         None => {
@@ -305,11 +309,27 @@ impl Config {
         match serde_json::from_slice(&bytes) {
             Ok(c) => c,
             Err(_) => {
-                // keep the user's bytes before defaults overwrite the file
-                let bad = path.with_extension("json.bad");
-                let _ = std::fs::write(&bad, &bytes);
-                eprintln!("wavelink: {} is unreadable, saved a copy to {}", path.display(), bad.display());
-                fresh()
+                // keep the user's bytes before defaults overwrite the file; never overwrite an earlier backup
+                let mut bad = path.with_extension("json.bad");
+                let mut n = 1;
+                while bad.exists() {
+                    bad = path.with_extension(format!("json.bad.{n}"));
+                    n += 1;
+                }
+                match std::fs::write(&bad, &bytes) {
+                    Ok(()) => {
+                        eprintln!("wavelink: {} is unreadable, saved a copy to {}", path.display(), bad.display());
+                        fresh()
+                    }
+                    Err(we) => {
+                        eprintln!(
+                            "wavelink: {} is unreadable and the copy to {} failed ({we}); using defaults without saving",
+                            path.display(),
+                            bad.display()
+                        );
+                        Config::default_config()
+                    }
+                }
             }
         }
     }
