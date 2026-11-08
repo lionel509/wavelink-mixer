@@ -1,4 +1,6 @@
 //! Mixer window: input strips (gain, EQ, FX, routes), buses, and an apps panel.
+#[path = "stems_view.rs"]
+mod stems_view;
 use crate::config::{self, db_to_vol, fmt_db, names, Bus, BusKind, Config, Input, InputKind, Route, FX_PRESETS};
 use crate::engine::bus_fader_node;
 use crate::dash::{db_to_pos, hex_rgb, Hit, pos_to_db, screw_row, Analyzer, Fft, GrMeter, Knob, Lamp, LedMeter, Patch, PatchBay, Spectrum, Vu};

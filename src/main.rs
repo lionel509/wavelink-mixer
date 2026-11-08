@@ -3,6 +3,12 @@
 //!   wavelink-mixer engine    run the routing engine (systemd user service)
 mod config;
 mod dash;
+mod dsp;
+mod models;
+mod notes;
+mod sep;
+mod stemcfg;
+mod stems;
 mod latency;
 mod leak;
 mod norm;
@@ -61,6 +67,9 @@ fn main() -> glib::ExitCode {
     }
     if std::env::args().nth(1).as_deref() == Some("latency") {
         std::process::exit(latency::run(std::env::args().skip(2).collect()));
+    }
+    if std::env::args().nth(1).as_deref() == Some("stems") {
+        std::process::exit(stems::cli(std::env::args().skip(2).collect()));
     }
     let app = adw::Application::builder().application_id("local.wavelink.Mixer").build();
     app.connect_activate(ui::activate);

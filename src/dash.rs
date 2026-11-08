@@ -628,7 +628,7 @@ const F_LO: f64 = 25.0;
 const F_HI: f64 = 18000.0;
 const RATE: f64 = 48000.0;
 
-fn fft(re: &mut [f32], im: &mut [f32]) {
+pub(crate) fn fft(re: &mut [f32], im: &mut [f32]) {
     let n = re.len();
     let mut j = 0;
     for i in 1..n {
@@ -993,8 +993,13 @@ pub struct Fft {
 
 impl Fft {
     pub fn new() -> Fft {
+        Fft::with_rate(RATE)
+    }
+
+    /// Same bands as `new`, for a stream at `rate` Hz.
+    pub fn with_rate(rate: f64) -> Fft {
         Fft {
-            edges: (0..=BANDS).map(|i| F_LO * (F_HI / F_LO).powf(i as f64 / BANDS as f64) * FFT_N as f64 / RATE).collect(),
+            edges: (0..=BANDS).map(|i| F_LO * (F_HI / F_LO).powf(i as f64 / BANDS as f64) * FFT_N as f64 / rate).collect(),
             window: (0..FFT_N).map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (FFT_N - 1) as f32).cos()).collect(),
             ring: vec![0.0; FFT_N],
             pos: 0,
@@ -1795,5 +1800,15 @@ mod redraw_tests {
         b.step(f64::NAN, 1.0 / 30.0);
         assert!(b.level <= M_MIN + 0.5 && b.peak <= M_MIN + 0.5,
             "a NaN reading lit the meter: level {} peak {} (expected silence at {})", b.level, b.peak, M_MIN);
+    }
+
+    #[test]
+    fn fft_with_rate_scales_edges() {
+        let a = Fft::with_rate(44100.0);
+        let b = Fft::new();
+        for k in 0..=BANDS {
+            let (x, y) = (a.edges[k] * 44100.0, b.edges[k] * 48000.0);
+            assert!((x - y).abs() <= 1e-9 * y.abs(), "edge {k}: {x} vs {y}");
+        }
     }
 }
