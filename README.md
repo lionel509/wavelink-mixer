@@ -8,7 +8,6 @@ Wave Link-style mixer for the PipeWire channel/mix setup.
 - Routing engine (`wavelink-mixer engine`, run as a systemd user service) that builds and supervises the PipeWire graph from `config.json`.
 - Vintage-style cairo instruments: needle gauges, knobs and an RGB spectrum analyser.
 - Novation SL MkIII control surface over MIDI (faders, knobs and buttons), read via `aseqdump`.
-- Discord call panel: per-person volume and mute for your current voice call (needs your own Discord developer app, credentials stored locally).
 - Spotify player page using the Web API for browsing and control; audio comes from librespot.
 - System monitor: read-only health view of the audio system (CPU, open files, latency, dropouts, services).
 
