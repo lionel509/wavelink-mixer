@@ -277,3 +277,7 @@ fn worker(id: &str, url: &str, stop: &AtomicBool) {
 #[cfg(test)]
 #[path = "netin_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "netin_breaker_r2_tests.rs"]
+mod breaker_r2_tests;

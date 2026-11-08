@@ -576,3 +576,7 @@ fn handle(mut s: TcpStream, allowed: &Mutex<Vec<(String, String)>>) -> std::io::
 #[cfg(test)]
 #[path = "swyh_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "swyh_breaker_r2_tests.rs"]
+mod breaker_r2_tests;
