@@ -1,5 +1,4 @@
 //! Model files: fetched on first use into ~/.local/share/wavelink/models, checked against a pinned SHA-256.
-//! Unit 1 skeleton: bodies are `todo!()` until Unit 2.
 #![allow(dead_code, unused_imports, unused_variables)]
 use std::path::{Path, PathBuf};
 
@@ -23,23 +22,81 @@ pub struct ModelSet {
 
 impl ModelSet {
     pub fn path(&self, name: &str) -> PathBuf {
-        todo!()
+        self.dir.join(name)
     }
 }
 
 /// config::glib_home()/.local/share/wavelink/models
 pub fn dir() -> PathBuf {
-    todo!()
+    crate::config::glib_home().join(".local/share/wavelink/models")
 }
 
 pub fn verify(path: &Path, sha_hex: &str) -> Result<(), String> {
-    todo!()
+    use sha2::{Digest, Sha256};
+    let mut f = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut h = Sha256::new();
+    std::io::copy(&mut f, &mut h).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let got = format!("{:x}", h.finalize());
+    if got.eq_ignore_ascii_case(sha_hex) {
+        Ok(())
+    } else {
+        Err(format!("sha256 mismatch for {}: got {got}", path.display()))
+    }
 }
 
 /// Present and verified files are skipped; otherwise fetch (120 s timeout), write <name>.part, verify, rename.
 /// A "TODO" sha is an error: "model <name> not published yet".
 pub fn ensure(names: &[&str], status: &dyn Fn(String)) -> Result<ModelSet, String> {
-    todo!()
+    let dir = dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let set = ModelSet { dir };
+    for name in names {
+        let (_, url, sha) = *MODELS
+            .iter()
+            .find(|m| m.0 == *name)
+            .ok_or_else(|| format!("unknown model {name}"))?;
+        if sha == "TODO" {
+            return Err(format!("model {name} not published yet"));
+        }
+        let path = set.path(name);
+        if path.exists() {
+            if verify(&path, sha).is_ok() {
+                continue;
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+        status(format!("fetching {name}…"));
+        fetch(url, sha, &path, name)?;
+    }
+    Ok(set)
+}
+
+/// Download `url` to `<name>.part`, check it, and rename it into place. A wrong hash is deleted
+/// and fetched once more before giving up.
+fn fetch(url: &str, sha: &str, path: &Path, name: &str) -> Result<(), String> {
+    let part = path.with_file_name(format!("{name}.part"));
+    let mut last = String::new();
+    for _ in 0..2 {
+        let resp = ureq::get(url)
+            .timeout(std::time::Duration::from_secs(120))
+            .call()
+            .map_err(|e| format!("fetch {name}: {e}"))?;
+        {
+            let mut f = std::fs::File::create(&part).map_err(|e| format!("create {}: {e}", part.display()))?;
+            std::io::copy(&mut resp.into_reader(), &mut f).map_err(|e| format!("download {name}: {e}"))?;
+        }
+        match verify(&part, sha) {
+            Ok(()) => {
+                std::fs::rename(&part, path).map_err(|e| format!("rename {name}: {e}"))?;
+                return Ok(());
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&part);
+                last = e;
+            }
+        }
+    }
+    Err(format!("{last} (fetched twice)"))
 }
 
 #[cfg(test)]
