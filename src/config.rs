@@ -661,6 +661,17 @@ mod tests {
         assert_eq!(c.buses.iter().find(|b| b.id == "n1").unwrap().name, "Network");
     }
 
+    /// `add_network_bus` must not reuse an input's id, or `remove_id` on the bus deletes the input too.
+    #[test]
+    fn bus_id_never_reuses_input_id() {
+        let mut c = Config::default_config();
+        let inp = c.add_stream_input("n1", "http://10.0.0.1:5959/s.wav");
+        let bus = c.add_network_bus("Cast");
+        assert_ne!(bus, inp, "network bus took the id of input {inp}");
+        c.remove_id(&bus);
+        assert!(c.inputs.iter().any(|i| i.id == inp), "removing bus {bus} also deleted input {inp}");
+    }
+
     #[test]
     fn add_stream_input_sets_url_and_route() {
         let mut c = Config::default_config();
