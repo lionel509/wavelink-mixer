@@ -18,7 +18,9 @@ pub fn spawn(tx: Sender<Midi>) {
         return; // test runs never touch real devices
     }
     std::thread::spawn(move || loop {
-        let child = Command::new("stdbuf")
+        let mut cmd = Command::new("stdbuf");
+        crate::pw::die_with_parent(&mut cmd);
+        let child = cmd
             .args(["-oL", "aseqdump", "-p", PORT])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -34,6 +36,7 @@ pub fn spawn(tx: Sender<Midi>) {
             if line.contains("Waiting for data") {
                 if tx.send(Midi::Connected(true)).is_err() {
                     let _ = child.kill();
+                    let _ = child.wait();
                     return;
                 }
                 announced = true;

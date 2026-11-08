@@ -1,7 +1,8 @@
 //! Thin helpers around the PipeWire command-line tools.
 use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::{mpsc, OnceLock};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Default)]
 pub struct Node {
@@ -132,8 +133,55 @@ pub fn output_timeout(cmd: &str, args: &[&str], limit: Duration) -> Option<Vec<u
 fn run(cmd: &str, args: &[&str]) {
     let _ = output_timeout(cmd, args, Duration::from_secs(3));
 }
-fn spawn(cmd: &str, args: &[&str]) {
-    let _ = Command::new(cmd).args(args).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+/// Fire-and-forget command whose exit is always reaped (no zombies); hung ones are killed after 3 s.
+pub fn spawn(cmd: &str, args: &[&str]) {
+    let Ok(c) = Command::new(cmd).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return };
+    let _ = reaper().send(c);
+}
+fn reaper() -> &'static mpsc::Sender<std::process::Child> {
+    static R: OnceLock<mpsc::Sender<std::process::Child>> = OnceLock::new();
+    R.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<std::process::Child>();
+        let _ = std::thread::Builder::new().name("reaper".into()).spawn(move || {
+            let mut live: Vec<(std::process::Child, Instant)> = vec![];
+            loop {
+                let got = if live.is_empty() { rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected) } else { rx.recv_timeout(Duration::from_millis(100)) };
+                match got {
+                    Ok(c) => live.push((c, Instant::now())),
+                    Err(mpsc::RecvTimeoutError::Disconnected) if live.is_empty() => return,
+                    Err(_) => {}
+                }
+                live.retain_mut(|(c, t0)| match c.try_wait() {
+                    Ok(None) if t0.elapsed() < Duration::from_secs(3) => true,
+                    Ok(None) => { let _ = c.kill(); let _ = c.wait(); false }
+                    _ => false,
+                });
+            }
+        });
+        tx
+    })
+}
+/// The child gets SIGKILL when this process dies, however it dies (crash, SIGKILL).
+/// Linux only (PR_SET_PDEATHSIG); elsewhere it is a passthrough. Linux fires this when the
+/// *spawning thread* exits, so only call it from long-lived threads.
+pub fn die_with_parent(cmd: &mut Command) -> &mut Command {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        extern "C" { fn prctl(option: std::ffi::c_int, ...) -> std::ffi::c_int; }
+        const PR_SET_PDEATHSIG: std::ffi::c_int = 1;
+        const SIGKILL: std::ffi::c_ulong = 9;
+        let parent = std::process::id();
+        unsafe {
+            cmd.pre_exec(move || {
+                if prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 { return Err(std::io::Error::last_os_error()); }
+                // parent died between fork and prctl: exit now (no allocation in the forked child)
+                if std::os::unix::process::parent_id() != parent { return Err(std::io::Error::from_raw_os_error(3)); }
+                Ok(())
+            });
+        }
+    }
+    cmd
 }
 
 /// Forces the graph quantum (frames per cycle) through PipeWire metadata; 0 releases the force.
@@ -180,6 +228,25 @@ pub fn link(out: &str, inp: &str) {
     for ch in ["FL", "FR"] {
         run("pw-link", &[&format!("{out}:output_{ch}"), &format!("{inp}:input_{ch}")]);
     }
+}
+/// Which side of a stereo pair the listener hears (L/R solo, monitor only). Left = the left signal in both ears.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Side { #[default] Stereo, Left, Right }
+/// (keep, drop) port pairs `(output_X, input_Y)` for `side`; together they are the four FL/FR pairs.
+pub fn side_ports(side: Side) -> (Vec<(&'static str, &'static str)>, Vec<(&'static str, &'static str)>) {
+    let want: [(&str, &str); 2] = match side {
+        Side::Stereo => [("FL", "FL"), ("FR", "FR")],
+        Side::Left => [("FL", "FL"), ("FL", "FR")],
+        Side::Right => [("FR", "FL"), ("FR", "FR")],
+    };
+    let all = [("FL", "FL"), ("FL", "FR"), ("FR", "FL"), ("FR", "FR")];
+    (want.to_vec(), all.into_iter().filter(|p| !want.contains(p)).collect())
+}
+/// Rewire `out -> inp` for `side`: drop the pairs not wanted, then add the wanted ones (an existing link errors harmlessly). Links only: no node, no latency.
+pub fn link_side(out: &str, inp: &str, side: Side) {
+    let (keep, drop) = side_ports(side);
+    for (o, i) in drop { run("pw-link", &["-d", &format!("{out}:output_{o}"), &format!("{inp}:input_{i}")]); }
+    for (o, i) in keep { run("pw-link", &[&format!("{out}:output_{o}"), &format!("{inp}:input_{i}")]); }
 }
 pub fn destroy(id: u64) {
     run("pw-cli", &["destroy", &id.to_string()]);
@@ -331,6 +398,7 @@ mod tests {
     }
 
     /// Re-exec target for `tap_dies_when_parent_is_sigkilled`. Does nothing unless the env var is set.
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore]
     fn deathsig_helper() {
