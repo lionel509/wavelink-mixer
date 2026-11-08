@@ -642,4 +642,15 @@ mod tests {
         assert_eq!(ins, vec!["FL", "FR"]);
         assert_eq!(side_ports(Side::Stereo).0, vec![("FL", "FL"), ("FR", "FR")]);
     }
+
+    #[test]
+    fn forget_held_drops_one_entry_per_reap() {
+        let _serial = child_lock();
+        let p = u32::MAX - 7;
+        HELD.lock().unwrap_or_else(|e| e.into_inner()).extend([p, p]);
+        forget_held(p);
+        let left = held().iter().filter(|&&q| q == p).count();
+        HELD.lock().unwrap_or_else(|e| e.into_inner()).retain(|&q| q != p);
+        assert_eq!(left, 1, "one reap of pid {p} forgot both holds");
+    }
 }

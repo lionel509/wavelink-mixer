@@ -1755,6 +1755,8 @@ impl App {
                     default_sink: false,
                     rack: config::Rack::default(),
                     normalize: false,
+                    norm_base: None,
+                    norm_out: None,
                 });
             }
             entry.set_text("");

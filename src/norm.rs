@@ -39,6 +39,25 @@ pub struct Channel {
 }
 
 impl Channel {
+    /// A channel he never touched: aims at TARGET_DB with auto's full range around 0 dB.
+    pub fn untouched(gain_db: f64) -> Channel {
+        Channel {
+            gain: gain_db, base: 0.0, out: TARGET_DB, pending: false, loud: None,
+            acc: 0.0, wsum: 0.0, facc: 0.0, fwsum: 0.0, heard: 0.0, quiet: 0.0,
+            hold: 0.0, since_emit: MIN_EMIT_S, emitted: gain_db,
+        }
+    }
+
+    pub fn resume(gain_db: f64, _base: Option<f64>, _out: Option<f64>) -> Channel {
+        Channel::untouched(gain_db)
+    }
+
+    pub fn saved(&self) -> (Option<f64>, Option<f64>) {
+        (None, None)
+    }
+
+    pub fn pause(&mut self) {}
+
     pub fn new(gain_db: f64) -> Channel {
         Channel {
             gain: gain_db, base: 0.0, out: TARGET_DB, pending: false, loud: None,
@@ -150,7 +169,7 @@ mod tests {
 
     #[test]
     fn silence_never_moves() {
-        let mut c = Channel::new(0.0);
+        let mut c = Channel::untouched(0.0);
         for _ in 0..2000 {
             assert_eq!(c.step(-80.0, 0.03), None);
         }
@@ -160,7 +179,7 @@ mod tests {
 
     #[test]
     fn loud_source_is_cut_at_attack_rate() {
-        let mut c = Channel::new(0.0);
+        let mut c = Channel::untouched(0.0);
         let dt: f64 = 0.03;
         let mut t = 0.0;
         let mut first_some: Option<f64> = None;
@@ -180,7 +199,7 @@ mod tests {
 
     #[test]
     fn quiet_source_rises_slowly_up_to_max_boost() {
-        let mut c = Channel::new(0.0);
+        let mut c = Channel::untouched(0.0);
         let dt: f64 = 0.03;
         let mut t = 0.0;
         let mut first11: Option<f64> = None;
@@ -199,7 +218,7 @@ mod tests {
 
     #[test]
     fn deadband_stops_hunting() {
-        let mut c = Channel::new(0.0);
+        let mut c = Channel::untouched(0.0);
         for _ in 0..667 {
             c.step(-8.0, 0.03);
         }
@@ -210,7 +229,7 @@ mod tests {
 
     #[test]
     fn manual_move_wins_and_becomes_preference() {
-        let mut c = Channel::new(0.0);
+        let mut c = Channel::untouched(0.0);
         for _ in 0..667 {
             c.step(-8.0, 0.03);
         }
@@ -231,7 +250,7 @@ mod tests {
 
     #[test]
     fn emits_are_rate_limited_and_rounded() {
-        let mut c = Channel::new(0.0);
+        let mut c = Channel::untouched(0.0);
         let dt: f64 = 0.01;
         let mut t = 0.0;
         let mut emits: Vec<(f64, f64)> = vec![];
@@ -255,7 +274,7 @@ mod tests {
     fn normalizer_bounded_under_random_feed() {
         let mut x: u64 = 11;
         for case in 0..200 {
-            let mut c = Channel::new(0.0);
+            let mut c = Channel::untouched(0.0);
             let mut hold_left = 0.0_f64;
             let mut t = 0.0_f64;
             let mut last_emit: Option<f64> = None;
@@ -305,7 +324,7 @@ mod tests {
 
     #[test]
     fn manual_before_first_reading_is_kept() {
-        let mut c = Channel::new(0.0);
+        let mut c = Channel::untouched(0.0);
         c.manual(-18.0);
         feed(&mut c, -8.0, 20.0, 0.03);
         assert!((c.gain - -18.0).abs() <= DEADBAND_DB, "auto snapped the slider back to {:.2} dB; his move was -18.0 dB", c.gain);
@@ -313,7 +332,7 @@ mod tests {
 
     #[test]
     fn offset_never_asks_past_fader_top() {
-        let mut c = Channel::new(0.0);
+        let mut c = Channel::untouched(0.0);
         feed(&mut c, -8.0, 20.0, 0.03);
         c.manual(12.0);
         let mut emits = feed(&mut c, -8.0, 10.0, 0.03);
@@ -325,7 +344,7 @@ mod tests {
 
     #[test]
     fn offset_never_asks_past_fader_floor() {
-        let mut c = Channel::new(0.0);
+        let mut c = Channel::untouched(0.0);
         feed(&mut c, -40.0, 20.0, 0.03);
         c.manual(-60.0);
         let emits = feed(&mut c, -8.0, 30.0, 0.03);
@@ -342,7 +361,7 @@ mod tests {
 
     #[test]
     fn xb1_fade_in_before_first_play_keeps_his_move() {
-        let mut c = Channel::new(0.0);
+        let mut c = Channel::untouched(0.0);
         c.manual(-18.0);
         let mut w = feed(&mut c, -80.0, 4.0, 0.03);
         w.extend(feed(&mut c, -49.0, 0.03, 0.03));
@@ -354,7 +373,7 @@ mod tests {
 
     #[test]
     fn xb1_click_before_first_play_keeps_his_move() {
-        let mut c = Channel::new(0.0);
+        let mut c = Channel::untouched(0.0);
         c.manual(-18.0);
         let mut w = feed(&mut c, -80.0, 4.0, 0.03);
         w.extend(feed(&mut c, -2.0, 0.03, 0.03));
@@ -366,7 +385,7 @@ mod tests {
 
     #[test]
     fn xb2_move_in_silence_after_play_keeps_his_move() {
-        let mut c = Channel::new(0.0);
+        let mut c = Channel::untouched(0.0);
         feed(&mut c, -8.0, 20.0, 0.03);
         feed(&mut c, -80.0, 60.0, 0.03);
         c.manual(-18.0);
@@ -380,7 +399,7 @@ mod tests {
 
     #[test]
     fn move_right_after_resume_keeps_his_move() {
-        let mut c = Channel::new(0.0);
+        let mut c = Channel::untouched(0.0);
         feed(&mut c, -8.0, 20.0, 0.03);
         feed(&mut c, -80.0, 60.0, 0.03);
         feed(&mut c, -30.0, 1.0, 0.03);
@@ -392,7 +411,7 @@ mod tests {
 
     #[test]
     fn move_in_short_gap_uses_settled_loudness() {
-        let mut c = Channel::new(0.0);
+        let mut c = Channel::untouched(0.0);
         feed(&mut c, -8.0, 20.0, 0.03);
         feed(&mut c, -80.0, 1.0, 0.03);
         c.manual(-18.0);
@@ -407,7 +426,7 @@ mod tests {
     #[test]
     fn burst_after_quiet_ambience_is_cut_fast() {
         let dt: f64 = 0.03;
-        let mut c = Channel::new(0.0);
+        let mut c = Channel::untouched(0.0);
         feed(&mut c, -40.0, 30.0, dt);
         assert!((c.gain - 12.0).abs() <= 1.0, "ambience gain {:.2}", c.gain);
         let mut t = 0.0;
@@ -428,7 +447,7 @@ mod tests {
 
     #[test]
     fn measurement_runs_during_hold() {
-        let mut c = Channel::new(0.0);
+        let mut c = Channel::untouched(0.0);
         feed(&mut c, -8.0, 20.0, 0.03);
         c.manual(-18.0);
         let mut w = feed(&mut c, -8.0, 0.5, 0.03);
@@ -441,7 +460,7 @@ mod tests {
 
     #[test]
     fn manual_ignores_non_finite() {
-        let mut c = Channel::new(0.0);
+        let mut c = Channel::untouched(0.0);
         feed(&mut c, -8.0, 20.0, 0.03);
         let before = c;
         c.manual(f64::NAN);
@@ -454,7 +473,7 @@ mod tests {
 
     #[test]
     fn boost_capped_above_his_position() {
-        let mut c = Channel::new(0.0);
+        let mut c = Channel::untouched(0.0);
         feed(&mut c, -8.0, 20.0, 0.03);
         c.manual(-18.0);
         let mut w = feed(&mut c, -8.0, 5.0, 0.03);
@@ -467,7 +486,7 @@ mod tests {
 
     #[test]
     fn silence_resets_loudness_memory() {
-        let mut c = Channel::new(0.0);
+        let mut c = Channel::untouched(0.0);
         feed(&mut c, -8.0, 20.0, 0.03);
         feed(&mut c, -80.0, 2.9, 0.03);
         assert!(c.loud_db().is_some());
@@ -486,7 +505,7 @@ mod tests {
         let mut fast_cuts = 0usize;
         let mut pending_steps = 0usize;
         for case in 0..300 {
-            let mut c = Channel::new(0.0);
+            let mut c = Channel::untouched(0.0);
             let mut last_manual: Option<f64> = None;
             for seg in 0..40 {
                 let silent = unit(&mut x) < 0.3;
@@ -529,5 +548,167 @@ mod tests {
         }
         assert!(fast_cuts > 0, "no fast cut happened, so the property is vacuous");
         assert!(pending_steps > 0, "no pending step happened, so the property is vacuous");
+    }
+
+    #[test]
+    fn brk_toggle_off_on_keeps_his_move() {
+        // N off: his fader move is not seen (fader_manual finds no channel). N on: ui rebuilds from the saved gain_db.
+        let mut c = Channel::new(0.0);
+        feed(&mut c, -8.0, 20.0, 0.03);
+        let mut c2 = Channel::new(-18.0);
+        let w = feed(&mut c2, -8.0, 20.0, 0.03);
+        assert!(w.is_empty(), "auto wrote {w:?} after N on; his slider was -18");
+        assert!((c2.gain - -18.0).abs() <= DEADBAND_DB, "auto moved his -18 slider to {:.2}", c2.gain);
+    }
+
+    #[test]
+    fn brk_toggle_on_inside_hold_writes_at_once() {
+        let mut c = Channel::new(0.0);
+        feed(&mut c, -8.0, 20.0, 0.03);
+        c.manual(-18.0);
+        let mut c2 = Channel::new(-18.0);   // N off, then on, inside the 3 s hold
+        let w = feed(&mut c2, -8.0, 0.5, 0.03);
+        assert!(w.is_empty(), "auto wrote {w:?} within 0.5 s of his move (hold is 3 s)");
+    }
+
+    #[test]
+    fn restart_at_minus_40_never_raised() {
+        let mut c = Channel::new(-40.0);
+        let w = feed(&mut c, -8.0, 20.0, 0.03);
+        assert!(w.iter().all(|&g| g <= -28.0), "auto wrote up to {:?}", w.iter().cloned().fold(None, |m: Option<f64>, g| Some(m.map_or(g, |m| m.max(g)))));
+        assert!(w.is_empty(), "auto wrote {w:?}; his slider was -40");
+    }
+
+    #[test]
+    fn restart_resumes_his_anchored_level() {
+        let mut c = Channel::untouched(0.0);
+        feed(&mut c, -8.0, 20.0, 0.03);
+        c.manual(-18.0);
+        feed(&mut c, -8.0, 5.0, 0.03);
+        let (b, o) = c.saved();
+        assert_eq!(b, Some(-18.0));
+        assert!((o.unwrap() - -26.0).abs() < 0.05);
+        let mut r = Channel::resume(c.gain, b, o);
+        let w = feed(&mut r, -14.0, 30.0, 0.03);
+        assert!(w.iter().all(|&g| g <= -6.0 + 1e-9));
+        assert!((r.gain - -12.0).abs() <= DEADBAND_DB, "gain {}", r.gain);
+    }
+
+    #[test]
+    fn restart_boost_capped_at_his_position() {
+        let mut c = Channel::resume(-40.0, Some(-40.0), Some(-48.0));
+        let w = feed(&mut c, -45.0, 40.0, 0.03);
+        assert!(w.iter().all(|&g| g <= -28.0 + 1e-9), "{w:?}");
+        assert!(c.gain <= -28.0 + 1e-9 && c.gain >= -29.0 - 1e-9, "gain {}", c.gain);
+    }
+
+    #[test]
+    fn old_config_position_is_his() {
+        assert_eq!(Channel::resume(-40.0, None, None), Channel::new(-40.0));
+        let mut c = Channel::resume(-40.0, None, None);
+        assert!(feed(&mut c, -8.0, 20.0, 0.03).is_empty());
+        assert_eq!(Channel::resume(0.0, None, None), Channel::untouched(0.0));
+        let mut u = Channel::resume(0.0, None, None);
+        feed(&mut u, -8.0, 20.0, 0.03);
+        assert!((u.gain - -12.0).abs() <= DEADBAND_DB);
+    }
+
+    #[test]
+    fn untouched_round_trips_through_save() {
+        let c = Channel::untouched(-12.0);
+        let (b, o) = c.saved();
+        assert_eq!((b, o), (Some(0.0), Some(TARGET_DB)));
+        assert_eq!(Channel::resume(-12.0, b, o), c);
+    }
+
+    #[test]
+    fn pause_keeps_hold_and_level() {
+        let mut c = Channel::untouched(0.0);
+        feed(&mut c, -8.0, 20.0, 0.03);
+        c.manual(-18.0);
+        feed(&mut c, -8.0, 1.0, 0.03);
+        c.pause();
+        assert!(feed(&mut c, -14.0, 1.5, 0.03).is_empty(), "hold lost across N off/on");
+        feed(&mut c, -14.0, 30.0, 0.03);
+        assert!((c.gain - -12.0).abs() <= DEADBAND_DB, "gain {}", c.gain);
+    }
+
+    #[test]
+    fn move_while_n_off_waits_for_new_audio() {
+        let mut c = Channel::untouched(0.0);
+        feed(&mut c, -8.0, 20.0, 0.03);
+        c.pause();
+        c.manual(-5.0);
+        let w = feed(&mut c, -30.0, 30.0, 0.03);
+        assert!(w.is_empty(), "auto wrote {w:?}; his N-off move was -5");
+    }
+
+    #[test]
+    fn rise_rule_holds_gain_during_burst() {
+        let mut c = Channel::untouched(0.0);
+        feed(&mut c, -40.0, 2.0, 0.03);
+        assert!(c.gain > 2.0 && c.gain < 5.0, "setup gain {}", c.gain);
+        feed(&mut c, -18.0, 0.3, 0.03);
+        let mut prev = c.gain;
+        for i in 0..190 {
+            c.step(-18.0, 0.03);
+            assert!(c.gain <= prev + 1e-9, "tick {i}: gain rose {prev:.3} -> {:.3} during the burst", c.gain);
+            prev = c.gain;
+        }
+    }
+
+    #[test]
+    fn cut_floor_is_his_position_minus_24() {
+        let mut c = Channel::untouched(0.0);
+        feed(&mut c, -30.0, 20.0, 0.03);
+        c.manual(-18.0);
+        for _ in 0..1000 {
+            c.step(0.0, 0.03);
+            assert!(c.gain >= -42.0 - 1e-9, "gain {}", c.gain);
+        }
+        assert!((c.gain - -42.0).abs() <= DEADBAND_DB, "never reached the floor: {}", c.gain);
+    }
+
+    #[test]
+    fn lifecycle_never_boosts_past_his_position_random() {
+        // the events the ui can produce: ticks while N is on, his move (N on or off), N toggle (pause), restart from saved()
+        let mut x = 0x5eed_0007u64;
+        let pos = |x: &mut u64| ((FADER_MIN_DB + unit(x) * (FADER_MAX_DB - FADER_MIN_DB)) * 10.0).round() / 10.0;
+        for run in 0..200 {
+            let g0 = if unit(&mut x) < 0.3 { 0.0 } else { pos(&mut x) };
+            let mut c = Channel::resume(g0, None, None); // app start on a pre-round-4 config
+            let mut his = g0; // 0.0 = untouched: same +12 cap
+            let mut on = true;
+            let mut hold = 0.0f64;
+            for ev in 0..3000 {
+                let r = unit(&mut x);
+                if r < 0.01 {
+                    his = pos(&mut x);
+                    c.manual(his);
+                    hold = MANUAL_HOLD_S;
+                } else if r < 0.015 {
+                    on = !on;
+                    if !on {
+                        c.pause();
+                    }
+                } else if r < 0.018 {
+                    let (b, o) = c.saved();
+                    c = Channel::resume(c.gain, b, o);
+                    hold = 0.0; // a restart drops the hold by design
+                } else if on {
+                    let dt = 0.01 + unit(&mut x) * 0.04;
+                    let rms = if unit(&mut x) < 0.2 { -80.0 } else { -60.0 + unit(&mut x) * 60.0 };
+                    let w = c.step(rms, dt);
+                    if hold > 0.0 {
+                        assert_eq!(w, None, "run {run} ev {ev}: wrote inside his hold");
+                        hold -= dt;
+                    }
+                    if let Some(g) = w {
+                        assert!(g <= his + MAX_BOOST_DB + 0.05 + 1e-9, "run {run} ev {ev}: wrote {g} over his {his} + {MAX_BOOST_DB}");
+                    }
+                }
+                assert!(c.gain <= his + MAX_BOOST_DB + 1e-9, "run {run} ev {ev}: gain {} over his {his} + {MAX_BOOST_DB}", c.gain);
+            }
+        }
     }
 }
