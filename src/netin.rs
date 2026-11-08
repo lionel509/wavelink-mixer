@@ -36,9 +36,9 @@ impl In {
 
     /// Makes the running workers match `want` (input id -> URL).
     fn sync(&mut self, want: HashMap<String, String>) {
-        // stop workers that are no longer wanted or whose URL changed
-        self.workers.retain(|id, (url, stop, _)| {
-            let keep = want.get(id) == Some(url);
+        // stop workers that are no longer wanted, whose URL changed, or whose thread has ended
+        self.workers.retain(|id, (url, stop, th)| {
+            let keep = want.get(id) == Some(url) && !th.is_finished();
             if !keep {
                 stop.store(true, Ordering::Relaxed);
             }
@@ -186,7 +186,11 @@ fn open(url: &str) -> Result<(Format, Vec<u8>, Box<dyn Read + Send>), Failure> {
         .timeout_connect(Duration::from_secs(5))
         .timeout_read(Duration::from_secs(10))
         .build();
-    let resp = agent.get(url).call().map_err(|e| Failure::Net(e.to_string()))?;
+    // ureq panics on some redirects (for example a Location of file://). A panic here would end the worker thread.
+    let resp = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| agent.get(url).call())) {
+        Ok(r) => r.map_err(|e| Failure::Net(e.to_string()))?,
+        Err(_) => return Err(Failure::Net("HTTP client failed on a redirect".into())),
+    };
     let ct = resp.header("Content-Type").map(str::to_string);
     let mut reader = resp.into_reader();
     let mut buf = vec![0u8; 256];
