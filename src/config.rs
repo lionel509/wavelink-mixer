@@ -174,6 +174,8 @@ pub struct Input {
     pub default_sink: bool,
     #[serde(default)]
     pub rack: Rack,
+    #[serde(default)]
+    pub normalize: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -371,7 +373,7 @@ impl Config {
         };
         let input = |id: &str, name: &str, color: &str, fx: &str, routes| Input {
             id: id.into(), name: name.into(), color: color.into(), kind: InputKind::Virtual, fx: fx.into(),
-            eq: flat_eq(), gain_db: 0.0, mute: false, routes, default_sink: id == "system", rack: Rack::default(),
+            eq: flat_eq(), gain_db: 0.0, mute: false, routes, default_sink: id == "system", rack: Rack::default(), normalize: false,
         };
         Config {
             piano: PianoCfg::default(),
@@ -386,7 +388,7 @@ impl Config {
                     id: "mic".into(), name: "Mic".into(), color: "#bf5af2".into(),
                     kind: InputKind::Source { target: "easyeffects_source".into() },
                     fx: "clean".into(), eq: flat_eq(), gain_db: 0.0, mute: false,
-                    routes: r(&[("b1", true, 0.0), ("b2", true, 0.0)]), default_sink: false, rack: Rack::default(),
+                    routes: r(&[("b1", true, 0.0), ("b2", true, 0.0)]), default_sink: false, rack: Rack::default(), normalize: false,
                 },
             ],
             buses: vec![

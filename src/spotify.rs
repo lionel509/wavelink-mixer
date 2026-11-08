@@ -75,7 +75,7 @@ impl Api {
             enc(client_id), enc(SCOPES), enc(REDIRECT), challenge, state
         );
         let listener = std::net::TcpListener::bind("127.0.0.1:8898").map_err(|e| format!("port 8898 busy: {e}"))?;
-        let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+        crate::pw::spawn("xdg-open", &[url.as_str()]);
         listener.set_nonblocking(false).ok();
         let deadline = SystemTime::now() + Duration::from_secs(300);
         let code = loop {
