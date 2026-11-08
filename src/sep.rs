@@ -1,8 +1,21 @@
 //! Separators and the transcriber: StemgenRT streaming (Live), Open-Unmix UMX-HQ (Quality), Basic Pitch notes.
-//! Unit 1 skeleton: bodies are `todo!()` until Unit 3.
 #![allow(dead_code, unused_imports, unused_variables)]
+use crate::dsp::{self, Spec, BP_RATE, SEP_RATE};
 use crate::models::{ModelSet, S_FILES, U_FILES};
 use crate::notes::Note;
+use ort::session::Session;
+use ort::value::Tensor;
+use std::time::Instant;
+
+fn e2s<E: std::fmt::Display>(e: E) -> String {
+    e.to_string()
+}
+
+/// Deterministic uniform [0, 1) from an LCG (no `rand` crate).
+fn noise_lcg(s: &mut u64) -> f32 {
+    *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    ((*s >> 33) as f32) / (1u64 << 31) as f32
+}
 
 // ---- Live (StemgenRT) ----
 pub const BLOCK: usize = 128;
@@ -28,56 +41,182 @@ pub const STATES: [(&str, &[i64]); 13] = [
 
 /// LRLR... -> L..., R...
 pub fn deinterleave(x: &[f32]) -> Vec<f32> {
-    todo!()
+    let mut out = vec![0f32; x.len()];
+    let half = x.len() / 2;
+    for i in 0..half {
+        out[i] = x[2 * i];
+        out[half + i] = x[2 * i + 1];
+    }
+    out
 }
 
 /// L..., R... -> LRLR...
 pub fn interleave(p: &[f32]) -> Vec<f32> {
-    todo!()
+    let half = p.len() / 2;
+    let mut out = vec![0f32; p.len()];
+    for i in 0..half {
+        out[2 * i] = p[i];
+        out[2 * i + 1] = p[half + i];
+    }
+    out
 }
 
-pub struct Streamer {}
+pub struct Streamer {
+    session: Session,
+    /// In STATES order.
+    states: Vec<Vec<f32>>,
+    primed: bool,
+}
 
 impl Streamer {
     /// Intra threads 1; parallel: parallel execution with 3 inter threads, else 1 inter thread. File S_FILES[0].
     pub fn load(m: &ModelSet, parallel: bool) -> Result<Streamer, String> {
-        todo!()
+        let b = Session::builder().map_err(e2s)?.with_intra_threads(1).map_err(e2s)?;
+        let b = if parallel {
+            b.with_parallel_execution(true).map_err(e2s)?.with_inter_threads(3).map_err(e2s)?
+        } else {
+            b.with_inter_threads(1).map_err(e2s)?
+        };
+        let session = b.commit_from_file(m.path(S_FILES[0])).map_err(e2s)?;
+        let mut s = Streamer { session, states: Vec::new(), primed: false };
+        s.reset();
+        Ok(s)
     }
 
     pub fn reset(&mut self) {
-        todo!()
+        self.states = STATES
+            .iter()
+            .map(|(_, shape)| vec![0f32; shape.iter().product::<i64>() as usize])
+            .collect();
+        self.primed = false;
     }
 
     /// planar.len() == 256. First call after load/reset -> Ok(None); call n returns call n-1's input,
     /// as [drums, bass, vocals, other], each interleaved (256).
     pub fn process(&mut self, planar: &[f32]) -> Result<Option<[Vec<f32>; 4]>, String> {
-        todo!()
+        if planar.len() != 2 * BLOCK {
+            return Err(format!("process wants {} planar samples, got {}", 2 * BLOCK, planar.len()));
+        }
+        let mut ins: Vec<(String, Tensor<f32>)> = Vec::with_capacity(1 + STATES.len());
+        ins.push((
+            "audio_chunk".to_string(),
+            Tensor::from_array((vec![1i64, 2, BLOCK as i64], planar.to_vec())).map_err(e2s)?,
+        ));
+        for (i, (name, shape)) in STATES.iter().enumerate() {
+            ins.push((
+                name.to_string(),
+                Tensor::from_array((shape.to_vec(), self.states[i].clone())).map_err(e2s)?,
+            ));
+        }
+        let out = self.session.run(ins).map_err(e2s)?;
+        let (_, sep) = out["separated_chunk"].try_extract_tensor::<f32>().map_err(e2s)?;
+        if sep.len() != 4 * 2 * BLOCK {
+            return Err(format!("separated_chunk has {} values", sep.len()));
+        }
+        let stems: [Vec<f32>; 4] = std::array::from_fn(|s| interleave(&sep[s * 2 * BLOCK..(s + 1) * 2 * BLOCK]));
+        for (i, (name, _)) in STATES.iter().enumerate() {
+            let (_, d) = out[format!("next_{name}").as_str()].try_extract_tensor::<f32>().map_err(e2s)?;
+            self.states[i] = d.to_vec();
+        }
+        if !self.primed {
+            self.primed = true;
+            return Ok(None);
+        }
+        let [d, b, v, o] = stems;
+        Ok(Some([d, b, v, o]))
     }
 }
 
 /// Wall ms per call over `calls` calls of LCG noise (0.1), then reset.
 pub fn calibrate(s: &mut Streamer, calls: usize) -> Result<Vec<f64>, String> {
-    todo!()
+    let mut seed = 7u64;
+    let mut times = Vec::with_capacity(calls);
+    for _ in 0..calls {
+        let x: Vec<f32> = (0..2 * BLOCK).map(|_| (noise_lcg(&mut seed) * 2.0 - 1.0) * 0.1).collect();
+        let t0 = Instant::now();
+        s.process(&x)?;
+        times.push(t0.elapsed().as_secs_f64() * 1000.0);
+    }
+    s.reset();
+    Ok(times)
 }
 
 // ---- Quality (UMX-HQ) ----
 
-pub struct Separator {}
+pub struct Separator {
+    /// vocals, drums, bass, other (U_FILES[0..4] order).
+    sessions: Vec<Session>,
+}
+
+/// One UMX net on a magnitude spectrogram [frames,1,2,2049] -> its estimate, same layout.
+fn umx_run(sess: &mut Session, mag: &[f32], frames: usize) -> Result<Vec<f32>, String> {
+    let t = Tensor::from_array((vec![frames as i64, 1, 2, 2049], mag.to_vec())).map_err(e2s)?;
+    let out = sess.run(ort::inputs!["mag" => t]).map_err(e2s)?;
+    let (_, est) = out["est"].try_extract_tensor::<f32>().map_err(e2s)?;
+    Ok(est.to_vec())
+}
 
 impl Separator {
     /// Each session with intra threads 2; files U_FILES[0..4].
     pub fn load(m: &ModelSet) -> Result<Separator, String> {
-        todo!()
+        let mut sessions = Vec::with_capacity(4);
+        for name in &U_FILES[0..4] {
+            let s = Session::builder()
+                .map_err(e2s)?
+                .with_intra_threads(2)
+                .map_err(e2s)?
+                .commit_from_file(m.path(name))
+                .map_err(e2s)?;
+            sessions.push(s);
+        }
+        Ok(Separator { sessions })
     }
 
     /// Returns [drums, bass, other] (vocals dropped), interleaved stereo at 44.1 kHz.
     pub fn separate(&mut self, pcm44: &[f32]) -> Result<[Vec<f32>; 3], String> {
-        todo!()
+        let s = dsp::stft(pcm44);
+        let n = s.re.len();
+        let mag: Vec<f32> = (0..n).map(|i| s.re[i].hypot(s.im[i])).collect();
+        let frames = s.frames;
+        let mag_ref = &mag;
+        let ests: Vec<Vec<f32>> = std::thread::scope(|sc| {
+            let handles: Vec<_> = self
+                .sessions
+                .iter_mut()
+                .map(|sess| sc.spawn(move || umx_run(sess, mag_ref, frames)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().map_err(|_| "UMX thread panicked".to_string())?)
+                .collect::<Result<Vec<_>, String>>()
+        })?;
+        let mut den = vec![1e-10f32; n];
+        for e in &ests {
+            for i in 0..n {
+                den[i] += e[i] * e[i];
+            }
+        }
+        let len = pcm44.len() / 2;
+        let stem = |j: usize| -> Vec<f32> {
+            let e = &ests[j];
+            let re: Vec<f32> = (0..n).map(|i| s.re[i] * (e[i] * e[i] / den[i])).collect();
+            let im: Vec<f32> = (0..n).map(|i| s.im[i] * (e[i] * e[i] / den[i])).collect();
+            dsp::istft(&Spec { frames, re, im }, len)
+        };
+        Ok([stem(1), stem(2), stem(3)])
     }
 
     /// separate() three times on 2.0 s of LCG stereo (0.3); max ms / 2.0.
     pub fn ms_per_s(&mut self) -> Result<f64, String> {
-        todo!()
+        let mut seed = 11u64;
+        let x: Vec<f32> = (0..2 * 88200).map(|_| (noise_lcg(&mut seed) * 2.0 - 1.0) * 0.3).collect();
+        let mut worst = 0f64;
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            self.separate(&x)?;
+            worst = worst.max(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        Ok(worst / 2.0)
     }
 }
 
@@ -89,23 +228,119 @@ pub const FRAME_THRESH: f32 = 0.3;
 pub const MIN_NOTE_FRAMES: usize = 5;
 pub const ENERGY_TOL: usize = 11;
 
-pub struct Transcriber {}
+pub struct Transcriber {
+    session: Session,
+}
 
 impl Transcriber {
     /// File "basic-pitch-nmp.onnx".
     pub fn load(m: &ModelSet) -> Result<Transcriber, String> {
-        todo!()
+        let session = Session::builder().map_err(e2s)?.commit_from_file(m.path("basic-pitch-nmp.onnx")).map_err(e2s)?;
+        Ok(Transcriber { session })
     }
 
     /// Mono at 44.1 kHz in; notes with t relative to the start of the input.
     pub fn notes(&mut self, mono44: &[f32]) -> Result<Vec<Note>, String> {
-        todo!()
+        // Mono -> stereo -> 22.05 kHz, then one channel.
+        let mut stereo = Vec::with_capacity(mono44.len() * 2);
+        for &v in mono44 {
+            stereo.push(v);
+            stereo.push(v);
+        }
+        let rs = dsp::resample(&stereo, SEP_RATE, BP_RATE);
+        let mono: Vec<f32> = rs.iter().step_by(2).copied().collect();
+        let mut x = vec![0f32; BP_SAMPLES];
+        let take = mono.len().min(BP_SAMPLES);
+        x[BP_SAMPLES - take..].copy_from_slice(&mono[mono.len() - take..]);
+
+        let in_name = self.session.inputs[0].name.clone();
+        let out_names: Vec<String> = self.session.outputs.iter().map(|o| o.name.clone()).collect();
+        let t = Tensor::from_array((vec![1i64, BP_SAMPLES as i64, 1], x)).map_err(e2s)?;
+        let out = self.session.run(ort::inputs![in_name.as_str() => t]).map_err(e2s)?;
+
+        // The two [1,172,88] outputs: the larger mean is `note`, the other `onset`. The [1,172,264] contour is unused.
+        let mut grids: Vec<(f32, Vec<f32>)> = Vec::new();
+        for name in &out_names {
+            let (shape, data) = out[name.as_str()].try_extract_tensor::<f32>().map_err(e2s)?;
+            if shape.len() == 3 && shape[1] == 172 && shape[2] == 88 {
+                let mean = data.iter().sum::<f32>() / data.len() as f32;
+                grids.push((mean, data.to_vec()));
+            }
+        }
+        if grids.len() != 2 {
+            return Err(format!("expected 2 note/onset outputs of [1,172,88], found {}", grids.len()));
+        }
+        grids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let to_grid = |d: &[f32]| -> Vec<Vec<f32>> { d.chunks(88).map(|c| c.to_vec()).collect() };
+        let note = to_grid(&grids[0].1);
+        let onset = to_grid(&grids[1].1);
+        Ok(frames_to_notes(&note, &onset))
     }
 }
 
 /// note and onset are [frame][pitch] grids (172 x 88).
 pub fn frames_to_notes(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<Note> {
-    todo!()
+    let frames = note.len();
+    if frames == 0 {
+        return Vec::new();
+    }
+    let pitches = note[0].len();
+    let mut work: Vec<Vec<f32>> = note.to_vec();
+
+    // Onset candidates: at or above the threshold and a local maximum in time.
+    let mut cands: Vec<(f32, usize, usize)> = Vec::new();
+    for f in 0..frames {
+        for p in 0..pitches {
+            let v = onset[f][p];
+            if v < ONSET_THRESH {
+                continue;
+            }
+            let prev = if f > 0 { onset[f - 1][p] } else { f32::NEG_INFINITY };
+            let next = if f + 1 < frames { onset[f + 1][p] } else { f32::NEG_INFINITY };
+            if v >= prev && v >= next {
+                cands.push((v, f, p));
+            }
+        }
+    }
+    cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut out: Vec<Note> = Vec::new();
+    for &(_, f, p) in &cands {
+        if work[f][p] < FRAME_THRESH {
+            continue;
+        }
+        // Walk forward, tolerating up to ENERGY_TOL quiet frames in a row.
+        let mut k = 0usize;
+        let mut end = f;
+        let mut fp = f + 1;
+        loop {
+            if fp >= frames {
+                end = frames - k;
+                break;
+            }
+            if work[fp][p] < FRAME_THRESH {
+                k += 1;
+            } else {
+                k = 0;
+            }
+            if k > ENERGY_TOL {
+                end = fp + 1 - k;
+                break;
+            }
+            fp += 1;
+        }
+        if end - f < MIN_NOTE_FRAMES {
+            continue;
+        }
+        let mean = work[f..end].iter().map(|r| r[p]).sum::<f32>() / (end - f) as f32;
+        let vel = (127.0 * mean).round().clamp(0.0, 127.0) as u8;
+        out.push(Note { t: f as f64 / FPS, dur: (end - f) as f64 / FPS, pitch: (p + 21) as u8, vel });
+        for r in work[f..end].iter_mut() {
+            r[p] = 0.0;
+        }
+    }
+    out.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal).then(a.pitch.cmp(&b.pitch)));
+    out
 }
 
 #[cfg(test)]
