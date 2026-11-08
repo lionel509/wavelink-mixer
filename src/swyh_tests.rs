@@ -418,3 +418,25 @@ fn breaker_removed_bus_closes_silent_stream() {
     assert!(closed, "bus removed but the HTTP stream is still open 6 s later (pw-record pid {pid})");
 }
 
+
+/// A tap that produces 64 MiB at once and then reports that it finished. The client reads the
+/// header and then stops reading. The reader thread may only hold a bounded amount of tap output,
+/// so the fake tap is still blocked on its pipe after 3 s. With an unbounded channel the whole
+/// 64 MiB lands in engine RAM and `done` appears.
+#[test]
+fn bounded_tap_buffer_stops_a_client_that_stops_reading() {
+    let _g = lock();
+    // PATH is only the fake dir here, so the tools are called by absolute path.
+    let body = "echo $$ > \"${0%/*}/pid\"\n/usr/bin/head -c 67108864 /dev/zero\n/usr/bin/touch \"${0%/*}/done\"";
+    let fake = fake_pw("bounded", Some(body));
+    let s = srv(&["n1"]);
+    let mut c = get(s.port, "/stream/n1.wav");
+    assert!(read_head(&mut c).starts_with("HTTP/1.1 200"));
+    let pid = pid_of(&fake.dir).expect("pw-record pid");
+    std::thread::sleep(Duration::from_secs(3));
+    let done = fake.dir.join("done").exists();
+    kill_pid(&pid);
+    drop(c);
+    wait_for(5, || CLIENTS.load(Ordering::SeqCst) == 0);
+    assert!(!done, "the tap pushed all 64 MiB into the engine while the client was not reading");
+}
