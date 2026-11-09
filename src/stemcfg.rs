@@ -152,6 +152,15 @@ pub fn effective_mute(cfg_mute: bool, id: &str, solo: &HashSet<String>, replaced
     cfg_mute || (!solo.is_empty() && !solo.contains(id)) || replaced == Some(id)
 }
 
+/// Which node `step` must mute again, if any. `node` is the replaced source's strip node (id, muted).
+/// Current rule (to be replaced): fire only when the node id differs from the last one seen.
+pub fn remute_target(replaced: bool, node: Option<(u64, bool)>, last: Option<u64>) -> Option<u64> {
+    match node {
+        Some((id, _)) if replaced && Some(id) != last => Some(id),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +340,11 @@ mod tests {
         std::fs::write(&p, "not json {").unwrap();
         assert_eq!(load_from(&p), StemsCfg::default());
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn remute_fires_when_same_node_is_unmuted() {
+        // the engine re-applies cfg.mute=false onto the same node id: must be muted again
+        assert_eq!(remute_target(true, Some((42, false)), Some(42)), Some(42));
     }
 }
