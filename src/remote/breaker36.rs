@@ -461,3 +461,266 @@ fn b36_probe_merge_resurrects_deleted_channel_edited_remotely() {
     let m = crate::config::merge3(&base, &mine, &theirs).unwrap();
     assert!(m.inputs.iter().any(|i| i.id == gone), "current behaviour: '{gone}' comes back");
 }
+
+// ####################################################################### ROUND 2 (86d7d2e)
+
+fn rig_caps(tag: &str, edit: impl FnOnce(&mut Config), caps: &[(&str, f64)]) -> Rig {
+    let dir = std::env::temp_dir().join(format!("wavelink-b36r2-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg_path = dir.join(".config/wavelink-mixer/config.json");
+    let mut c = Config::default_config();
+    c.buses.insert(
+        2,
+        Bus { id: "a3".into(), name: "Sonos".into(), color: "#ff9f0a".into(), kind: BusKind::Hardware { target: "raop_sonos_test".into() }, gain_db: -30.0, mute: false, max_db: None },
+    );
+    edit(&mut c);
+    assert!(c.save_to(&cfg_path));
+    let fake = Arc::new(FakeBackend::default());
+    let caps = caps.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    let run = serve(Opts { bind: "127.0.0.1".into(), port: 0, token: TOKEN.into(), cfg_path: cfg_path.clone(), name: "testhost".into(), caps }, fake.clone()).unwrap();
+    Rig { dir, cfg: cfg_path, fake, run }
+}
+
+fn try_join(r: &Rig) -> Option<Ws> {
+    let s = TcpStream::connect(r.run.addr).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    let (mut ws, _) = tungstenite::client(format!("ws://{}/", r.run.addr), s).ok()?;
+    hello(&mut ws, TOKEN, false);
+    match recv_np(&mut ws)? {
+        ServerMsg::Welcome { .. } => Some(ws),
+        _ => None,
+    }
+}
+
+fn unlock(ws: &mut Ws, bus: &str, on: bool) -> u32 {
+    send(ws, &ClientMsg::Unlock { bus: bus.into(), on });
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(3) {
+        match recv_np(ws) {
+            Some(ServerMsg::Unlock { bus: b, seconds }) if b == bus => return seconds,
+            Some(ServerMsg::Error { .. }) | None => return 0,
+            Some(_) => {}
+        }
+    }
+    0
+}
+
+// ----------------------------------------------------------------------- RED (round 2)
+
+/// R2-1 (MEDIUM). Pre-auth lockout: MAX_PREAUTH = 4 slots, first come first served, no per-peer limit and
+/// no eviction. Any host on the LAN that keeps 4 handshaken-but-silent sockets open (re-opening each one as
+/// the 5 s deadline closes it) locks the real Wavelink Remote out indefinitely; the real client only
+/// retries with backoff, so it loses every race for a freed slot. (The builder's `connection_caps_hold`
+/// asserts this refusal as intended.) Expected: a client that sends a valid Hello right away still gets
+/// in, e.g. by evicting the oldest idle pre-auth socket when the cap is hit, plus a per-peer-IP cap.
+#[test]
+fn r2_four_idle_preauth_sockets_do_not_lock_out_the_real_client() {
+    let r = rig("lockout");
+    let _idle: Vec<_> = (0..super::server::MAX_PREAUTH).map(|_| connect(&r)).collect();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(try_join(&r).is_some(), "4 silent pre-auth sockets (no token needed) lock out a client with the right token");
+}
+
+/// R2-2 (LOW-MEDIUM). `remote-token --rotate` does not revoke sessions that authenticated with the old
+/// token: the server only re-reads the file on the next Hello and never drops live clients. A leaked
+/// token's holder keeps full control (and can keep the session alive forever with pings) after the owner
+/// rotated precisely to cut them off. Expected: when the token changes, sessions authed with the old one
+/// are closed (or at least refused on their next command).
+#[test]
+fn r2_rotate_revokes_sessions_on_the_old_token() {
+    let r = rig("rotate");
+    let tf = r.dir.join("remote.json");
+    std::fs::write(&tf, format!(r#"{{"token":"{TOKEN}"}}"#)).unwrap();
+    r.run.token_file(tf.clone());
+    let (mut old, _) = join(&r);
+    let new = super::settings::rotate(&tf).unwrap();
+    assert_ne!(new, TOKEN);
+    // the new token works, the old one is refused for new connections (green part)
+    let mut ws = connect(&r);
+    hello(&mut ws, TOKEN, false);
+    assert!(matches!(recv(&mut ws), Some(ServerMsg::Error { code: ErrorCode::Auth, .. })));
+    let mut ws = connect(&r);
+    hello(&mut ws, &new, false);
+    assert!(matches!(recv_np(&mut ws), Some(ServerMsg::Welcome { .. })));
+    std::thread::sleep(Duration::from_millis(1500));
+    // the session opened with the old token
+    send(&mut old, &ClientMsg::Command { id: 1, cmd: Command::SetInputMute { input: "mic".into(), mute: true } });
+    let t0 = Instant::now();
+    let mut accepted = false;
+    while t0.elapsed() < Duration::from_secs(2) {
+        match recv_np(&mut old) {
+            Some(ServerMsg::Ack { id: 1, ok, .. }) => {
+                accepted = ok;
+                break;
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    assert!(!accepted, "a session authenticated with the rotated-out token still controls the mixer");
+}
+
+/// R2-3 (LOW). The "auto" bind excludes VPNs by a name denylist (tun/tap/wg/zt/ppp/nordlynx/tailscale...),
+/// so common VPN interfaces with other names get a listener: ProtonVPN (`proton0`), Cisco AnyConnect
+/// (`cscotun0`), GlobalProtect (`gpd0`), Mullvad on some setups (`mullvad-…`), libreswan (`ipsec0`).
+/// Expected: an allowlist of physical NICs (e.g. /sys/class/net/<dev>/device exists, or ARPHRD_ETHER +
+/// not under /sys/devices/virtual), not a denylist. (Binding a LAN IP is also not an interface filter:
+/// Linux's weak host model accepts that IP from any interface, e.g. from a Meshnet peer with LAN access
+/// or a container routed through the host. Docs should say "LAN addresses", not "LAN only".)
+#[test]
+fn r2_auto_bind_excludes_vpn_interfaces_not_named_like_tun_or_wg() {
+    let ifs: Vec<(String, String)> = [
+        ("enp14s0", "192.168.1.231"),
+        ("proton0", "10.2.0.2"),
+        ("cscotun0", "10.99.0.5"),
+        ("gpd0", "10.98.0.7"),
+        ("mullvad-se1", "10.64.0.9"),
+        ("ipsec0", "10.97.0.3"),
+    ]
+    .iter()
+    .map(|(a, b)| (a.to_string(), b.to_string()))
+    .collect();
+    let got = super::settings::bind_addrs("auto", false, &ifs);
+    assert_eq!(got, vec!["192.168.1.231".to_string(), "127.0.0.1".to_string()], "VPN addresses bound: {got:?}");
+}
+
+// ----------------------------------------------------------------------- GREEN probes (round 2)
+
+/// The 6 round-1 reds stay fixed (they run above); here: the raise limit is shared by parallel clients.
+/// 4 clients hammering a1 from 4 threads for 1.2 s can't add more than 2 windows' worth (+24 dB).
+#[test]
+fn r2_probe_raise_limit_shared_by_parallel_clients() {
+    let r = rig_with("par", |c| c.buses[0].gain_db = -60.0);
+    let addr = r.run.addr;
+    let stop = Instant::now() + Duration::from_millis(1200);
+    let hs: Vec<_> = (0..4)
+        .map(|k| {
+            std::thread::spawn(move || {
+                let s = TcpStream::connect(addr).unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let (mut ws, _) = tungstenite::client(format!("ws://{addr}/"), s).unwrap();
+                hello(&mut ws, TOKEN, false);
+                let mut id = k * 100_000;
+                while Instant::now() < stop {
+                    id += 1;
+                    let _ = cmd(&mut ws, id, Command::SetBusGain { bus: "a1".into(), db: 12.0, unlock: false });
+                }
+            })
+        })
+        .collect();
+    for h in hs {
+        h.join().unwrap();
+    }
+    let g = bus_gain(&r, "a1");
+    assert!(g <= -60.0 + 24.0 + 1e-9, "a1 at {g} after 1.2 s of 4 parallel hammering clients");
+}
+
+/// Reconnecting does not reset the limit (it is per bus, not per connection).
+#[test]
+fn r2_probe_reconnect_does_not_reset_the_limit() {
+    let r = rig_with("recon", |c| c.buses[0].gain_db = -60.0);
+    for k in 0..6 {
+        let (mut ws, _) = join(&r);
+        let _ = cmd(&mut ws, k, Command::SetBusGain { bus: "a1".into(), db: 12.0, unlock: false });
+    }
+    assert!(bus_gain(&r, "a1") <= -48.0 + 1e-9);
+}
+
+/// Dip-then-jump only lowers the window floor: -20 -> -60 -> jump gives at most -48.
+#[test]
+fn r2_probe_dip_then_jump_does_not_widen_the_window() {
+    let r = rig_with("dip", |c| c.buses[0].gain_db = -20.0);
+    let (mut ws, _) = join(&r);
+    let _ = cmd(&mut ws, 1, Command::SetBusGain { bus: "a1".into(), db: -60.0, unlock: false });
+    for id in 2..10 {
+        let _ = cmd(&mut ws, id, Command::SetBusGain { bus: "a1".into(), db: 12.0, unlock: false });
+    }
+    assert!(bus_gain(&r, "a1") <= -48.0 + 1e-9, "{}", bus_gain(&r, "a1"));
+}
+
+/// Full range with the limiter, simulated clock: -60 -> +12 takes 5 s (windows at 0,1,..,5), not the 6 s
+/// the fix comment says; and the largest instantaneous jump is +12 dB (two commands), vs 6 dB for the
+/// 6 dB/500 ms the coordinator suggested. Same average rate.
+#[test]
+fn r2_probe_full_range_time_and_burst_size() {
+    let mut l = safety::RaiseLimiter::default();
+    let (mut g, mut t) = (-60.0f64, 0.0f64);
+    let mut first_burst = None;
+    while g < 12.0 && t < 20.0 {
+        let step = (g + safety::MAX_STEP_DB).min(l.allowed(t, g)).min(12.0);
+        if step > g {
+            l.record(t, g, step);
+            g = step;
+        }
+        if first_burst.is_none() && t >= 0.5 {
+            first_burst = Some(g + 60.0);
+        }
+        t += 0.01;
+    }
+    assert_eq!(first_burst, Some(12.0));
+    assert!((4.9..5.2).contains(&t), "full range took {t:.2} s");
+}
+
+/// Unlock is bounded by the hard ceiling and by the soft cap source: a user soft cap of -30 on a1 with a
+/// ceiling of -12 -> unlocked rises stop at -12; another connection stays at -30; unlock of a bus that
+/// only has a ceiling (no soft cap) is granted but cannot pass the ceiling.
+#[test]
+fn r2_probe_unlock_bound_by_ceiling() {
+    let r = rig_caps("unl", |c| {
+        c.buses[0].gain_db = -40.0;
+        c.buses[0].max_db = Some(-12.0);
+    }, &[("a1", -30.0)]);
+    let (mut a, st) = join(&r);
+    assert_eq!((st.bus("a1").unwrap().max_db, st.bus("a1").unwrap().ceiling_db), (Some(-30.0), Some(-12.0)));
+    let (mut b, _) = join(&r);
+    assert_eq!(unlock(&mut a, "a1", true), safety::UNLOCK_S as u32);
+    for id in 1..20 {
+        let _ = cmd(&mut a, id, Command::SetBusGain { bus: "a1".into(), db: 12.0, unlock: true });
+        std::thread::sleep(Duration::from_millis(160));
+    }
+    assert_eq!(bus_gain(&r, "a1"), -12.0);
+    let _ = cmd(&mut b, 100, Command::SetBusGain { bus: "a1".into(), db: -12.0, unlock: true });
+    assert_eq!(bus_gain(&r, "a1"), -30.0, "b holds no unlock: its write is clamped to the soft cap (a lowering)");
+    // the Sonos: soft cap == ceiling (-20): unlock is granted but changes nothing
+    assert_eq!(unlock(&mut a, "a3", true), safety::UNLOCK_S as u32);
+    for id in 200..210 {
+        let _ = cmd(&mut a, id, Command::SetBusGain { bus: "a3".into(), db: 12.0, unlock: true });
+    }
+    assert_eq!(bus_gain(&r, "a3"), -20.0);
+    assert!(r.fake.applied.lock().unwrap().iter().all(|c| !matches!(c, Command::SetBusGain { bus, db, .. } if bus == "a3" && *db > -20.0)));
+}
+
+/// The 5 s wall-clock Hello deadline bounds a pre-auth slot: after it, the slots are free again.
+#[test]
+fn r2_probe_preauth_slots_free_after_deadline() {
+    let r = rig("deadline");
+    let idle: Vec<_> = (0..super::server::MAX_PREAUTH).map(|_| connect(&r)).collect();
+    std::thread::sleep(super::server::HELLO_DEADLINE + Duration::from_millis(700));
+    assert!(try_join(&r).is_some());
+    drop(idle);
+}
+
+/// B36-8 fix holds on the save path: an auto-normalize move loses to a remote gain, his EQ edit lands.
+#[test]
+fn r2_probe_auto_gain_loses_to_remote_on_save() {
+    let dir = std::env::temp_dir().join(format!("wavelink-b36r2-merge-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let p = dir.join("config.json");
+    let mut base = Config::default_config();
+    assert!(base.save_to(&p));
+    let mut gui = base.clone();
+    gui.inputs[1].gain_db = -8.0; // auto move
+    gui.inputs[0].eq[2] = 3.0;
+    let mut remote = Config::peek(&p).unwrap();
+    remote.inputs[1].gain_db = -30.0;
+    assert!(remote.save_to(&p));
+    let auto: std::collections::HashSet<String> = [gui.inputs[1].id.clone()].into_iter().collect();
+    let r = gui.save_merged_with(&mut base, &p, &|b, d, m| {
+        crate::config::their_gains_win(b, d, m, &auto);
+    });
+    assert_eq!(r, Ok(true));
+    let disk = Config::peek(&p).unwrap();
+    assert_eq!(disk.inputs[1].gain_db, -30.0);
+    assert_eq!(disk.inputs[0].eq[2], 3.0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
