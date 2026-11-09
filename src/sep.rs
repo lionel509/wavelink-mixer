@@ -638,4 +638,70 @@ mod tests {
         let n = ns.iter().find(|n| n.pitch == 69).unwrap_or_else(|| panic!("no pitch 69: {ns:?}"));
         assert!((n.t - 20.0 / FPS).abs() < 3.0 / FPS, "{ns:?}");
     }
+
+    /// F18 (breaker r3 B1): note grid noise in [0, 0.35), onset noise in [0, 0.45) and one real onset peak
+    /// of 0.6 elsewhere. No pitch has a real attack, so there must be no notes.
+    #[test]
+    fn r3_noise_produces_no_notes() {
+        let mut total = 0usize;
+        let mut worst = Vec::new();
+        for seed in 1..=20u64 {
+            let mut x = seed * 7919;
+            let mut note = vec![vec![0f32; 88]; 172];
+            let mut onset = vec![vec![0f32; 88]; 172];
+            for f in 0..172 {
+                for p in 0..88 {
+                    note[f][p] = lcg(&mut x) * 0.35;
+                    onset[f][p] = lcg(&mut x) * 0.45;
+                }
+            }
+            for f in 0..172 {
+                note[f][10] = 0.0;
+            }
+            onset[100][10] = 0.6;
+            let ns = frames_to_notes(&note, &onset);
+            if !ns.is_empty() {
+                total += ns.len();
+                worst.push((seed, ns.len(), ns.first().cloned()));
+            }
+        }
+        assert_eq!(total, 0, "spurious notes on noise: {worst:?}");
+    }
+
+    /// F18: upstream's minimum note length is 11 frames, and a note must be longer than that (>= 12).
+    #[test]
+    fn frames_to_notes_upstream_min_len() {
+        for (len, want) in [(11usize, 0usize), (12, 1)] {
+            let mut note = vec![vec![0f32; 88]; 172];
+            let mut onset = vec![vec![0f32; 88]; 172];
+            for f in 40..40 + len {
+                note[f][30] = 0.9;
+            }
+            onset[40][30] = 0.9;
+            let ns = frames_to_notes(&note, &onset);
+            assert_eq!(ns.len(), want, "len {len}: {ns:?}");
+        }
+    }
+
+    /// F18 (ignored, CPU, model): white noise must not become notes, at amplitude 0.05 and 0.2.
+    #[test]
+    #[ignore]
+    fn r3_model_white_noise_no_notes() {
+        let m = models::ensure(&["basic-pitch-nmp.onnx"], &|s: String| println!("{s}")).unwrap();
+        let mut tr = Transcriber::load(&m).unwrap();
+        let mut x = 12345u64;
+        let mut bad = Vec::new();
+        for amp in [0.05f32, 0.2] {
+            let noise: Vec<f32> = (0..88200).map(|_| (lcg(&mut x) * 2.0 - 1.0) * amp).collect();
+            let ns = tr.notes(&noise).unwrap();
+            println!("white noise amp {amp}: {} notes, first {:?}", ns.len(), ns.first());
+            if !ns.is_empty() {
+                bad.push((amp, ns.len()));
+            }
+        }
+        let tone: Vec<f32> = (0..88200).map(|i| ((2.0 * std::f64::consts::PI * 220.0 * i as f64 / 44100.0).sin() as f32) * 0.4).collect();
+        let ns = tr.notes(&tone).unwrap();
+        println!("steady 220 Hz tone: {} notes, first {:?}", ns.len(), ns.first());
+        assert!(bad.is_empty(), "notes on white noise (amp, count): {bad:?}");
+    }
 }
