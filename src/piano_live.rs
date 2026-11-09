@@ -669,6 +669,7 @@ pub fn cli(args: Vec<String>) -> i32 {
     let (mut subtract, mut vocal) = (false, None::<String>);
     let mut v3 = None::<bool>;
     let mut drums = None::<String>;
+    let mut eval = None::<String>;
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -687,11 +688,34 @@ pub fn cli(args: Vec<String>) -> i32 {
             "--piano3" => v3 = Some(true),
             "--vocal" => vocal = it.next(),
             "--drums" => drums = it.next(),
+            "--eval" => eval = it.next(),
             other => return usage(&format!("unknown argument {other}")),
         }
     }
     if bench {
         return run_bench();
+    }
+    if let Some(w) = eval {
+        let (pcm, rate) = match std::fs::read(&w).map_err(|e| e.to_string()).and_then(|b| piano::read_wav(&b)) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("{w}: {e}");
+                return 1;
+            }
+        };
+        let x = piano::to_rate(&pcm, rate);
+        // sections: PIANO_EVAL_SECTIONS="intro=0-32,verse=32-92,chorus=104-134"
+        let secs: Vec<(String, f64, f64)> = std::env::var("PIANO_EVAL_SECTIONS")
+            .unwrap_or_else(|_| "intro=0-32,verse=32-92,chorus=104-134".into())
+            .split(',')
+            .filter_map(|kv| {
+                let (k, v) = kv.split_once('=')?;
+                let (a, b) = v.split_once('-')?;
+                Some((k.to_string(), a.parse().ok()?, b.parse().ok()?))
+            })
+            .collect();
+        print!("{}", crate::piano_eval::eval(&x, &secs));
+        return 0;
     }
     if let (Some(w), Some(po)) = (&wav, v3) {
         return arrange3_cli(w, out.as_deref(), po);
