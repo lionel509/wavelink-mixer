@@ -873,3 +873,6 @@ fn brk_repeats_with_realistic_attack() {
 
 #[path = "piano_breaker2_tests.rs"]
 mod round2;
+
+#[path = "piano_breaker3_tests.rs"]
+mod round3;

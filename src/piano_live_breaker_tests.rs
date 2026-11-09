@@ -157,3 +157,65 @@ fn brk2_snapshot_while_sounding_is_a_copy() {
     assert_eq!(s3.iter().filter(|n| n.pitch == 60).count(), 1, "{s3:?}");
     assert!((s3.iter().find(|n| n.pitch == 60).unwrap().dur - 1.5).abs() < 1e-9);
 }
+
+// ------------------------------------------------------------------------------------------------
+// Round 3 (head 464b0c4): the note-off retry queue
+// ------------------------------------------------------------------------------------------------
+
+/// A sink that refuses the next `n` sends.
+struct Refuse(Vec<String>, usize);
+impl Sink for Refuse {
+    fn note(&mut self, on: bool, ch: u8, key: u8, _vel: u8) -> Result<(), String> {
+        if self.1 > 0 {
+            self.1 -= 1;
+            return Err("EAGAIN".into());
+        }
+        self.0.push(format!("{} {ch} {key}", if on { "on" } else { "off" }));
+        Ok(())
+    }
+    fn control(&mut self, ch: u8, cc: u8, _val: u8) -> Result<(), String> {
+        if self.1 > 0 {
+            self.1 -= 1;
+            return Err("EAGAIN".into());
+        }
+        self.0.push(format!("cc {ch} {cc}"));
+        Ok(())
+    }
+}
+
+/// RED (R3-F6, Low). A queued (refused) note-off for key K must not be delivered after a newer
+/// note-on of K: that kills the new note at the receiver while MidiOut believes it is sounding.
+/// Sequence: On 60, Off 60 refused (queued), the retry at the next event refused again, the new
+/// On 60 accepted; the next event's flush then sends the stale Off 60 after it.
+#[test]
+fn brk3_stale_queued_note_off_never_follows_a_new_note_on() {
+    let mut m = MidiOut::new(Refuse(Vec::new(), 0));
+    m.event(&Ev::On { t: 0.0, pitch: 60, vel: 90 });
+    m.sink.1 = 1;
+    m.event(&Ev::Off { t: 0.3, pitch: 60 });
+    m.sink.1 = 1; // the flush at the start of the next event is refused, the On goes out
+    m.event(&Ev::On { t: 0.5, pitch: 60, vel: 80 });
+    m.event(&Ev::On { t: 0.6, pitch: 72, vel: 80 }); // any later event flushes the queue
+    let log = m.sink.0.clone();
+    let last_on = log.iter().rposition(|l| l == "on 1 60").expect("second On 60 not sent");
+    assert!(!log[last_on..].iter().any(|l| l == "off 1 60"), "stale Off 60 after the new On 60: {log:?}");
+    std::mem::forget(m);
+}
+
+/// GREEN probe. A permanently stuck subscriber: the queue stays bounded (one entry per channel and
+/// key, three CCs), however many notes go by.
+#[test]
+fn brk3_retry_queue_bounded_under_stuck_subscriber() {
+    let mut m = MidiOut::new(Refuse(Vec::new(), 0));
+    m.sink.1 = usize::MAX;
+    for i in 0..20000u32 {
+        let p = 21 + (i % 88) as u8;
+        m.event(&Ev::On { t: i as f64, pitch: p, vel: 90 });
+        m.event(&Ev::Off { t: i as f64 + 0.5, pitch: p });
+        if i % 100 == 0 {
+            m.all_off();
+        }
+    }
+    assert!(m.pending() <= 88 + 3, "queue grew to {}", m.pending());
+    std::mem::forget(m);
+}
