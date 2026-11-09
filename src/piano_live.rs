@@ -606,6 +606,7 @@ pub fn cli(args: Vec<String>) -> i32 {
     let (mut wav, mut out, mut reference, mut source) = (None::<String>, None::<String>, None::<String>, None::<String>);
     let (mut merged, mut port, mut bench, mut seconds) = (false, false, false, None::<f64>);
     let mut arrange = None::<bool>;
+    let (mut subtract, mut vocal) = (false, None::<String>);
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -619,11 +620,16 @@ pub fn cli(args: Vec<String>) -> i32 {
             "--bench" => bench = true,
             "--arrange" => arrange = Some(false),
             "--piano-only" => arrange = Some(true),
+            "--subtract" => subtract = true,
+            "--vocal" => vocal = it.next(),
             other => return usage(&format!("unknown argument {other}")),
         }
     }
     if bench {
         return run_bench();
+    }
+    if let (Some(w), true) = (&wav, subtract || vocal.is_some()) {
+        return subtract_cli(w, out.as_deref(), vocal.as_deref());
     }
     if let (Some(w), Some(po)) = (&wav, arrange) {
         return arrange_cli(w, out.as_deref(), po);
@@ -639,6 +645,52 @@ pub fn cli(args: Vec<String>) -> i32 {
 
 fn write_midi(path: &str, notes: &[Note], merged: bool, origin: Option<f64>) -> Result<(), String> {
     std::fs::write(path, crate::notes::piano_midi(notes, !merged, origin)).map_err(|e| format!("{path}: {e}"))
+}
+
+/// `piano --wav X --subtract [--out notes.mid] [--vocal stem.wav]`: notes by complex harmonic
+/// subtraction (through the pianist layer), and the vocal stem plus its melody (stem.mid).
+fn subtract_cli(wav: &str, out: Option<&str>, vocal: Option<&str>) -> i32 {
+    let (l, r, rate) = match std::fs::read(wav).map_err(|e| e.to_string()).and_then(|b| crate::subtract::read_stereo(&b)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{wav}: {e}");
+            return 1;
+        }
+    };
+    let (l, r) = (piano::to_rate(&l, rate), piano::to_rate(&r, rate));
+    let secs = l.len() as f64 / piano::RATE as f64;
+    let t = Instant::now();
+    let fr = crate::subtract::frames(&l, &r);
+    let el = t.elapsed().as_secs_f64();
+    let raw = crate::subtract::notes(&fr);
+    let notes = if std::env::var_os("PIANO_RAW").is_some() { raw.clone() } else { crate::pianist::perform(&raw) };
+    let poly = fr.found.iter().map(|f| f.len()).sum::<usize>() as f64 / fr.found.len().max(1) as f64;
+    println!("{} notes ({} raw) from {secs:.1} s in {el:.2} s ({:.2} ms per 0.5 s), {poly:.1} series per frame", notes.len(), raw.len(), el * 1000.0 / (secs / 0.5));
+    if std::env::var_os("PIANO_DUMP").is_some() {
+        for n in notes.iter() {
+            println!("N {:8.3} {:6.3} {:3} {:3}", n.t, n.dur, n.pitch, n.vel);
+        }
+    }
+    if let Some(path) = out {
+        if let Err(e) = write_midi(path, &notes, true, Some(0.0)) {
+            eprintln!("{e}");
+            return 1;
+        }
+        println!("wrote {path}");
+    }
+    if let Some(vp) = vocal {
+        let line = crate::subtract::vocal_line(&fr);
+        let stem = crate::subtract::resynth(&fr, &line, l.len());
+        let mel = crate::subtract::line_notes(&fr, &line);
+        let voiced = line.iter().filter(|x| x.is_some()).count() as f64 / line.len().max(1) as f64;
+        let mp = std::path::Path::new(vp).with_extension("mid");
+        if let Err(e) = std::fs::write(vp, crate::subtract::wav16(&stem, piano::RATE)).and_then(|_| std::fs::write(&mp, crate::notes::piano_midi(&mel, false, Some(0.0)))) {
+            eprintln!("{vp}: {e}");
+            return 1;
+        }
+        println!("vocal: voiced {:.0}% of frames, {} melody notes; wrote {vp} and {}", voiced * 100.0, mel.len(), mp.display());
+    }
+    0
 }
 
 /// `piano --wav X --arrange|--piano-only [--out f.mid]`: tempo, key, chords, and the arranged parts.
