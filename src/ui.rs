@@ -350,6 +350,9 @@ fn meter(name: &str, target: Option<(&str, bool)>, led: Option<Rc<LedMeter>>, vu
     Some(Meter { child, level, led, vu, out: Rc::new(Cell::new((-90.0, -90.0))), last: [Cell::new(-90.0), Cell::new(-90.0)], rms, last_rms: Cell::new(-90.0), bands, node, side })
 }
 
+/// Failed merges in a row before the window parks its config and follows the file (B36-9).
+const MERGE_TRIES: u32 = 5;
+
 pub struct App {
     cfg: RefCell<Config>,
     /// config.json as this window last read or wrote it: the base of the 3-way merge that keeps the
@@ -360,6 +363,8 @@ pub struct App {
     /// inputs whose in-memory gain was last moved by auto-normalize, not by him (B36-8): on a merge, a gain
     /// another writer saved beats those moves
     auto_gain: RefCell<std::collections::HashSet<String>>,
+    /// consecutive failed merges on save (see save_cfg)
+    merge_fails: Cell<u32>,
     graph: RefCell<Graph>,
     dirty: Cell<bool>,
     content: gtk::Box,
@@ -1078,11 +1083,35 @@ impl App {
             c.save_merged_with(&mut b, &Config::path(), &prefer)
         };
         match r {
-            Ok(true) => self.apply_external(&before, &won.into_inner()),
-            Ok(false) => {}
+            Ok(changed) => {
+                self.merge_fails.set(0);
+                if changed {
+                    self.apply_external(&before, &won.into_inner());
+                }
+            }
             Err(e) => {
-                eprintln!("wavelink: {e}");
-                self.dirty.set(true); // retry on a later tick, merging again
+                let n = self.merge_fails.get() + 1;
+                self.merge_fails.set(n);
+                if n < MERGE_TRIES {
+                    eprintln!("wavelink: {e} (try {n}/{MERGE_TRIES})");
+                    self.dirty.set(true); // retry on a later tick, merging again
+                    return;
+                }
+                // it keeps failing: never spin silently, never overwrite the newer file. Park his config
+                // next to it, warn, and continue from the file.
+                self.merge_fails.set(0);
+                let parked = Config::path().with_extension("json.wavelink-failed");
+                let ok = before.save_to(&parked);
+                eprintln!(
+                    "wavelink: WARNING: config.json could not be merged {MERGE_TRIES} times in a row; {} ({e}). The window now follows config.json.",
+                    if ok { format!("this window's settings were saved to {}", parked.display()) } else { format!("saving them to {} failed too", parked.display()) }
+                );
+                if let Some(d) = Config::peek(&Config::path()) {
+                    *self.cfg.borrow_mut() = d.clone();
+                    *self.synced.borrow_mut() = d;
+                    self.dirty.set(false);
+                    self.apply_external(&before, &[]);
+                }
             }
         }
     }
@@ -2679,6 +2708,7 @@ pub fn activate(app: &adw::Application) {
         synced: RefCell::new(Config::default_config()), // set to the loaded config right below (one load, B36-9)
         norm_btns: RefCell::new(HashMap::new()),
         auto_gain: RefCell::new(Default::default()),
+        merge_fails: Cell::new(0),
         graph: RefCell::new(Graph::read().unwrap_or_default()),
         dirty: Cell::new(false),
         content,

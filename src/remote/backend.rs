@@ -14,6 +14,10 @@ pub trait Backend: Send + Sync + 'static {
     /// Called ~15 times a second while at least one client wants meters (`want` = true), and once with
     /// false when the last one leaves. Returns the levels since the previous call.
     fn meters(&self, cfg: &Config, want: bool) -> Option<p::Meters>;
+    /// Whether the node's props say it is an AirPlay/RAOP sink (#35), whatever its name.
+    fn node_is_raop(&self, _node: &str) -> bool {
+        false
+    }
 }
 
 /// The real thing: wpctl/pw-cli on the same nodes the GUI drives, meters from pw-record taps.
@@ -60,6 +64,10 @@ impl PwBackend {
 }
 
 impl Backend for PwBackend {
+    fn node_is_raop(&self, node: &str) -> bool {
+        self.node(node).is_some_and(|(_, raop)| raop)
+    }
+
     fn apply(&self, cfg: &Config, cmd: &p::Command) {
         match cmd {
             p::Command::SetInputGain { input, db } => {
@@ -244,6 +252,8 @@ impl Tap {
 #[cfg(test)]
 #[derive(Default)]
 pub struct FakeBackend {
+    /// node names the fake graph reports as AirPlay sinks by their props
+    pub raop_nodes: Mutex<Vec<String>>,
     pub applied: Mutex<Vec<p::Command>>,
     pub meter_calls: AtomicU64,
     pub stopped: AtomicU64,
@@ -251,6 +261,9 @@ pub struct FakeBackend {
 
 #[cfg(test)]
 impl Backend for FakeBackend {
+    fn node_is_raop(&self, node: &str) -> bool {
+        self.raop_nodes.lock().unwrap().iter().any(|n| n == node)
+    }
     fn apply(&self, _cfg: &Config, cmd: &p::Command) {
         self.applied.lock().unwrap().push(cmd.clone());
     }
