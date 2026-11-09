@@ -305,10 +305,15 @@ impl Config {
     }
 
     pub fn load() -> Config {
-        let path = Self::path();
+        Self::load_from(&Self::path())
+    }
+
+    /// `load` for an explicit path (the remote server's tests use a temp dir).
+    pub fn load_from(path: &std::path::Path) -> Config {
+        let path = path.to_path_buf();
         let fresh = || {
             let c = Config::default_config();
-            c.save();
+            c.save_to(&path);
             c
         };
         let Ok(bytes) = std::fs::read(&path) else {
@@ -343,12 +348,57 @@ impl Config {
     }
 
     pub fn save(&self) {
-        let p = Self::path();
+        self.save_to(&Self::path());
+    }
+
+    /// Atomic write: a per-process temp file renamed over `p` (two writers never share a temp name).
+    pub fn save_to(&self, p: &std::path::Path) -> bool {
         let _ = std::fs::create_dir_all(p.parent().unwrap());
-        let tmp = p.with_extension("json.tmp");
-        if std::fs::write(&tmp, serde_json::to_vec_pretty(self).unwrap()).is_ok() {
-            let _ = std::fs::rename(tmp, p);
+        let tmp = p.with_extension(format!("json.tmp.{}", std::process::id()));
+        if std::fs::write(&tmp, serde_json::to_vec_pretty(self).unwrap()).is_ok() && std::fs::rename(&tmp, p).is_ok() {
+            return true;
         }
+        let _ = std::fs::remove_file(&tmp);
+        false
+    }
+
+    /// Read the file as it is now without the load() side effects (no defaults written, no backup); None if missing or unparsable.
+    pub fn peek(p: &std::path::Path) -> Option<Config> {
+        serde_json::from_slice(&std::fs::read(p).ok()?).ok()
+    }
+
+    /// Save without clobbering another writer (the engine's remote server, #26): under the config lock,
+    /// if the file changed since `base` (what this process last read or wrote), merge field by field
+    /// (our edits since `base` win, everything else comes from the file) before writing.
+    /// `self` becomes the merged config and `base` the written one. True when the file changed under us.
+    pub fn save_merged(&mut self, base: &mut Config, p: &std::path::Path) -> bool {
+        let _lock = lock_config(p);
+        let disk = Config::peek(p);
+        let mut changed = false;
+        if let Some(d) = disk.filter(|d| d != base) {
+            if let Some(m) = merge3(base, self, &d) {
+                *self = m;
+            }
+            changed = true;
+        }
+        if self.save_to(p) {
+            *base = self.clone();
+        }
+        changed
+    }
+
+    /// Pull in edits another writer saved since `base`; our unsaved edits since `base` stay.
+    /// Returns the file's config when it differed from `base` (`self` is then merged, `base` = file).
+    pub fn pull_merged(&mut self, base: &mut Config, p: &std::path::Path) -> Option<Config> {
+        let d = Config::peek(p)?;
+        if &d == base {
+            return None;
+        }
+        if let Some(m) = merge3(base, self, &d) {
+            *self = m;
+        }
+        *base = d.clone();
+        Some(d)
     }
 
     /// Everything that needs the engine to rebuild the graph (not levels/mutes/EQ).
@@ -412,6 +462,95 @@ impl Config {
             ],
         }
     }
+}
+
+/// Exclusive advisory lock on `<config dir>/config.lock` for a read-modify-write of `p`; released on drop.
+/// Best effort: if the lock file can't be opened the write goes ahead unlocked.
+pub fn lock_config(p: &std::path::Path) -> Option<std::fs::File> {
+    let lp = p.with_extension("lock");
+    let _ = std::fs::create_dir_all(lp.parent()?);
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(lp).ok()?;
+    f.lock().ok()?;
+    Some(f)
+}
+
+/// Three-way merge of JSON-serialised configs: for each leaf, `mine` wins where it differs from
+/// `base`, otherwise `theirs`. Arrays of objects with an "id" (inputs, buses) merge per id; other arrays
+/// (EQ bands) are leaves. None if the merge doesn't deserialize back (then the caller keeps `mine`).
+pub fn merge3(base: &Config, mine: &Config, theirs: &Config) -> Option<Config> {
+    use serde_json::Value;
+    fn ids(v: &Value) -> Option<Vec<String>> {
+        v.as_array()?.iter().map(|x| x.get("id").and_then(|i| i.as_str()).map(String::from)).collect()
+    }
+    fn m(base: &Value, mine: &Value, theirs: &Value) -> Value {
+        if mine == base {
+            return theirs.clone();
+        }
+        if theirs == base || theirs == mine {
+            return mine.clone();
+        }
+        match (base, mine, theirs) {
+            (Value::Object(b), Value::Object(mi), Value::Object(th)) => {
+                let mut out = serde_json::Map::new();
+                let keys: std::collections::BTreeSet<&String> = b.keys().chain(mi.keys()).chain(th.keys()).collect();
+                for k in keys {
+                    match (b.get(k), mi.get(k), th.get(k)) {
+                        (_, Some(x), Some(y)) => {
+                            out.insert(k.clone(), m(b.get(k).unwrap_or(&Value::Null), x, y));
+                        }
+                        // removed on one side: keep the removal unless the other side edited it
+                        (Some(bv), Some(x), None) => {
+                            if x != bv {
+                                out.insert(k.clone(), x.clone());
+                            }
+                        }
+                        (Some(bv), None, Some(y)) => {
+                            if y != bv {
+                                out.insert(k.clone(), y.clone());
+                            }
+                        }
+                        (None, Some(x), None) => {
+                            out.insert(k.clone(), x.clone());
+                        }
+                        (None, None, Some(y)) => {
+                            out.insert(k.clone(), y.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                Value::Object(out)
+            }
+            (Value::Array(b), Value::Array(mi), Value::Array(th)) => match (ids(base), ids(mine), ids(theirs)) {
+                (Some(bi), Some(mii), Some(thi)) => {
+                    // order: mine's order if mine reordered/added/removed, else theirs'; per-id merge
+                    let order = if mii != bi { mii.clone() } else { thi.clone() };
+                    let get = |arr: &Vec<Value>, idv: &Vec<String>, id: &str| idv.iter().position(|x| x == id).map(|i| arr[i].clone());
+                    let mut out = vec![];
+                    let mut seen = std::collections::HashSet::new();
+                    for id in order.iter().chain(thi.iter()).chain(mii.iter()) {
+                        if !seen.insert(id.clone()) {
+                            continue;
+                        }
+                        let (bv, mv, tv) = (get(b, &bi, id), get(mi, &mii, id), get(th, &thi, id));
+                        match (bv, mv, tv) {
+                            (bv, Some(x), Some(y)) => out.push(m(&bv.unwrap_or(Value::Null), &x, &y)),
+                            (Some(bv), Some(x), None) if x != bv => out.push(x),
+                            (Some(bv), None, Some(y)) if y != bv => out.push(y),
+                            (None, Some(x), None) => out.push(x),
+                            (None, None, Some(y)) => out.push(y),
+                            _ => {}
+                        }
+                    }
+                    Value::Array(out)
+                }
+                _ => mine.clone(),
+            },
+            // both sides changed the same leaf: ours wins (the caller's in-memory edit is the newest intent here)
+            _ => mine.clone(),
+        }
+    }
+    let (b, mi, th) = (serde_json::to_value(base).ok()?, serde_json::to_value(mine).ok()?, serde_json::to_value(theirs).ok()?);
+    serde_json::from_value(m(&b, &mi, &th)).ok()
 }
 
 pub fn glib_home() -> PathBuf {
@@ -483,6 +622,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         assert_eq!(bad.unwrap(), truncated);
         assert_eq!(bad1.unwrap(), second);
+    }
+
+    #[test]
+    fn merge3_keeps_both_sides_edits() {
+        let base = Config::default_config();
+        let mut mine = base.clone();
+        let mut theirs = base.clone();
+        mine.inputs[0].gain_db = -7.0; // GUI moved System
+        mine.inputs[1].eq[3] = 4.0;
+        theirs.inputs[1].gain_db = -11.0; // remote moved Spotify
+        theirs.buses[0].mute = true;
+        theirs.inputs[2].routes.get_mut("a1").unwrap().on = false;
+        let m = merge3(&base, &mine, &theirs).unwrap();
+        assert_eq!(m.inputs[0].gain_db, -7.0);
+        assert_eq!(m.inputs[1].eq[3], 4.0);
+        assert_eq!(m.inputs[1].gain_db, -11.0);
+        assert!(m.buses[0].mute);
+        assert!(!m.inputs[2].routes["a1"].on);
+        // same leaf on both sides: ours
+        theirs.inputs[0].gain_db = -30.0;
+        assert_eq!(merge3(&base, &mine, &theirs).unwrap().inputs[0].gain_db, -7.0);
+        // an input added on their side, one removed on ours
+        let mut theirs2 = base.clone();
+        let mut extra = base.inputs[0].clone();
+        extra.id = "new".into();
+        theirs2.inputs.push(extra);
+        let mut mine2 = base.clone();
+        mine2.inputs.retain(|i| i.id != "game");
+        let m = merge3(&base, &mine2, &theirs2).unwrap();
+        let ids: Vec<_> = m.inputs.iter().map(|i| i.id.as_str()).collect();
+        assert!(ids.contains(&"new") && !ids.contains(&"game"), "{ids:?}");
+    }
+
+    #[test]
+    fn save_merged_never_writes_stale_state_over_newer_file() {
+        let dir = std::env::temp_dir().join(format!("wavelink-merge-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("config.json");
+        let mut base = Config::default_config();
+        assert!(base.save_to(&p));
+        let mut gui = base.clone();
+        // another writer (the remote server) changes the file
+        let mut other = Config::peek(&p).unwrap();
+        other.buses[1].gain_db = -40.0;
+        other.save_to(&p);
+        // the GUI saves its own, unrelated edit
+        gui.inputs[0].mute = true;
+        assert!(gui.save_merged(&mut base, &p));
+        let disk = Config::peek(&p).unwrap();
+        assert_eq!(disk.buses[1].gain_db, -40.0, "the other writer's edit survived");
+        assert!(disk.inputs[0].mute, "the GUI's edit landed");
+        assert_eq!(base, disk);
+        // pull: the file changes again, the GUI picks it up
+        let mut other = disk.clone();
+        other.inputs[3].gain_db = -2.5;
+        other.save_to(&p);
+        assert!(gui.pull_merged(&mut base, &p).is_some());
+        assert_eq!(gui.inputs[3].gain_db, -2.5);
+        assert!(gui.pull_merged(&mut base, &p).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -330,6 +330,7 @@ pub fn run() {
     let mut piano_sent: Option<crate::config::PianoCfg> = None;
     let mut last_quantum: Option<u32> = None;
     eprintln!("wavelink engine: config {}", Config::path().display());
+    crate::remote::start(); // LAN control server on its own threads (#26)
 
     loop {
         // reload config on change

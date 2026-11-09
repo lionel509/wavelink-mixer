@@ -1,6 +1,7 @@
 //! wavelink-mixer: a Voicemeeter-style mixer for PipeWire.
 //!   wavelink-mixer           open the mixer window
-//!   wavelink-mixer engine    run the routing engine (systemd user service)
+//!   wavelink-mixer engine    run the routing engine (systemd user service) + LAN control server
+//!   wavelink-mixer remote-token   print the host/port/token a remote client needs
 mod config;
 mod dash;
 mod dsp;
@@ -21,6 +22,7 @@ mod player;
 mod spotify;
 mod sysmon;
 mod pw;
+mod remote;
 mod ui;
 #[cfg(test)]
 #[path = "breaker_front.rs"]
@@ -66,6 +68,9 @@ fn main() -> glib::ExitCode {
     if std::env::args().nth(1).as_deref() == Some("engine-conf") {
         print!("{}", engine::dump_conf());
         return glib::ExitCode::SUCCESS;
+    }
+    if std::env::args().nth(1).as_deref() == Some("remote-token") {
+        std::process::exit(remote::print_info());
     }
     if std::env::args().nth(1).as_deref() == Some("engine") {
         engine::run();
