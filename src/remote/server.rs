@@ -1,23 +1,32 @@
-//! WebSocket control server: one accept thread, one thread per client, a config watcher and a meter pump.
+//! WebSocket control server: accept threads (one per listen address), one thread per client, a config
+//! watcher and a meter pump.
 //!
 //! The server is the single writer of config.json for remote edits: every command is applied to the
 //! freshest file (read under the config lock), saved atomically, pushed into the graph, and broadcast
 //! to every client as a delta. Edits other writers make (the GTK window) are picked up by the watcher
 //! and broadcast the same way.
+//!
+//! Safety (breaker #36): every bus write is clamped to the bus's hard ceiling (config `max_db`, #35);
+//! a soft cap is lifted only by a per-connection unlock that expires after 60 s and dies with the
+//! connection; a physical bus rises at most MAX_STEP_DB per command and MAX_RAISE_PER_WINDOW_DB per
+//! RAISE_WINDOW_S across all clients. Pre-auth: small frames, a connection cap and a wall-clock Hello
+//! deadline.
 use super::backend::Backend;
 use super::model;
 use crate::config::{self, Config};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+use tungstenite::protocol::WebSocketConfig;
 use tungstenite::Message;
 use wavelink_proto::{self as p, safety, ClientMsg, ErrorCode, ServerMsg};
 
 pub struct Opts {
+    /// Address to listen on, or several separated by commas ("192.168.1.157,127.0.0.1").
     pub bind: String,
     pub port: u16,
     pub token: String,
@@ -29,10 +38,17 @@ pub struct Opts {
 
 /// Messages queued per client before it counts as stalled and is dropped (it reconnects and resyncs).
 const QUEUE: usize = 512;
-const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+/// From TCP accept to a valid Hello, wall clock, whatever else arrives (pings, a trickled handshake).
+pub const HELLO_DEADLINE: Duration = Duration::from_secs(5);
 /// A client that sends nothing (not even its ping) for this long is dropped.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const WATCH_EVERY: Duration = Duration::from_millis(250);
+/// Largest WebSocket message/frame accepted. A Hello or a command is well under 1 KiB; 128 KiB still
+/// lets an oversized (100 KB) token reach the auth check and get a proper `auth` refusal.
+pub const MAX_MSG: usize = 128 * 1024;
+/// Connections at once, and of those, not yet authenticated.
+pub const MAX_CONNS: usize = 16;
+pub const MAX_PREAUTH: usize = 4;
 
 struct Client {
     id: u64,
@@ -44,6 +60,14 @@ struct Core {
     cfg: Config,
     state: p::State,
     clients: Vec<Client>,
+    /// time-based raise limit per physical bus, shared by every client
+    limits: HashMap<String, safety::RaiseLimiter>,
+}
+
+struct Token {
+    value: String,
+    file: Option<PathBuf>,
+    mtime: Option<SystemTime>,
 }
 
 struct Inner {
@@ -52,9 +76,13 @@ struct Inner {
     core: Mutex<Core>,
     next_id: AtomicU64,
     stop: AtomicBool,
+    conns: AtomicUsize,
+    preauth: AtomicUsize,
+    token: Mutex<Token>,
+    clock: Instant,
 }
 
-/// A running server; dropping it stops the accept loop and the pumps (client threads end with their sockets).
+/// A running server; dropping it stops the accept loops and the pumps (client threads end with their sockets).
 pub struct Running {
     pub addr: SocketAddr,
     inner: Arc<Inner>,
@@ -66,49 +94,103 @@ impl Drop for Running {
     }
 }
 
-#[cfg(test)]
 impl Running {
+    #[cfg(test)]
     pub fn clients(&self) -> usize {
         self.inner.lock().clients.len()
     }
+
+    /// Listen on one more address (the "auto" bind adds LAN addresses that appear later).
+    pub fn listen(&self, bind: &str, port: u16) -> std::io::Result<SocketAddr> {
+        listen(&self.inner, bind, port)
+    }
+
+    /// Check Hello tokens against this file's current token (re-read when it changes: `remote-token --rotate`).
+    pub fn token_file(&self, p: PathBuf) {
+        self.inner.token.lock().unwrap_or_else(|e| e.into_inner()).file = Some(p);
+    }
+}
+
+/// Decrements a counter when dropped.
+struct Slot<'a>(&'a AtomicUsize);
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+fn take_slot(c: &AtomicUsize, max: usize) -> Option<Slot<'_>> {
+    let mut n = c.load(Ordering::SeqCst);
+    loop {
+        if n >= max {
+            return None;
+        }
+        match c.compare_exchange(n, n + 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return Some(Slot(c)),
+            Err(x) => n = x,
+        }
+    }
+}
+
+fn listen(inner: &Arc<Inner>, bind: &str, port: u16) -> std::io::Result<SocketAddr> {
+    let listener = TcpListener::bind((bind, port))?;
+    listener.set_nonblocking(true)?;
+    let addr = listener.local_addr()?;
+    let inner = inner.clone();
+    std::thread::Builder::new().name("remote-accept".into()).spawn(move || {
+        while !inner.stop.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((s, peer)) => {
+                    let inner = inner.clone();
+                    let _ = std::thread::Builder::new().name("remote-client".into()).spawn(move || {
+                        let Some(_total) = take_slot(&inner.conns, MAX_CONNS) else {
+                            eprintln!("wavelink remote: {peer}: refused, {MAX_CONNS} connections already");
+                            return; // dropping the stream closes it
+                        };
+                        match inner.conn(s, peer) {
+                            Err(e) if e.contains("without closing handshake") => {}
+                            Err(e) => eprintln!("wavelink remote: {peer}: {e}"),
+                            Ok(()) => {}
+                        }
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(25)),
+                Err(e) => {
+                    eprintln!("wavelink remote: accept: {e}");
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
+        }
+    })?;
+    Ok(addr)
 }
 
 pub fn serve(opts: Opts, backend: Arc<dyn Backend>) -> std::io::Result<Running> {
-    let listener = TcpListener::bind((opts.bind.as_str(), opts.port))?;
-    listener.set_nonblocking(true)?;
-    let addr = listener.local_addr()?;
+    let binds: Vec<String> = opts.bind.split(',').map(|b| b.trim().to_string()).filter(|b| !b.is_empty()).collect();
+    if binds.is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "no address to listen on"));
+    }
     let cfg = Config::load_from(&opts.cfg_path);
     let state = model::to_state(&cfg, &opts.name, 1, &opts.caps);
+    let port = opts.port;
+    let token = Token { value: opts.token.clone(), file: None, mtime: None };
     let inner = Arc::new(Inner {
         opts,
         backend,
-        core: Mutex::new(Core { cfg, state, clients: vec![] }),
+        core: Mutex::new(Core { cfg, state, clients: vec![], limits: HashMap::new() }),
         next_id: AtomicU64::new(1),
         stop: AtomicBool::new(false),
+        conns: AtomicUsize::new(0),
+        preauth: AtomicUsize::new(0),
+        token: Mutex::new(token),
+        clock: Instant::now(),
     });
-    {
-        let inner = inner.clone();
-        std::thread::Builder::new().name("remote-accept".into()).spawn(move || {
-            while !inner.stop.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((s, peer)) => {
-                        let inner = inner.clone();
-                        let _ = std::thread::Builder::new().name("remote-client".into()).spawn(move || {
-                            match inner.conn(s) {
-                                Err(e) if e.contains("without closing handshake") => {}
-                                Err(e) => eprintln!("wavelink remote: {peer}: {e}"),
-                                Ok(()) => {}
-                            }
-                        });
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(25)),
-                    Err(e) => {
-                        eprintln!("wavelink remote: accept: {e}");
-                        std::thread::sleep(Duration::from_millis(500));
-                    }
-                }
-            }
-        })?;
+    // the first address must work (the caller reports it); later ones are best effort
+    let addr = listen(&inner, &binds[0], port)?;
+    let run = Running { addr, inner: inner.clone() };
+    for b in &binds[1..] {
+        if let Err(e) = listen(&inner, b, port) {
+            eprintln!("wavelink remote: can't listen on {b}:{port}: {e}");
+        }
     }
     {
         let inner = inner.clone();
@@ -152,7 +234,7 @@ pub fn serve(opts: Opts, backend: Arc<dyn Backend>) -> std::io::Result<Running> 
             }
         })?;
     }
-    Ok(Running { addr, inner })
+    Ok(run)
 }
 
 fn ct_eq(a: &str, b: &str) -> bool {
@@ -164,9 +246,44 @@ fn io_timeout(e: &tungstenite::Error) -> bool {
     matches!(e, tungstenite::Error::Io(io) if matches!(io.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut))
 }
 
+/// A client-chosen name, safe for one log line: printable, no control characters, at most 64 chars.
+pub fn sanitize_name(s: &str) -> String {
+    let t: String = s.chars().filter(|c| !c.is_control()).take(64).collect();
+    if t.trim().is_empty() {
+        "unnamed".into()
+    } else {
+        t
+    }
+}
+
+fn ws_config() -> WebSocketConfig {
+    WebSocketConfig::default().max_message_size(Some(MAX_MSG)).max_frame_size(Some(MAX_MSG))
+}
+
 impl Inner {
     fn lock(&self) -> std::sync::MutexGuard<'_, Core> {
         self.core.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn now_s(&self) -> f64 {
+        self.clock.elapsed().as_secs_f64()
+    }
+
+    fn token_ok(&self, got: &str) -> bool {
+        let mut t = self.token.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(f) = t.file.clone() {
+            let m = std::fs::metadata(&f).and_then(|m| m.modified()).ok();
+            if m != t.mtime {
+                if let Some(v) = super::settings::read_token(&f) {
+                    if t.mtime.is_some() && v != t.value {
+                        eprintln!("wavelink remote: token changed in {}", f.display());
+                    }
+                    t.value = v;
+                }
+                t.mtime = m;
+            }
+        }
+        ct_eq(got.trim(), &t.value)
     }
 
     /// Queue `msg` for every client; a client whose queue is full or gone is dropped.
@@ -209,15 +326,36 @@ impl Inner {
         }
     }
 
-    fn command(&self, id: u64, cmd: &p::Command) -> ServerMsg {
+    /// `unlocked(bus)` = the sending connection holds a live unlock for that bus.
+    fn command(&self, id: u64, cmd: &p::Command, unlocked: &dyn Fn(&str) -> bool) -> ServerMsg {
         let nack = |e: String| ServerMsg::Ack { id, ok: false, error: Some(e), note: None };
         let mut core = self.lock();
         let flock = config::lock_config(&self.opts.cfg_path);
         self.sync_disk(&mut core);
-        let checked = match safety::check(cmd, &core.state) {
+        let mut checked = match safety::check(cmd, &core.state, unlocked) {
             Ok(c) => c,
             Err(e) => return nack(e.to_string()),
         };
+        // the time-based raise limit (B36-1/2): shared by all clients, decreases never limited
+        let now = self.now_s();
+        let mut raised = vec![];
+        for c in checked.cmds.iter_mut() {
+            if let p::Command::SetBusGain { bus, db, .. } = c {
+                let Some(b) = core.state.bus(bus) else { continue };
+                if !b.physical() {
+                    continue;
+                }
+                let cur = b.gain_db;
+                if *db > cur {
+                    let allowed = core.limits.entry(bus.clone()).or_default().allowed(now, cur);
+                    if *db > allowed {
+                        *db = allowed.max(cur);
+                        checked.note = Some(format!("raised at most {} dB per {} s", safety::MAX_RAISE_PER_WINDOW_DB, safety::RAISE_WINDOW_S));
+                    }
+                }
+                raised.push((bus.clone(), cur, *db));
+            }
+        }
         let mut cfg = core.cfg.clone();
         for c in &checked.cmds {
             if !model::apply(&mut cfg, c) {
@@ -228,6 +366,11 @@ impl Inner {
             return nack("could not save config.json".into());
         }
         drop(flock);
+        for (bus, before, _) in raised {
+            // what was really written (model::apply clamps to the ceiling too)
+            let after = cfg.buses.iter().find(|b| b.id == bus).map(|b| b.gain_db).unwrap_or(before);
+            core.limits.entry(bus).or_default().record(now, before, after);
+        }
         for c in &checked.cmds {
             self.backend.apply(&cfg, c);
         }
@@ -235,12 +378,30 @@ impl Inner {
         ServerMsg::Ack { id, ok: true, error: None, note: checked.note }
     }
 
-    fn conn(self: &Arc<Self>, s: TcpStream) -> Result<(), String> {
+    fn conn(self: &Arc<Self>, s: TcpStream, peer: SocketAddr) -> Result<(), String> {
+        let deadline = Instant::now() + HELLO_DEADLINE;
+        let Some(pre) = take_slot(&self.preauth, MAX_PREAUTH) else {
+            return Err(format!("refused, {MAX_PREAUTH} unauthenticated connections already"));
+        };
+        let left = || deadline.saturating_duration_since(Instant::now());
         s.set_nonblocking(false).map_err(|e| e.to_string())?;
         s.set_nodelay(true).ok();
-        s.set_read_timeout(Some(HELLO_TIMEOUT)).map_err(|e| e.to_string())?;
         s.set_write_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
-        let mut ws = tungstenite::accept(s).map_err(|e| format!("handshake: {e}"))?;
+        // short read timeouts so the wall-clock deadline is checked while the peer trickles bytes
+        s.set_read_timeout(Some(Duration::from_millis(200))).map_err(|e| e.to_string())?;
+        let mut hs = tungstenite::accept_with_config(s, Some(ws_config()));
+        let mut ws = loop {
+            match hs {
+                Ok(ws) => break ws,
+                Err(tungstenite::HandshakeError::Interrupted(mid)) => {
+                    if left().is_zero() {
+                        return Err("no handshake before the deadline".into());
+                    }
+                    hs = mid.handshake();
+                }
+                Err(tungstenite::HandshakeError::Failure(e)) => return Err(format!("handshake: {e}")),
+            }
+        };
         let send = |ws: &mut tungstenite::WebSocket<TcpStream>, m: &ServerMsg| ws.send(Message::text(m.to_json())).map_err(|e| e.to_string());
         let refuse = |ws: &mut tungstenite::WebSocket<TcpStream>, code: ErrorCode, msg: &str| {
             let _ = send(ws, &ServerMsg::Error { code, message: msg.into() });
@@ -248,12 +409,19 @@ impl Inner {
             let _ = ws.flush();
             Err(msg.to_string())
         };
-        // first frame must be Hello with the right protocol and token
+        // first frame must be Hello with the right protocol and token, within the deadline
         let hello = loop {
+            if left().is_zero() {
+                return refuse(&mut ws, ErrorCode::BadRequest, "no hello within 5 s");
+            }
             match ws.read() {
                 Ok(Message::Text(t)) => break ClientMsg::from_json(t.as_str()),
-                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
+                    let _ = ws.flush(); // the auto pong
+                    continue;
+                }
                 Ok(_) => return refuse(&mut ws, ErrorCode::BadRequest, "expected hello"),
+                Err(e) if io_timeout(&e) => continue,
                 Err(e) => return Err(format!("no hello: {e}")),
             }
         };
@@ -265,10 +433,11 @@ impl Inner {
             let m = format!("protocol {} not supported (server speaks {})", hello.protocol, p::PROTOCOL_VERSION);
             return refuse(&mut ws, ErrorCode::Protocol, &m);
         }
-        if !ct_eq(hello.token.trim(), &self.opts.token) {
+        if !self.token_ok(&hello.token) {
             std::thread::sleep(Duration::from_millis(400)); // slows guessing
             return refuse(&mut ws, ErrorCode::Auth, "bad token");
         }
+        drop(pre); // authenticated: no longer counts against the pre-auth cap
         send(&mut ws, &ServerMsg::Welcome { protocol: p::PROTOCOL_VERSION, server: self.opts.name.clone(), version: env!("CARGO_PKG_VERSION").into() })?;
         let (tx, rx) = mpsc::sync_channel::<Arc<str>>(QUEUE);
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
@@ -280,31 +449,47 @@ impl Inner {
             let _ = tx.try_send(ServerMsg::State { state: core.state.clone() }.to_json().into());
             core.clients.push(Client { id, tx, meters: meters.clone() });
         }
-        eprintln!("wavelink remote: client {id} connected ({})", if hello.client.is_empty() { "unnamed" } else { &hello.client });
-        let r = self.client_loop(&mut ws, &rx, &meters);
+        let who = format!("client {id} ({}, {peer})", sanitize_name(&hello.client));
+        eprintln!("wavelink remote: {who} connected");
+        let r = self.client_loop(&mut ws, &rx, &meters, &who);
         self.lock().clients.retain(|c| c.id != id);
         let _ = ws.close(None);
         let _ = ws.flush();
-        eprintln!("wavelink remote: client {id} left");
+        eprintln!("wavelink remote: {who} left");
         r
     }
 
-    fn client_loop(&self, ws: &mut tungstenite::WebSocket<TcpStream>, rx: &mpsc::Receiver<Arc<str>>, meters: &AtomicBool) -> Result<(), String> {
+    fn client_loop(&self, ws: &mut tungstenite::WebSocket<TcpStream>, rx: &mpsc::Receiver<Arc<str>>, meters: &AtomicBool, who: &str) -> Result<(), String> {
         ws.get_ref().set_read_timeout(Some(Duration::from_millis(15))).map_err(|e| e.to_string())?;
         let mut heard = Instant::now();
-        loop {
+        // this connection's unlocks: bus -> expiry. Gone with the connection.
+        let mut unlocks: HashMap<String, Instant> = HashMap::new();
+        let result = loop {
             if self.stop.load(Ordering::SeqCst) {
-                return Ok(());
+                break Ok(());
+            }
+            let now = Instant::now();
+            let expired: Vec<String> = unlocks.iter().filter(|(_, t)| **t <= now).map(|(b, _)| b.clone()).collect();
+            for b in expired {
+                unlocks.remove(&b);
+                eprintln!("wavelink remote: {who}: unlock of bus {b} expired");
+                if let Err(e) = ws.write(Message::text(ServerMsg::Unlock { bus: b, seconds: 0 }.to_json())) {
+                    return Err(e.to_string());
+                }
             }
             match ws.read() {
                 Ok(Message::Text(t)) => {
                     heard = Instant::now();
                     let reply = match ClientMsg::from_json(t.as_str()) {
-                        Ok(ClientMsg::Command { id, cmd }) => Some(self.command(id, &cmd)),
+                        Ok(ClientMsg::Command { id, cmd }) => {
+                            let live = |b: &str| unlocks.get(b).is_some_and(|t| *t > Instant::now());
+                            Some(self.command(id, &cmd, &live))
+                        }
                         Ok(ClientMsg::Subscribe { meters: on }) => {
                             meters.store(on, Ordering::Relaxed);
                             None
                         }
+                        Ok(ClientMsg::Unlock { bus, on }) => Some(self.unlock(&mut unlocks, &bus, on, who)),
                         Ok(ClientMsg::Ping { t }) => Some(ServerMsg::Pong { t }),
                         Ok(ClientMsg::Hello(_)) => Some(ServerMsg::Error { code: ErrorCode::BadRequest, message: "already greeted".into() }),
                         Err(e) => Some(ServerMsg::Error { code: ErrorCode::BadRequest, message: format!("bad message: {e}") }),
@@ -313,11 +498,11 @@ impl Inner {
                         ws.write(Message::text(r.to_json())).map_err(|e| e.to_string())?;
                     }
                 }
-                Ok(Message::Close(_)) => return Ok(()),
+                Ok(Message::Close(_)) => break Ok(()),
                 Ok(_) => heard = Instant::now(), // ping/pong/binary: alive
                 Err(e) if io_timeout(&e) => {}
-                Err(tungstenite::Error::ConnectionClosed) | Err(tungstenite::Error::AlreadyClosed) => return Ok(()),
-                Err(e) => return Err(e.to_string()),
+                Err(tungstenite::Error::ConnectionClosed) | Err(tungstenite::Error::AlreadyClosed) => break Ok(()),
+                Err(e) => break Err(e.to_string()),
             }
             loop {
                 match rx.try_recv() {
@@ -329,11 +514,39 @@ impl Inner {
             match ws.flush() {
                 Ok(()) => {}
                 Err(e) if io_timeout(&e) => {}
-                Err(e) => return Err(e.to_string()),
+                Err(e) => break Err(e.to_string()),
             }
             if heard.elapsed() > IDLE_TIMEOUT {
-                return Err("idle timeout".into());
+                break Err("idle timeout".into());
             }
+        };
+        for b in unlocks.keys() {
+            eprintln!("wavelink remote: {who}: unlock of bus {b} cleared (disconnect)");
+        }
+        result
+    }
+
+    /// Unlock (or relock) a bus's soft cap for one connection, for safety::UNLOCK_S seconds.
+    fn unlock(&self, unlocks: &mut HashMap<String, Instant>, bus: &str, on: bool, who: &str) -> ServerMsg {
+        let cap = {
+            let core = self.lock();
+            match core.state.bus(bus) {
+                Some(b) => b.max_db,
+                None => return ServerMsg::Error { code: ErrorCode::BadRequest, message: format!("unknown bus '{}'", sanitize_name(bus)) },
+            }
+        };
+        if on {
+            let Some(cap) = cap else {
+                return ServerMsg::Error { code: ErrorCode::BadRequest, message: format!("bus {bus} has no cap to unlock") };
+            };
+            unlocks.insert(bus.to_string(), Instant::now() + Duration::from_secs(safety::UNLOCK_S));
+            eprintln!("wavelink remote: {who}: UNLOCKED bus {bus} above its {cap} dB cap for {} s (the ceiling still holds)", safety::UNLOCK_S);
+            ServerMsg::Unlock { bus: bus.into(), seconds: safety::UNLOCK_S as u32 }
+        } else {
+            if unlocks.remove(bus).is_some() {
+                eprintln!("wavelink remote: {who}: relocked bus {bus}");
+            }
+            ServerMsg::Unlock { bus: bus.into(), seconds: 0 }
         }
     }
 }

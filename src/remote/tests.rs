@@ -25,6 +25,10 @@ impl Drop for Rig {
 }
 
 fn rig(tag: &str) -> Rig {
+    rig_with(tag, |_| {})
+}
+
+fn rig_with(tag: &str, edit: impl FnOnce(&mut Config)) -> Rig {
     let dir = std::env::temp_dir().join(format!("wavelink-remote-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let cfg_path = dir.join(".config/wavelink-mixer/config.json");
@@ -33,6 +37,7 @@ fn rig(tag: &str) -> Rig {
         2,
         Bus { id: "a3".into(), name: "Sonos".into(), color: "#ff9f0a".into(), kind: BusKind::Hardware { target: "raop_sonos_test".into() }, gain_db: -30.0, mute: false, max_db: None },
     );
+    edit(&mut c);
     assert!(c.save_to(&cfg_path));
     let fake = Arc::new(FakeBackend::default());
     let run = serve(
@@ -92,7 +97,15 @@ fn join(r: &Rig) -> (Ws, State) {
     }
 }
 
+/// Drop whatever is already queued (other clients' deltas), so the next deltas are this command's.
+fn drain(ws: &mut Ws) {
+    ws.get_ref().set_read_timeout(Some(Duration::from_millis(60))).unwrap();
+    while ws.read().is_ok() {}
+    ws.get_ref().set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+}
+
 fn cmd(ws: &mut Ws, id: u64, c: Command) -> (bool, Option<String>, Option<String>, Vec<Delta>) {
+    drain(ws);
     send(ws, &ClientMsg::Command { id, cmd: c });
     let mut deltas = vec![];
     // the ack and the delta may arrive in either order
@@ -208,21 +221,124 @@ fn speaker_cap_and_step_are_enforced_server_side() {
     let (_, _, note, d) = cmd(&mut a, 2, Command::SetBusGain { bus: "a3".into(), db: 0.0, unlock: false });
     assert!(note.unwrap().contains("capped at -20"));
     assert_eq!(d, vec![Delta::BusGain { bus: "a3".into(), db: -20.0 }]);
-    // at the cap: no change, no delta
+    // at the cap: no change, no delta; the command's own unlock flag changes nothing
     let (ok, _, _, d) = cmd(&mut a, 3, Command::SetBusGain { bus: "a3".into(), db: -5.0, unlock: false });
     assert!(ok && d.is_empty());
-    // unlock: past the cap, still one step at a time
-    let (_, _, _, d) = cmd(&mut a, 4, Command::SetBusGain { bus: "a3".into(), db: 0.0, unlock: true });
-    assert_eq!(d, vec![Delta::BusGain { bus: "a3".into(), db: -14.0 }]);
-    assert_eq!(Config::peek(&r.cfg).unwrap().buses.iter().find(|b| b.id == "a3").unwrap().gain_db, -14.0);
+    let (ok, _, _, d) = cmd(&mut a, 4, Command::SetBusGain { bus: "a3".into(), db: 0.0, unlock: true });
+    assert!(ok && d.is_empty(), "{d:?}");
+    // an unlock can't go past the hard ceiling: this AirPlay bus's ceiling is -20 too (#35)
+    assert_eq!(unlock(&mut a, "a3", true), 60);
+    let (_, _, note, d) = cmd(&mut a, 5, Command::SetBusGain { bus: "a3".into(), db: 0.0, unlock: false });
+    assert!(d.is_empty() && note.unwrap().contains("ceiling"));
     // down is never limited
-    let (_, _, _, d) = cmd(&mut a, 5, Command::SetBusGain { bus: "a3".into(), db: -60.0, unlock: false });
+    let (_, _, _, d) = cmd(&mut a, 6, Command::SetBusGain { bus: "a3".into(), db: -60.0, unlock: false });
     assert_eq!(d, vec![Delta::BusGain { bus: "a3".into(), db: -60.0 }]);
     // headphones: step limit, no cap
-    let (_, _, _, d) = cmd(&mut a, 6, Command::SetBusGain { bus: "a1".into(), db: 12.0, unlock: false });
+    let (_, _, _, d) = cmd(&mut a, 7, Command::SetBusGain { bus: "a1".into(), db: 12.0, unlock: false });
     assert_eq!(d, vec![Delta::BusGain { bus: "a1".into(), db: -4.2 + 6.0 }]);
     let applied = r.fake.applied.lock().unwrap();
-    assert!(applied.iter().all(|c| !matches!(c, Command::SetBusGain { bus, db, unlock: false } if bus == "a3" && *db > -20.0)));
+    assert!(applied.iter().all(|c| !matches!(c, Command::SetBusGain { bus, db, .. } if bus == "a3" && *db > -20.0)));
+}
+
+/// Send Unlock and return the seconds the server granted (0 = locked).
+fn unlock(ws: &mut Ws, bus: &str, on: bool) -> u32 {
+    send(ws, &ClientMsg::Unlock { bus: bus.into(), on });
+    loop {
+        match recv_np(ws) {
+            Some(ServerMsg::Unlock { bus: b, seconds }) if b == bus => return seconds,
+            Some(ServerMsg::Error { message, .. }) => panic!("unlock refused: {message}"),
+            Some(_) => {}
+            None => panic!("closed"),
+        }
+    }
+}
+
+#[test]
+fn unlock_is_per_connection_bounded_by_the_ceiling_and_rate_limited() {
+    // a raised ceiling (-10) above the speaker's soft cap (-20)
+    let r = rig_with("unlock", |c| c.buses.iter_mut().find(|b| b.id == "a3").unwrap().max_db = Some(-10.0));
+    let (mut a, st) = join(&r);
+    assert_eq!((st.bus("a3").unwrap().max_db, st.bus("a3").unwrap().ceiling_db), (Some(-20.0), Some(-10.0)));
+    let (mut b, _) = join(&r);
+    assert!(cmd(&mut a, 1, Command::SetBusGain { bus: "a3".into(), db: -20.0, unlock: false }).0); // -30 -> -24
+    assert!(cmd(&mut a, 2, Command::SetBusGain { bus: "a3".into(), db: -20.0, unlock: false }).0); // -> -20
+    assert_eq!(unlock(&mut a, "a3", true), 60);
+    // within the same second the raise budget (12 dB above the window's floor of -30) is nearly spent
+    let (_, _, note, d) = cmd(&mut a, 3, Command::SetBusGain { bus: "a3".into(), db: 0.0, unlock: false });
+    assert_eq!(d, vec![Delta::BusGain { bus: "a3".into(), db: -18.0 }]);
+    assert!(note.unwrap().contains("per 1 s"));
+    // the other connection holds no unlock: it can't go above the soft cap (only down)
+    let (ok, _, note, _) = cmd(&mut b, 4, Command::SetBusGain { bus: "a3".into(), db: -15.0, unlock: true });
+    assert!(ok && note.unwrap().contains("capped at -20"));
+    assert_eq!(Config::peek(&r.cfg).unwrap().buses.iter().find(|b| b.id == "a3").unwrap().gain_db, -20.0);
+    std::thread::sleep(Duration::from_millis(1100));
+    let (_, _, _, d) = cmd(&mut a, 5, Command::SetBusGain { bus: "a3".into(), db: 0.0, unlock: false });
+    assert_eq!(d, vec![Delta::BusGain { bus: "a3".into(), db: -14.0 }]);
+    // the hard ceiling holds even unlocked
+    let (_, _, note, d) = cmd(&mut a, 6, Command::SetBusGain { bus: "a3".into(), db: 0.0, unlock: false });
+    assert_eq!(d, vec![Delta::BusGain { bus: "a3".into(), db: -10.0 }]);
+    assert!(note.unwrap().contains("ceiling"));
+    assert_eq!(Config::peek(&r.cfg).unwrap().buses.iter().find(|b| b.id == "a3").unwrap().gain_db, -10.0);
+    // relock: back under the soft cap rules
+    assert_eq!(unlock(&mut a, "a3", false), 0);
+    let (_, _, _, d) = cmd(&mut a, 7, Command::SetBusGain { bus: "a3".into(), db: -12.0, unlock: false });
+    assert_eq!(d, vec![Delta::BusGain { bus: "a3".into(), db: -20.0 }]);
+    // an unlock dies with its connection
+    assert_eq!(unlock(&mut a, "a3", true), 60);
+    drop(a);
+    let (mut c, _) = join(&r);
+    let (_, _, note, _) = cmd(&mut c, 8, Command::SetBusGain { bus: "a3".into(), db: -14.0, unlock: true });
+    assert!(note.unwrap().contains("capped at -20"));
+    // a bus without a cap has nothing to unlock
+    send(&mut c, &ClientMsg::Unlock { bus: "b1".into(), on: true });
+    assert!(matches!(recv_np(&mut c), Some(ServerMsg::Error { code: ErrorCode::BadRequest, .. })));
+}
+
+#[test]
+fn remote_writes_respect_the_config_ceiling() {
+    // a user ceiling on the headphones (#35's max_db): the remote can never go above it
+    let r = rig_with("ceiling", |c| c.buses[0].max_db = Some(-10.0));
+    let (mut a, st) = join(&r);
+    assert_eq!(st.bus("a1").unwrap().ceiling_db, Some(-10.0));
+    assert_eq!(st.bus("a1").unwrap().max_db, Some(-10.0), "the soft cap is never above the ceiling");
+    let (_, _, _, d) = cmd(&mut a, 1, Command::SetBusGain { bus: "a1".into(), db: 12.0, unlock: false });
+    assert_eq!(d, vec![Delta::BusGain { bus: "a1".into(), db: -10.0 }]);
+    assert!(r.fake.applied.lock().unwrap().iter().all(|c| !matches!(c, Command::SetBusGain { db, .. } if *db > -10.0)));
+}
+
+#[test]
+fn connection_caps_hold() {
+    let r = rig("conncap");
+    // MAX_PREAUTH sockets that never say Hello: the next one is closed at once
+    let idle: Vec<_> = (0..super::server::MAX_PREAUTH).map(|_| connect(&r)).collect();
+    std::thread::sleep(Duration::from_millis(200));
+    let s = TcpStream::connect(r.run.addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let t0 = Instant::now();
+    let refused = tungstenite::client(format!("ws://{}/", r.run.addr), s).is_err();
+    assert!(refused && t0.elapsed() < Duration::from_secs(2), "a 5th pre-auth connection was served");
+    drop(idle);
+    std::thread::sleep(Duration::from_millis(300));
+    // MAX_CONNS authenticated sessions: the next connection is refused
+    let mut held = vec![];
+    for _ in 0..super::server::MAX_CONNS {
+        held.push(join(&r).0);
+    }
+    let s = TcpStream::connect(r.run.addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    assert!(tungstenite::client(format!("ws://{}/", r.run.addr), s).is_err());
+    drop(held);
+    // and once they are gone, a new client gets in
+    std::thread::sleep(Duration::from_millis(500));
+    let _ = join(&r);
+}
+
+#[test]
+fn client_names_are_sanitised_for_logs() {
+    assert_eq!(super::server::sanitize_name("Mac\nwavelink remote: client 9 connected (fake)"), "Macwavelink remote: client 9 connected (fake)");
+    assert_eq!(super::server::sanitize_name("\u{1b}[31mred"), "[31mred");
+    assert_eq!(super::server::sanitize_name(""), "unnamed");
+    assert_eq!(super::server::sanitize_name(&"x".repeat(500)).len(), 64);
 }
 
 #[test]
