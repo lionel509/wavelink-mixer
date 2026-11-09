@@ -306,20 +306,33 @@ fn remote_writes_respect_the_config_ceiling() {
     assert!(r.fake.applied.lock().unwrap().iter().all(|c| !matches!(c, Command::SetBusGain { db, .. } if *db > -10.0)));
 }
 
+/// Intended behaviour changed in fix round 3 (breaker #36 R2-1): a full set of silent pre-auth sockets no
+/// longer locks anyone out. A new connection is admitted and the OLDEST IDLE pending one is closed (per
+/// IP at MAX_PREAUTH_PER_IP, loopback exempt; overall at MAX_PREAUTH). The total cap still refuses beyond
+/// MAX_CONNS.
 #[test]
 fn connection_caps_hold() {
     let r = rig("conncap");
-    // MAX_PREAUTH sockets that never say Hello: the next one is closed at once
-    let idle: Vec<_> = (0..super::server::MAX_PREAUTH).map(|_| connect(&r)).collect();
-    std::thread::sleep(Duration::from_millis(200));
-    let s = TcpStream::connect(r.run.addr).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-    let t0 = Instant::now();
-    let refused = tungstenite::client(format!("ws://{}/", r.run.addr), s).is_err();
-    assert!(refused && t0.elapsed() < Duration::from_secs(2), "a 5th pre-auth connection was served");
-    drop(idle);
+    let alive = |ws: &mut Ws| -> bool {
+        ws.get_ref().set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        match ws.read() {
+            Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => true,
+            _ => false,
+        }
+    };
+    let mut idle: Vec<Ws> = (0..super::server::MAX_PREAUTH).map(|_| connect(&r)).collect();
     std::thread::sleep(Duration::from_millis(300));
-    // MAX_CONNS authenticated sessions: the next connection is refused
+    let mut newer = connect(&r);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!alive(&mut idle[0]), "the oldest idle pending socket was closed to make room");
+    assert!(alive(&mut idle[1]) && alive(&mut newer), "the others are still pending");
+    // and a real client always gets in, however many silent sockets came first
+    std::thread::sleep(Duration::from_millis(150));
+    let (mut ok, _) = join(&r);
+    assert!(cmd(&mut ok, 1, Command::SetInputMute { input: "mic".into(), mute: true }).0);
+    drop((idle, newer, ok));
+    std::thread::sleep(Duration::from_millis(500));
+    // MAX_CONNS authenticated sessions: the next connection is refused (the total cap stays)
     let mut held = vec![];
     for _ in 0..super::server::MAX_CONNS {
         held.push(join(&r).0);
@@ -331,6 +344,47 @@ fn connection_caps_hold() {
     // and once they are gone, a new client gets in
     std::thread::sleep(Duration::from_millis(500));
     let _ = join(&r);
+}
+
+#[test]
+fn preauth_admission_policy() {
+    use super::server::{admit_policy, Admit, MAX_PREAUTH, PREAUTH_IDLE};
+    use std::net::{IpAddr, Ipv4Addr};
+    let (a, b, lo) = (IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), IpAddr::V4(Ipv4Addr::new(192, 168, 1, 60)), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let idle = PREAUTH_IDLE * 3;
+    let fresh = Duration::from_millis(5);
+    // per-IP cap: a's own oldest idle socket goes; a peer with only fresh sockets is refused (hurts itself)
+    assert_eq!(admit_policy(&[(a, idle * 2), (a, idle)], a), Admit::Evict(0));
+    assert_eq!(admit_policy(&[(a, fresh), (a, fresh)], a), Admit::Refuse);
+    assert_eq!(admit_policy(&[(a, fresh), (a, fresh)], b), Admit::Ok);
+    // loopback is exempt from the per-IP cap
+    assert_eq!(admit_policy(&[(lo, fresh), (lo, fresh)], lo), Admit::Ok);
+    // overall cap: silent sockets from 2 hosts never lock out a third
+    let full = vec![(a, idle * 4), (a, idle * 3), (b, idle * 2), (b, idle)];
+    assert_eq!(full.len(), MAX_PREAUTH);
+    assert_eq!(admit_policy(&full, lo), Admit::Evict(0));
+    // fresh sockets are never closed; brief overflow allowed, then refused
+    let busy: Vec<_> = (0..MAX_PREAUTH).map(|_| (lo, fresh)).collect();
+    assert_eq!(admit_policy(&busy, lo), Admit::Ok);
+    let flood: Vec<_> = (0..2 * MAX_PREAUTH).map(|_| (lo, fresh)).collect();
+    assert_eq!(admit_policy(&flood, lo), Admit::Refuse);
+}
+
+#[test]
+fn airplay_by_props_only_shows_the_capped_gain() {
+    // a renamed AirPlay sink: nothing in its name, only the node props say so
+    let r = rig_with("props", |c| {
+        c.buses[1].kind = BusKind::Hardware { target: "living_room".into() };
+        c.buses[1].gain_db = -5.0;
+    });
+    r.fake.raop_nodes.lock().unwrap().push("living_room".into());
+    let (mut a, st) = join(&r);
+    assert_eq!(st.bus("a2").unwrap().ceiling_db, None, "unknown until the graph is asked");
+    let (ok, ..) = cmd(&mut a, 1, Command::SetBusGain { bus: "a2".into(), db: -3.0, unlock: false });
+    assert!(ok);
+    let c = Config::peek(&r.cfg).unwrap();
+    let a2 = c.buses.iter().find(|b| b.id == "a2").unwrap();
+    assert_eq!((a2.max_db, a2.gain_db), (Some(-20.0), -20.0), "ceiling saved and the gain shown as what the speaker plays");
 }
 
 #[test]

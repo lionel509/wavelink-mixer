@@ -46,9 +46,11 @@ const WATCH_EVERY: Duration = Duration::from_millis(250);
 /// Largest WebSocket message/frame accepted. A Hello or a command is well under 1 KiB; 128 KiB still
 /// lets an oversized (100 KB) token reach the auth check and get a proper `auth` refusal.
 pub const MAX_MSG: usize = 128 * 1024;
-/// Connections at once, and of those, not yet authenticated.
+/// Connections at once, and of those, not yet authenticated (in total and per peer IP; see admit_policy:
+/// at the cap the oldest IDLE pending socket is closed instead of refusing the new one, R2-1).
 pub const MAX_CONNS: usize = 16;
 pub const MAX_PREAUTH: usize = 4;
+pub const MAX_PREAUTH_PER_IP: usize = 2;
 
 struct Client {
     id: u64,
@@ -67,7 +69,8 @@ struct Core {
 struct Token {
     value: String,
     file: Option<PathBuf>,
-    mtime: Option<SystemTime>,
+    /// (inode, mtime) of the file when last read: a rotate renames a new file in
+    mtime: Option<(u64, SystemTime)>,
 }
 
 struct Inner {
@@ -77,7 +80,10 @@ struct Inner {
     next_id: AtomicU64,
     stop: AtomicBool,
     conns: AtomicUsize,
-    preauth: AtomicUsize,
+    preauth: Mutex<Vec<Pending>>,
+    next_pre: AtomicU64,
+    /// bumped whenever the token in the file changes
+    token_gen: AtomicU64,
     token: Mutex<Token>,
     clock: Instant,
 }
@@ -86,6 +92,8 @@ struct Inner {
 pub struct Running {
     pub addr: SocketAddr,
     inner: Arc<Inner>,
+    /// addresses from `bind` that could not be bound at start
+    pub failed: Vec<String>,
 }
 
 impl Drop for Running {
@@ -118,6 +126,61 @@ impl Drop for Slot<'_> {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
+/// A pending socket is idle (evictable) once it has been waiting this long: a real client sends its
+/// Hello right after the handshake, so only silent sockets get here.
+pub const PREAUTH_IDLE: Duration = Duration::from_millis(100);
+
+#[derive(Debug, PartialEq)]
+pub enum Admit {
+    Ok,
+    /// close pending socket #i first, then decide again
+    Evict(usize),
+    Refuse,
+}
+
+/// Pre-auth admission (R2-1). `pending` = (peer IP, time waiting) of the unauthenticated sockets.
+/// - an IP at MAX_PREAUTH_PER_IP (loopback exempt) loses its own oldest idle socket, or is refused
+///   while all of its sockets are still fresh (it only hurts itself);
+/// - at MAX_PREAUTH overall, the oldest idle socket is closed; fresh ones are never closed, and up to
+///   2 x MAX_PREAUTH may be pending briefly before anything is refused.
+/// So silent sockets from other hosts can never keep a real client out.
+pub fn admit_policy(pending: &[(std::net::IpAddr, Duration)], ip: std::net::IpAddr) -> Admit {
+    let oldest_idle = |same: bool| {
+        pending.iter().enumerate().filter(|(_, (i, age))| (!same || *i == ip) && *age >= PREAUTH_IDLE).max_by_key(|(_, (_, age))| *age).map(|(k, _)| k)
+    };
+    if !ip.is_loopback() && pending.iter().filter(|(i, _)| *i == ip).count() >= MAX_PREAUTH_PER_IP {
+        return oldest_idle(true).map_or(Admit::Refuse, Admit::Evict);
+    }
+    if pending.len() >= MAX_PREAUTH {
+        if let Some(k) = oldest_idle(false) {
+            return Admit::Evict(k);
+        }
+        if pending.len() >= 2 * MAX_PREAUTH {
+            return Admit::Refuse;
+        }
+    }
+    Admit::Ok
+}
+
+/// An unauthenticated connection: who, since when, and a handle to close it if it must make room.
+struct Pending {
+    id: u64,
+    ip: std::net::IpAddr,
+    since: Instant,
+    sock: TcpStream,
+}
+
+/// Removes its pending entry when dropped (authenticated, refused, or gone).
+struct PreGuard<'a> {
+    inner: &'a Inner,
+    id: u64,
+}
+impl Drop for PreGuard<'_> {
+    fn drop(&mut self) {
+        self.inner.preauth.lock().unwrap_or_else(|e| e.into_inner()).retain(|p| p.id != self.id);
+    }
+}
+
 fn take_slot(c: &AtomicUsize, max: usize) -> Option<Slot<'_>> {
     let mut n = c.load(Ordering::SeqCst);
     loop {
@@ -180,18 +243,29 @@ pub fn serve(opts: Opts, backend: Arc<dyn Backend>) -> std::io::Result<Running> 
         next_id: AtomicU64::new(1),
         stop: AtomicBool::new(false),
         conns: AtomicUsize::new(0),
-        preauth: AtomicUsize::new(0),
+        preauth: Mutex::new(vec![]),
+        next_pre: AtomicU64::new(1),
+        token_gen: AtomicU64::new(0),
         token: Mutex::new(token),
         clock: Instant::now(),
     });
-    // the first address must work (the caller reports it); later ones are best effort
-    let addr = listen(&inner, &binds[0], port)?;
-    let run = Running { addr, inner: inner.clone() };
-    for b in &binds[1..] {
-        if let Err(e) = listen(&inner, b, port) {
-            eprintln!("wavelink remote: can't listen on {b}:{port}: {e}");
+    // every address is tried; serve() fails only if none works (127.0.0.1 still comes up when a LAN
+    // address is taken). The caller retries the failed ones later (Running::failed).
+    let (mut addr, mut failed, mut last_err) = (None, vec![], None);
+    for b in &binds {
+        match listen(&inner, b, port) {
+            Ok(a) => {
+                addr.get_or_insert(a);
+            }
+            Err(e) => {
+                eprintln!("wavelink remote: can't listen on {b}:{port}: {e}");
+                failed.push(b.clone());
+                last_err = Some(e);
+            }
         }
     }
+    let Some(addr) = addr else { return Err(last_err.unwrap()) };
+    let run = Running { addr, inner: inner.clone(), failed };
     {
         let inner = inner.clone();
         std::thread::Builder::new().name("remote-watch".into()).spawn(move || {
@@ -200,6 +274,7 @@ pub fn serve(opts: Opts, backend: Arc<dyn Backend>) -> std::io::Result<Running> 
                     let mut core = inner.lock();
                     inner.sync_disk(&mut core);
                 }
+                inner.refresh_token(); // a rotate drops the sessions on the old token (R2-2)
                 std::thread::sleep(WATCH_EVERY);
             }
         })?;
@@ -269,21 +344,53 @@ impl Inner {
         self.clock.elapsed().as_secs_f64()
     }
 
-    fn token_ok(&self, got: &str) -> bool {
+    /// Re-read the token file if it changed; a new token bumps `token_gen`, which ends every session
+    /// authenticated under the old one.
+    fn refresh_token(&self) {
         let mut t = self.token.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(f) = t.file.clone() {
-            let m = std::fs::metadata(&f).and_then(|m| m.modified()).ok();
-            if m != t.mtime {
-                if let Some(v) = super::settings::read_token(&f) {
-                    if t.mtime.is_some() && v != t.value {
-                        eprintln!("wavelink remote: token changed in {}", f.display());
-                    }
-                    t.value = v;
-                }
-                t.mtime = m;
+        let Some(f) = t.file.clone() else { return };
+        let m = std::fs::metadata(&f).and_then(|m| Ok((std::os::unix::fs::MetadataExt::ino(&m), m.modified()?))).ok();
+        if m == t.mtime {
+            return;
+        }
+        if let Some(v) = super::settings::read_token(&f) {
+            if v != t.value {
+                eprintln!("wavelink remote: token changed in {}; closing sessions on the old token", f.display());
+                t.value = v;
+                self.token_gen.fetch_add(1, Ordering::SeqCst);
             }
         }
-        ct_eq(got.trim(), &t.value)
+        t.mtime = m;
+    }
+
+    /// Ok(generation) when `got` is the current token.
+    fn token_ok(&self, got: &str) -> Option<u64> {
+        self.refresh_token();
+        let t = self.token.lock().unwrap_or_else(|e| e.into_inner());
+        ct_eq(got.trim(), &t.value).then(|| self.token_gen.load(Ordering::SeqCst))
+    }
+
+    /// Register an unauthenticated connection, closing the oldest idle pending one(s) to make room.
+    fn admit(&self, sock: &TcpStream, peer: SocketAddr) -> Result<PreGuard<'_>, String> {
+        let handle = sock.try_clone().map_err(|e| e.to_string())?;
+        let id = self.next_pre.fetch_add(1, Ordering::SeqCst);
+        let mut v = self.preauth.lock().unwrap_or_else(|e| e.into_inner());
+        let ip = peer.ip();
+        loop {
+            let now = Instant::now();
+            let view: Vec<(std::net::IpAddr, Duration)> = v.iter().map(|p| (p.ip, now.duration_since(p.since))).collect();
+            match admit_policy(&view, ip) {
+                Admit::Ok => break,
+                Admit::Refuse => return Err(format!("refused: too many unauthenticated connections from {ip}")),
+                Admit::Evict(i) => {
+                    let p = v.remove(i);
+                    eprintln!("wavelink remote: {}: idle pre-auth connection closed to make room for a new one", p.ip);
+                    let _ = p.sock.shutdown(std::net::Shutdown::Both);
+                }
+            }
+        }
+        v.push(Pending { id, ip, since: Instant::now(), sock: handle });
+        Ok(PreGuard { inner: self, id })
     }
 
     /// Queue `msg` for every client; a client whose queue is full or gone is dropped.
@@ -332,6 +439,24 @@ impl Inner {
         let mut core = self.lock();
         let flock = config::lock_config(&self.opts.cfg_path);
         self.sync_disk(&mut core);
+        // a destination that is AirPlay only by its node props gets its ceiling saved first (#35's rule),
+        // so the config, the state and the raise limiter show the capped gain the speaker really plays
+        if let p::Command::SetBusGain { bus, .. } | p::Command::SetBusMute { bus, .. } = cmd {
+            let mut cfg = core.cfg.clone();
+            if let Some(b) = cfg.buses.iter_mut().find(|b| &b.id == bus) {
+                let raop = match &b.kind {
+                    config::BusKind::Hardware { target } => b.max_db.is_none() && self.backend.node_is_raop(target),
+                    _ => false,
+                };
+                if raop && b.persist_raop_ceiling(true) {
+                    b.gain_db = b.clamp_db(b.gain_db);
+                    eprintln!("wavelink remote: bus {bus}: AirPlay destination (node props), ceiling {} dB saved", b.ceiling_db());
+                    if cfg.save_to(&self.opts.cfg_path) {
+                        self.publish(&mut core, cfg);
+                    }
+                }
+            }
+        }
         let mut checked = match safety::check(cmd, &core.state, unlocked) {
             Ok(c) => c,
             Err(e) => return nack(e.to_string()),
@@ -380,9 +505,7 @@ impl Inner {
 
     fn conn(self: &Arc<Self>, s: TcpStream, peer: SocketAddr) -> Result<(), String> {
         let deadline = Instant::now() + HELLO_DEADLINE;
-        let Some(pre) = take_slot(&self.preauth, MAX_PREAUTH) else {
-            return Err(format!("refused, {MAX_PREAUTH} unauthenticated connections already"));
-        };
+        let pre = self.admit(&s, peer)?;
         let left = || deadline.saturating_duration_since(Instant::now());
         s.set_nonblocking(false).map_err(|e| e.to_string())?;
         s.set_nodelay(true).ok();
@@ -433,10 +556,10 @@ impl Inner {
             let m = format!("protocol {} not supported (server speaks {})", hello.protocol, p::PROTOCOL_VERSION);
             return refuse(&mut ws, ErrorCode::Protocol, &m);
         }
-        if !self.token_ok(&hello.token) {
+        let Some(token_gen) = self.token_ok(&hello.token) else {
             std::thread::sleep(Duration::from_millis(400)); // slows guessing
             return refuse(&mut ws, ErrorCode::Auth, "bad token");
-        }
+        };
         drop(pre); // authenticated: no longer counts against the pre-auth cap
         send(&mut ws, &ServerMsg::Welcome { protocol: p::PROTOCOL_VERSION, server: self.opts.name.clone(), version: env!("CARGO_PKG_VERSION").into() })?;
         let (tx, rx) = mpsc::sync_channel::<Arc<str>>(QUEUE);
@@ -451,7 +574,7 @@ impl Inner {
         }
         let who = format!("client {id} ({}, {peer})", sanitize_name(&hello.client));
         eprintln!("wavelink remote: {who} connected");
-        let r = self.client_loop(&mut ws, &rx, &meters, &who);
+        let r = self.client_loop(&mut ws, &rx, &meters, &who, token_gen);
         self.lock().clients.retain(|c| c.id != id);
         let _ = ws.close(None);
         let _ = ws.flush();
@@ -459,7 +582,7 @@ impl Inner {
         r
     }
 
-    fn client_loop(&self, ws: &mut tungstenite::WebSocket<TcpStream>, rx: &mpsc::Receiver<Arc<str>>, meters: &AtomicBool, who: &str) -> Result<(), String> {
+    fn client_loop(&self, ws: &mut tungstenite::WebSocket<TcpStream>, rx: &mpsc::Receiver<Arc<str>>, meters: &AtomicBool, who: &str, token_gen: u64) -> Result<(), String> {
         ws.get_ref().set_read_timeout(Some(Duration::from_millis(15))).map_err(|e| e.to_string())?;
         let mut heard = Instant::now();
         // this connection's unlocks: bus -> expiry. Gone with the connection.
@@ -467,6 +590,11 @@ impl Inner {
         let result = loop {
             if self.stop.load(Ordering::SeqCst) {
                 break Ok(());
+            }
+            if self.token_gen.load(Ordering::SeqCst) != token_gen {
+                eprintln!("wavelink remote: {who}: token rotated, closing the session");
+                let _ = ws.write(Message::text(ServerMsg::Error { code: ErrorCode::Auth, message: "token rotated".into() }.to_json()));
+                break Err("token rotated".into());
             }
             let now = Instant::now();
             let expired: Vec<String> = unlocks.iter().filter(|(_, t)| **t <= now).map(|(b, _)| b.clone()).collect();
@@ -481,6 +609,9 @@ impl Inner {
                 Ok(Message::Text(t)) => {
                     heard = Instant::now();
                     let reply = match ClientMsg::from_json(t.as_str()) {
+                        Ok(ClientMsg::Command { .. }) if self.token_gen.load(Ordering::SeqCst) != token_gen => {
+                            break Err("token rotated".into());
+                        }
                         Ok(ClientMsg::Command { id, cmd }) => {
                             let live = |b: &str| unlocks.get(b).is_some_and(|t| *t > Instant::now());
                             Some(self.command(id, &cmd, &live))
