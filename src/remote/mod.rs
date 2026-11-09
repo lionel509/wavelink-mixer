@@ -27,8 +27,10 @@ pub fn start() {
         return;
     }
     let name = hostname();
+    let auto = rc.bind.trim().is_empty() || rc.bind.trim() == "auto";
+    let addrs = settings::bind_addrs(&rc.bind, rc.allow_meshnet, &settings::interfaces());
     let opts = server::Opts {
-        bind: rc.bind.clone(),
+        bind: addrs.join(","),
         port: rc.port,
         token: rc.token.clone(),
         cfg_path: crate::config::Config::path(),
@@ -37,13 +39,32 @@ pub fn start() {
     };
     match server::serve(opts, std::sync::Arc::new(backend::PwBackend::default())) {
         Ok(run) => {
-            eprintln!("wavelink remote: listening on {} (token in {})", run.addr, p.display());
+            run.token_file(p.clone());
+            eprintln!("wavelink remote: listening on {} port {} (token in {})", addrs.join(", "), rc.port, p.display());
             if rc.mdns {
                 mdns::advertise(format!("Wavelink Mixer on {name}"), run.addr.port());
             }
-            std::mem::forget(run); // lives as long as the engine
+            if auto {
+                // LAN addresses that appear later (Wi-Fi up after login, a new DHCP lease) get a listener too
+                let (meshnet, port) = (rc.allow_meshnet, rc.port);
+                let mut have: std::collections::HashSet<String> = addrs.into_iter().collect();
+                let _ = std::thread::Builder::new().name("remote-bind".into()).spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    for a in settings::bind_addrs("auto", meshnet, &settings::interfaces()) {
+                        if !have.contains(&a) {
+                            match run.listen(&a, port) {
+                                Ok(_) => eprintln!("wavelink remote: now also listening on {a}:{port}"),
+                                Err(e) => eprintln!("wavelink remote: can't listen on {a}:{port}: {e}"),
+                            }
+                            have.insert(a); // tried once per address; an address that goes away just stays idle
+                        }
+                    }
+                });
+            } else {
+                std::mem::forget(run); // lives as long as the engine
+            }
         }
-        Err(e) => eprintln!("wavelink remote: can't listen on {}:{}: {e}", rc.bind, rc.port),
+        Err(e) => eprintln!("wavelink remote: can't listen on {}:{}: {e}", addrs.join(","), rc.port),
     }
 }
 
@@ -51,24 +72,32 @@ pub fn hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname").map(|s| s.trim().to_string()).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "wavelink".into())
 }
 
-/// `wavelink-mixer remote-token`: print what a client needs to connect.
-pub fn print_info() -> i32 {
-    match settings::load_or_create(&settings::path()) {
+/// `wavelink-mixer remote-token [--rotate]`: print what a client needs to connect (a new token with --rotate).
+pub fn print_info(args: &[String]) -> i32 {
+    let p = settings::path();
+    if args.iter().any(|a| a == "--rotate") {
+        match settings::rotate(&p) {
+            Ok(_) => println!("new token written to {} (the engine uses it from the next connection; reconnect clients with it)", p.display()),
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        }
+    }
+    match settings::load_or_create(&p) {
         Ok(rc) => {
             // avahi may have renamed the host on a name clash (bazzite-2.local), so show its real name and the LAN IPs
             let mdns = crate::pw::output_timeout("avahi-resolve", &["-a", "127.0.0.1"], std::time::Duration::from_secs(2))
                 .and_then(|o| String::from_utf8(o).ok())
                 .and_then(|s| s.split_whitespace().nth(1).map(String::from))
                 .unwrap_or_else(|| format!("{}.local", hostname()));
-            let ips = crate::pw::output_timeout("ip", &["-4", "-o", "addr", "show", "scope", "global"], std::time::Duration::from_secs(2))
-                .and_then(|o| String::from_utf8(o).ok())
-                .map(|s| lan_ips(&s))
-                .unwrap_or_default();
+            let ifs = settings::interfaces();
             println!("port:  {}", rc.port);
             println!("host:  {mdns}");
-            for (dev, ip) in ips {
+            for (dev, ip) in settings::lan_addrs(&ifs, rc.allow_meshnet) {
                 println!("ip:    {ip}  ({dev})");
             }
+            println!("bind:  {}", settings::bind_addrs(&rc.bind, rc.allow_meshnet, &ifs).join(", "));
             println!("token: {}", rc.token);
             0
         }
@@ -79,27 +108,9 @@ pub fn print_info() -> i32 {
     }
 }
 
-/// (interface, IPv4) from `ip -4 -o addr`, skipping container bridges.
-fn lan_ips(out: &str) -> Vec<(String, String)> {
-    out.lines()
-        .filter_map(|l| {
-            let f: Vec<&str> = l.split_whitespace().collect();
-            let dev = f.get(1)?.to_string();
-            let ip = f.iter().position(|x| *x == "inet").and_then(|i| f.get(i + 1))?.split('/').next()?.to_string();
-            (!["podman", "docker", "veth", "virbr", "br-"].iter().any(|p| dev.starts_with(p))).then_some((dev, ip))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 #[path = "breaker36.rs"]
 mod breaker36;
 
-#[cfg(test)]
-#[test]
-fn lan_ips_skip_bridges() {
-    let out = "2: enp14s0    inet 192.168.1.231/24 brd 192.168.1.255 scope global dynamic\n3: podman0    inet 10.88.0.1/16 scope global\n4: wlp15s0    inet 192.168.1.157/24 scope global\n";
-    assert_eq!(lan_ips(out), vec![("enp14s0".into(), "192.168.1.231".into()), ("wlp15s0".into(), "192.168.1.157".into())]);
-}
