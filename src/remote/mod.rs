@@ -109,6 +109,11 @@ pub fn print_info(args: &[String]) -> i32 {
     }
 }
 
+/// `wavelink-mixer fake-engine [PORT]`: the engine's protocol server over a fake graph, for the remote console demo (#37).
+pub fn fake_engine(_args: &[String]) -> i32 {
+    todo!("U2: fake_engine")
+}
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

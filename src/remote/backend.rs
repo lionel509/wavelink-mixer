@@ -70,6 +70,8 @@ impl Backend for PwBackend {
 
     fn apply(&self, cfg: &Config, cmd: &p::Command) {
         match cmd {
+            // scaffold (U2 todo): host commands bypass the graph backend
+            p::Command::SetHostVolume { .. } | p::Command::SetHostMute { .. } => {}
             p::Command::SetInputGain { input, db } => {
                 if let Some(id) = self.node_id(&names::strip_in(input)) {
                     pw::set_volume(id, db_to_vol(*db));

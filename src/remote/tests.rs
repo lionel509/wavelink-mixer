@@ -83,7 +83,7 @@ fn recv_np(ws: &mut Ws) -> Option<ServerMsg> {
 }
 
 fn hello(ws: &mut Ws, token: &str, meters: bool) {
-    send(ws, &ClientMsg::Hello(Hello { protocol: PROTOCOL_VERSION, token: token.into(), client: "test".into(), meters }));
+    send(ws, &ClientMsg::Hello(Hello { protocol: PROTOCOL_VERSION, token: token.into(), client: "test".into(), meters, host: None }));
 }
 
 /// Connect, greet, return the socket and the first snapshot.
@@ -140,7 +140,7 @@ fn rejects_bad_token_and_protocol() {
     hello(&mut ws, "wrong", false);
     assert!(matches!(recv(&mut ws), Some(ServerMsg::Error { code: ErrorCode::Auth, .. })));
     let mut ws = connect(&r);
-    send(&mut ws, &ClientMsg::Hello(Hello { protocol: PROTOCOL_VERSION + 1, token: TOKEN.into(), client: String::new(), meters: false }));
+    send(&mut ws, &ClientMsg::Hello(Hello { protocol: PROTOCOL_VERSION + 1, token: TOKEN.into(), client: String::new(), meters: false, host: None }));
     assert!(matches!(recv(&mut ws), Some(ServerMsg::Error { code: ErrorCode::Protocol, .. })));
     let mut ws = connect(&r);
     send(&mut ws, &ClientMsg::Ping { t: 1 });
@@ -505,4 +505,137 @@ fn client_leaving_is_unregistered() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(r.run.clients(), 0);
+}
+
+// ---------------------------------------------------------------- hosts (#37): a MacBook's own system volume
+
+/// Greet as a host (a computer that owns its system volume).
+fn hello_host(ws: &mut Ws, id: &str, label: &str, volume: u8, mute: bool) {
+    let host = HostHello { id: id.into(), label: label.into(), volume, mute };
+    send(ws, &ClientMsg::Hello(Hello { protocol: PROTOCOL_VERSION, token: TOKEN.into(), client: "test-host".into(), meters: false, host: Some(host) }));
+}
+
+/// Wait for the welcome and the first snapshot of a host connection.
+fn join_host(r: &Rig, id: &str, label: &str, volume: u8, mute: bool) -> Ws {
+    let mut ws = connect(r);
+    hello_host(&mut ws, id, label, volume, mute);
+    assert!(matches!(recv_np(&mut ws), Some(ServerMsg::Welcome { .. })));
+    assert!(matches!(recv_np(&mut ws), Some(ServerMsg::State { .. })));
+    ws
+}
+
+/// Read until a delta matches `want` (other traffic is skipped), up to 3 s.
+fn wait_delta(ws: &mut Ws, want: impl Fn(&Delta) -> bool) -> Option<Delta> {
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(3) {
+        match recv_np(ws) {
+            Some(ServerMsg::Delta { changes, .. }) => {
+                if let Some(d) = changes.into_iter().find(|d| want(d)) {
+                    return Some(d);
+                }
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    None
+}
+
+/// The first error a socket reports (skipping anything else), if any.
+fn expect_error(ws: &mut Ws) -> Option<(ErrorCode, String)> {
+    for _ in 0..8 {
+        match recv_np(ws)? {
+            ServerMsg::Error { code, message } => return Some((code, message)),
+            _ => continue,
+        }
+    }
+    None
+}
+
+#[test]
+fn host_hello_registers_online_and_leaving_marks_offline() {
+    let r = rig("host-online");
+    let (mut watcher, _) = join(&r);
+    let mut host = join_host(&r, "macbook", "MacBook", 20, false);
+    let (_, st) = join(&r);
+    assert_eq!(st.hosts.len(), 1, "{:?}", st.hosts);
+    assert_eq!(st.hosts[0].id, "macbook");
+    assert!(st.hosts[0].online);
+    assert_eq!(st.hosts[0].volume, 20);
+
+    let _ = host.close(None);
+    let _ = host.flush();
+    let went = wait_delta(&mut watcher, |d| matches!(d, Delta::HostOnline { online: false, .. }));
+    assert_eq!(went, Some(Delta::HostOnline { host: "macbook".into(), online: false }));
+}
+
+#[test]
+fn host_volume_command_changes_state_only() {
+    let r = rig("host-volume");
+    let mut host = join_host(&r, "macbook", "MacBook", 50, false);
+    let (mut c, _) = join(&r);
+    let cfg_before = std::fs::read(&r.cfg).unwrap();
+
+    let (ok, _err, note, deltas) = cmd(&mut c, 1, Command::SetHostVolume { host: "macbook".into(), volume: 90 });
+    assert!(ok);
+    assert_eq!(note.as_deref(), Some("raised at most 25 per step"));
+    assert!(deltas.contains(&Delta::HostVolume { host: "macbook".into(), volume: 75 }), "{deltas:?}");
+    // the Mac itself hears about it (it applies the volume to CoreAudio from this delta)
+    assert_eq!(wait_delta(&mut host, |d| matches!(d, Delta::HostVolume { .. })), Some(Delta::HostVolume { host: "macbook".into(), volume: 75 }));
+
+    // host changes never touch config.json or the PipeWire backend
+    assert_eq!(std::fs::read(&r.cfg).unwrap(), cfg_before);
+    assert!(r.fake.applied.lock().unwrap().is_empty());
+
+    // a later config edit republishes the state: the host must survive it
+    let input = Config::default_config().inputs[0].id.clone();
+    let (ok, _, _, _) = cmd(&mut c, 2, Command::SetInputGain { input, db: -3.0 });
+    assert!(ok);
+    let (_, st) = join(&r);
+    assert_eq!(st.hosts.len(), 1, "a config edit dropped the host: {:?}", st.hosts);
+    assert_eq!(st.hosts[0].volume, 75);
+}
+
+#[test]
+fn host_state_report_overrides_and_broadcasts() {
+    let r = rig("host-report");
+    let mut host = join_host(&r, "macbook", "MacBook", 50, false);
+    let (mut c, _) = join(&r);
+    send(&mut host, &ClientMsg::HostState { volume: 12, mute: true });
+    assert_eq!(wait_delta(&mut c, |d| matches!(d, Delta::HostVolume { .. })), Some(Delta::HostVolume { host: "macbook".into(), volume: 12 }));
+    assert_eq!(wait_delta(&mut c, |d| matches!(d, Delta::HostMute { .. })), Some(Delta::HostMute { host: "macbook".into(), mute: true }));
+    let (_, st) = join(&r);
+    assert_eq!((st.hosts[0].volume, st.hosts[0].mute), (12, true));
+}
+
+#[test]
+fn newest_registration_owns_the_host() {
+    let r = rig("host-newest");
+    let mut old = join_host(&r, "macbook", "MacBook", 30, false);
+    let _new = join_host(&r, "macbook", "MacBook", 31, false);
+    let _ = old.close(None);
+    let _ = old.flush();
+    std::thread::sleep(Duration::from_millis(300));
+    let (_, st) = join(&r);
+    assert_eq!(st.hosts.len(), 1);
+    assert!(st.hosts[0].online, "the older socket leaving must not mark the newer one offline");
+}
+
+#[test]
+fn non_host_connection_cannot_report_host_state() {
+    let r = rig("host-plain");
+    let (mut c, _) = join(&r);
+    send(&mut c, &ClientMsg::HostState { volume: 10, mute: false });
+    assert!(matches!(expect_error(&mut c), Some((ErrorCode::BadRequest, _))));
+}
+
+#[test]
+fn bad_host_id_is_refused() {
+    let r = rig("host-badid");
+    let mut ws = connect(&r);
+    hello_host(&mut ws, "Mac Book!", "MacBook", 20, false);
+    match expect_error(&mut ws) {
+        Some((ErrorCode::BadRequest, msg)) => assert!(msg.contains("bad host id"), "{msg}"),
+        m => panic!("expected BadRequest, got {m:?}"),
+    }
 }

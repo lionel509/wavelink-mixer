@@ -14,7 +14,7 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-const CSS: &str = r#"
+pub(crate) const CSS: &str = r#"
 window, .main { background: #0e0e10; color: #e6e6e8; }
 .strip {
   background-color: #2b2c30;
@@ -427,7 +427,7 @@ fn label_x(text: &str) -> gtk::Label {
     l
 }
 
-fn label(text: &str, class: &str) -> gtk::Label {
+pub(crate) fn label(text: &str, class: &str) -> gtk::Label {
     let l = gtk::Label::new(Some(text));
     l.add_css_class(class);
     l
@@ -3043,5 +3043,23 @@ mod serial_tests {
         let s = include_str!("ui.rs");
         assert!(s.contains(concat!("self.side_q", ".push(")));
         assert!(!s.contains(concat!("cur.is_none() && s ", "== Side::Stereo")));
+    }
+}
+
+/// The loopback address the window's own link dials: the engine's port on 127.0.0.1, None when remote control is off (#37).
+pub(crate) fn host_link_addr(_rc: &crate::remote::settings::RemoteCfg) -> Option<String> {
+    todo!("U5: host_link_addr")
+}
+
+#[cfg(test)]
+mod host_link_tests {
+    use super::*;
+
+    #[test]
+    fn host_link_addr_is_loopback_on_the_engine_port_and_none_when_disabled() {
+        let on = crate::remote::settings::RemoteCfg { enabled: true, port: 8790, ..Default::default() };
+        assert_eq!(host_link_addr(&on).as_deref(), Some("127.0.0.1:8790"));
+        let off = crate::remote::settings::RemoteCfg { enabled: false, ..on };
+        assert_eq!(host_link_addr(&off), None);
     }
 }

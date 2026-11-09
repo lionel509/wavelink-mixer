@@ -656,6 +656,8 @@ impl Inner {
                         Ok(ClientMsg::Unlock { bus, on }) => Some(self.unlock(&mut unlocks, &bus, on, who)),
                         Ok(ClientMsg::Ping { t }) => Some(ServerMsg::Pong { t }),
                         Ok(ClientMsg::Hello(_)) => Some(ServerMsg::Error { code: ErrorCode::BadRequest, message: "already greeted".into() }),
+                        // scaffold (U2 todo): HostState is not handled yet; answers with a non-BadRequest error
+                        Ok(ClientMsg::HostState { .. }) => Some(ServerMsg::Error { code: ErrorCode::Other, message: "todo: host state".into() }),
                         Err(e) => Some(ServerMsg::Error { code: ErrorCode::BadRequest, message: format!("bad message: {e}") }),
                     };
                     if let Some(r) = reply {
