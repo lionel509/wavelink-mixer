@@ -19,6 +19,9 @@ use crate::piano::{KEYS, LOW_KEY, RATE};
 
 pub const N: usize = 4096;
 pub const HOP: usize = 256;
+/// The long window for bass pitch decisions (< 110 Hz): it ends where the short one ends, so it
+/// adds no latency.
+pub const LONG: usize = 8192;
 const KMAX: usize = 1000; // ~5.4 kHz
 const MAX_NOTES: usize = 14;
 
@@ -179,6 +182,12 @@ pub struct Analyzer {
     g: Vec<f32>,
     df: f32,
     stop_rel: f32,
+    fft2: Fft,
+    win2: Vec<f32>,
+    re2: Vec<f32>,
+    im2: Vec<f32>,
+    mag2: Vec<f32>,
+    long_ok: bool,
 }
 
 pub struct FrameOut {
@@ -209,14 +218,21 @@ impl Analyzer {
             g: vec![0.0; KMAX],
             df: RATE as f32 / N as f32,
             stop_rel: tun("STOP_REL", 0.22),
+            fft2: Fft::new(LONG),
+            win2: hann(LONG),
+            re2: vec![0.0; LONG],
+            im2: vec![0.0; LONG],
+            mag2: vec![0.0; LONG / 8],
+            long_ok: false,
         }
     }
 
     /// `get(i)` gives the (left, right) sample i of the N-sample window (i = 0 is N/2 before the
-    /// frame centre); with `stereo` false only the left is read and the centre is all ones.
-    pub fn analyse(&mut self, get: impl Fn(usize) -> (f32, f32), stereo: bool) -> FrameOut {
+    /// frame centre; down to N - LONG for the bass window); with `stereo` false only the left is read and the centre is all ones.
+    pub fn analyse(&mut self, get: impl Fn(isize) -> (f32, f32), stereo: bool) -> FrameOut {
+        self.long_ok = false;
         for i in 0..N {
-            let (a, b) = get(i);
+            let (a, b) = get(i as isize);
             // zero-phase: rotate by N/2 so phases refer to the frame centre and W is real
             let j = (i + N / 2) % N;
             self.lr[j] = a * self.win[i];
@@ -314,6 +330,42 @@ impl Analyzer {
             if (0..KEYS as i32).contains(&kr) && (kr - k as i32).abs() == 1 && !taken[kr as usize] {
                 k = kr as usize;
             }
+            // bass: decide between the semitone neighbours on the long window (2.7 Hz bins)
+            if key_hz(k) < 110.0 {
+                if !self.long_ok {
+                    let off = N as isize - LONG as isize;
+                    for i in 0..LONG {
+                        let (a, b) = get(off + i as isize);
+                        self.re2[i] = if stereo { 0.5 * (a + b) } else { a } * self.win2[i];
+                        self.im2[i] = 0.0;
+                    }
+                    self.fft2.run(&mut self.re2, &mut self.im2, false);
+                    for i in 0..self.mag2.len() {
+                        self.mag2[i] = (self.re2[i] * self.re2[i] + self.im2[i] * self.im2[i]).sqrt();
+                    }
+                    self.long_ok = true;
+                }
+                let df2 = RATE as f32 / LONG as f32;
+                let sc = |c: usize| -> f32 {
+                    let f = key_hz(c);
+                    (1..=8)
+                        .map(|h| {
+                            let x = h as f32 * f * (1.0 + 0.0002 * (h * h) as f32).sqrt() / df2;
+                            peak(&self.mag2, x, (0.015 * x).max(0.8)).map_or(0.0, |p| p.1) / (h as f32).sqrt()
+                        })
+                        .sum()
+                };
+                let mut bk = (sc(k), k);
+                for c in [k.wrapping_sub(1), k + 1] {
+                    if c < KEYS && !got[c] {
+                        let v = sc(c);
+                        if v > bk.0 * 1.15 {
+                            bk = (v, c);
+                        }
+                    }
+                }
+                k = bk.1;
+            }
             for j in k.saturating_sub(1)..=(k + 1).min(KEYS - 1) {
                 taken[j] = true;
             }
@@ -387,7 +439,7 @@ pub fn frames(l: &[f32], r: &[f32]) -> Frames {
         let c0 = (f * HOP) as isize - (N / 2) as isize;
         let fo = an.analyse(
             |i| {
-                let s = c0 + i as isize;
+                let s = c0 + i;
                 if s >= 0 && (s as usize) < len {
                     (l[s as usize], r[s as usize])
                 } else {
@@ -832,8 +884,8 @@ impl SubTracker {
             );
             self.step(&fo, &mut evs);
             self.frame += 1;
-            // keep N samples before the next frame's centre
-            let keep_from = (self.frame * HOP as u64).saturating_sub((N / 2) as u64);
+            // keep the long window's reach before the next frame's centre
+            let keep_from = (self.frame * HOP as u64).saturating_sub((LONG - N / 2) as u64);
             if keep_from > self.start + N as u64 {
                 let d = (keep_from - self.start) as usize;
                 self.buf.drain(..d.min(self.buf.len()));
