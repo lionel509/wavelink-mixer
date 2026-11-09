@@ -83,8 +83,8 @@ pub enum Why {
 ///     Dead / zero-node restarts obey the gap but not the caps: nothing plays then, and degrading
 ///     would leave the mixer silent; the 60 s gap bounds the rate.
 ///  3. Degraded = giving up on the current missing set (3 consecutive restarts left it unchanged,
-///     or a cap was reached while restarts keep failing; a loss after a stable graph is not that) and keeping the partial graph. Names outside it are still handled by
-///     1-2. It ends after 30 s of complete graph, on a structure change, when a cap-caused one
+///     or a cap was reached while restarts keep failing; a loss after a stable graph is not that)
+///     and keeping the partial graph. Names outside it are still handled by 1-2. It ends after 30 s of complete graph, on a structure change, when a cap-caused one
 ///     finds both caps below their limits again, and (one attempt) after an hour; when a dependency
 ///     comes back, the names it had gated are dropped from the set. A young child gets no verdict.
 ///  4. A structure change is the user's action: it restarts at once and resets the limiter.
@@ -120,12 +120,19 @@ pub struct Supervisor {
     last_set: Vec<String>,
     degraded: Option<Vec<String>>,
     degraded_by_cap: bool,
+    /// a wanted restart is waiting for the hard cap to free up (for logging)
+    deferred: bool,
 }
 
 impl Supervisor {
     /// Missing nodes the engine gave up restarting for (partial graph kept), if any.
     pub fn degraded(&self) -> Option<&[String]> {
         self.degraded.as_deref().filter(|d| !d.is_empty())
+    }
+
+    /// A restart is wanted but the hourly hard cap forbids it for now.
+    pub fn deferred_at_cap(&self) -> bool {
+        self.deferred
     }
 
     fn gap(&self) -> Duration {
@@ -184,6 +191,7 @@ impl Supervisor {
         self.failed_log.retain(|t| now.saturating_duration_since(*t) < hour);
         let hard = self.restart_log.len() >= HARD_CAP;
         let capped = self.failed_log.len() >= RESTART_CAP;
+        self.deferred = false;
 
         // per-name clocks. While some dependency is away (eligible below its maximum) a name that is
         // not missing may just be gated, so its clock keeps running; once everything is up again, or
@@ -216,8 +224,11 @@ impl Supervisor {
             if let Some(d) = &mut self.degraded {
                 d.retain(|n| !self.gated.contains(n));
             }
-            self.same_set = 0;
-            self.last_set.clear();
+            // the same-set count only forgets what this dependency gated; an unrelated node keeps counting
+            self.last_set.retain(|n| !self.gated.contains(n));
+            if self.last_set.is_empty() {
+                self.same_set = 0;
+            }
             self.stuck_restarts = 0; // a new situation, not one more failed restart
         }
         if eligible >= self.max_eligible {
@@ -328,7 +339,11 @@ impl Supervisor {
             return None;
         }
         let need = if capped { PENALTY_GAP.max(self.gap()) } else { self.gap() };
-        if hard || self.last_restart.map_or(false, |t| now.saturating_duration_since(t) < need) {
+        if hard {
+            self.deferred = true;
+            return None;
+        }
+        if self.last_restart.map_or(false, |t| now.saturating_duration_since(t) < need) {
             return None;
         }
         self.same_set = if fresh == self.last_set { self.same_set + 1 } else { 1 };
@@ -750,6 +765,7 @@ pub fn run() {
     let mut levels_pending = false;
     let mut sup = Supervisor::default();
     let mut was_degraded = false;
+    let mut was_deferred = false;
     let degraded_file = conf_dir.join("engine.degraded");
     let _ = std::fs::remove_file(&degraded_file); // never keep a stale state from a previous engine
     let mut hw: HashMap<String, (Child, String)> = HashMap::new();
@@ -821,6 +837,15 @@ pub fn run() {
                 was_degraded = false;
             }
             _ => {}
+        }
+        if sup.deferred_at_cap() != was_deferred {
+            was_deferred = sup.deferred_at_cap();
+            if was_deferred {
+                eprintln!("restart deferred: hourly restart cap reached, still missing {missing_names:?}; retrying when the oldest restart leaves the window");
+                let _ = std::fs::write(&degraded_file, format!("{}\n", missing_names.join("\n")));
+            } else if !was_degraded {
+                let _ = std::fs::remove_file(&degraded_file);
+            }
         }
         if let Some(why) = why {
             if let Some(mut c) = child.take() {
