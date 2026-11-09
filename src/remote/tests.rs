@@ -321,13 +321,12 @@ fn connection_caps_hold() {
         }
     };
     let mut idle: Vec<Ws> = (0..super::server::MAX_PREAUTH).map(|_| connect(&r)).collect();
-    std::thread::sleep(Duration::from_millis(300));
+    std::thread::sleep(super::server::PREAUTH_IDLE + Duration::from_millis(300)); // idle: 1 s past their handshake
     let mut newer = connect(&r);
     std::thread::sleep(Duration::from_millis(200));
     assert!(!alive(&mut idle[0]), "the oldest idle pending socket was closed to make room");
     assert!(alive(&mut idle[1]) && alive(&mut newer), "the others are still pending");
     // and a real client always gets in, however many silent sockets came first
-    std::thread::sleep(Duration::from_millis(150));
     let (mut ok, _) = join(&r);
     assert!(cmd(&mut ok, 1, Command::SetInputMute { input: "mic".into(), mute: true }).0);
     drop((idle, newer, ok));
@@ -350,12 +349,13 @@ fn connection_caps_hold() {
 fn preauth_admission_policy() {
     use super::server::{admit_policy, Admit, MAX_PREAUTH, PREAUTH_IDLE};
     use std::net::{IpAddr, Ipv4Addr};
-    let (a, b, lo) = (IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), IpAddr::V4(Ipv4Addr::new(192, 168, 1, 60)), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let ip = |d: u8| IpAddr::V4(Ipv4Addr::new(192, 168, 1, d));
+    let (a, b, c, real, lo) = (ip(50), ip(60), ip(61), ip(20), IpAddr::V4(Ipv4Addr::LOCALHOST));
     let idle = PREAUTH_IDLE * 3;
     let fresh = Duration::from_millis(5);
-    // per-IP cap: a's own oldest idle socket goes; a peer with only fresh sockets is refused (hurts itself)
+    // per-IP cap: the IP makes room by losing its own oldest socket (idle first), never someone else's
     assert_eq!(admit_policy(&[(a, idle * 2), (a, idle)], a), Admit::Evict(0));
-    assert_eq!(admit_policy(&[(a, fresh), (a, fresh)], a), Admit::Refuse);
+    assert_eq!(admit_policy(&[(a, fresh), (a, idle)], a), Admit::Evict(1));
     assert_eq!(admit_policy(&[(a, fresh), (a, fresh)], b), Admit::Ok);
     // loopback is exempt from the per-IP cap
     assert_eq!(admit_policy(&[(lo, fresh), (lo, fresh)], lo), Admit::Ok);
@@ -363,11 +363,29 @@ fn preauth_admission_policy() {
     let full = vec![(a, idle * 4), (a, idle * 3), (b, idle * 2), (b, idle)];
     assert_eq!(full.len(), MAX_PREAUTH);
     assert_eq!(admit_policy(&full, lo), Admit::Evict(0));
-    // fresh sockets are never closed; brief overflow allowed, then refused
+    // R3-1: a real client mid-handshake (its only socket) is never the victim while an IP holds 2
+    let p = [(real, Duration::ZERO), (a, fresh), (a, fresh), (b, fresh)];
+    assert!(matches!(admit_policy(&p, b), Admit::Evict(1) | Admit::Evict(2)));
+    // ... not even when it is idle-looking (handshake done long ago) and the flooder's are fresh
+    let p = [(real, idle), (a, fresh), (a, fresh), (b, fresh)];
+    assert!(matches!(admit_policy(&p, c), Admit::Evict(1) | Admit::Evict(2)));
+    // R3-2: a newcomer from an empty IP is never refused while some IP holds 2: a full IP loses one
+    let p: Vec<_> = (0..4u8).flat_map(|k| [(ip(70 + k), fresh), (ip(70 + k), fresh)]).collect();
+    assert_eq!(p.len(), 2 * MAX_PREAUTH);
+    assert!(matches!(admit_policy(&p, real), Admit::Evict(_)));
+    // everyone holds a single fresh socket: nobody is evicted, the newcomer waits in the overflow
+    let p = [(a, fresh), (b, fresh), (c, fresh), (real, fresh)];
+    assert_eq!(admit_policy(&p, ip(99)), Admit::Ok);
+    // ... but an idle single socket does make room
+    let p = [(a, fresh), (b, idle), (c, fresh), (real, fresh)];
+    assert_eq!(admit_policy(&p, ip(99)), Admit::Evict(1));
+    // a local loopback flood of fresh sockets: overflow, then refused (accepted: same-user processes have the token)
     let busy: Vec<_> = (0..MAX_PREAUTH).map(|_| (lo, fresh)).collect();
     assert_eq!(admit_policy(&busy, lo), Admit::Ok);
     let flood: Vec<_> = (0..2 * MAX_PREAUTH).map(|_| (lo, fresh)).collect();
     assert_eq!(admit_policy(&flood, lo), Admit::Refuse);
+    // ... while a LAN client is still let in past it
+    assert!(matches!(admit_policy(&flood, real), Admit::Evict(_)));
 }
 
 #[test]

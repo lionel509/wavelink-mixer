@@ -126,9 +126,10 @@ impl Drop for Slot<'_> {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
-/// A pending socket is idle (evictable) once it has been waiting this long: a real client sends its
-/// Hello right after the handshake, so only silent sockets get here.
-pub const PREAUTH_IDLE: Duration = Duration::from_millis(100);
+/// A pending socket is idle once this long has passed since its WebSocket handshake completed without a
+/// Hello: a real client sends Hello right after the handshake, even on a slow link. A socket still in
+/// its handshake is never idle (the 5 s Hello deadline bounds it).
+pub const PREAUTH_IDLE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, PartialEq)]
 pub enum Admit {
@@ -138,26 +139,48 @@ pub enum Admit {
     Refuse,
 }
 
-/// Pre-auth admission (R2-1). `pending` = (peer IP, time waiting) of the unauthenticated sockets.
-/// - an IP at MAX_PREAUTH_PER_IP (loopback exempt) loses its own oldest idle socket, or is refused
-///   while all of its sockets are still fresh (it only hurts itself);
-/// - at MAX_PREAUTH overall, the oldest idle socket is closed; fresh ones are never closed, and up to
-///   2 x MAX_PREAUTH may be pending briefly before anything is refused.
-/// So silent sockets from other hosts can never keep a real client out.
+/// Pre-auth admission (breaker #36 R2-1, R3-1, R3-2). `pending` = (peer IP, idle time) of the
+/// unauthenticated sockets, idle time counted from the end of the handshake (zero while handshaking).
+/// - An IP at MAX_PREAUTH_PER_IP (loopback exempt) makes room by losing its own oldest socket.
+/// - At MAX_PREAUTH overall, the victim comes from the IP holding the most pending sockets (so an IP's
+///   only socket is never taken while another IP holds 2 or more), preferring its idle sockets, then its
+///   oldest. A newcomer is never refused while some other IP holds 2 or more.
+/// - Only when the newcomer's own IP is the biggest holder and none of its sockets are idle (a local
+///   loopback flood) does it wait for room: up to 2 x MAX_PREAUTH pending, then it is refused.
 pub fn admit_policy(pending: &[(std::net::IpAddr, Duration)], ip: std::net::IpAddr) -> Admit {
-    let oldest_idle = |same: bool| {
-        pending.iter().enumerate().filter(|(_, (i, age))| (!same || *i == ip) && *age >= PREAUTH_IDLE).max_by_key(|(_, (_, age))| *age).map(|(k, _)| k)
+    let count = |x: std::net::IpAddr| pending.iter().filter(|(i, _)| *i == x).count();
+    // the oldest socket among `pool`, idle ones first
+    let pick = |pool: &dyn Fn(std::net::IpAddr) -> bool| {
+        pending
+            .iter()
+            .enumerate()
+            .filter(|(_, (i, _))| pool(*i))
+            .max_by_key(|(_, (_, age))| (*age >= PREAUTH_IDLE, *age))
+            .map(|(k, _)| k)
     };
-    if !ip.is_loopback() && pending.iter().filter(|(i, _)| *i == ip).count() >= MAX_PREAUTH_PER_IP {
-        return oldest_idle(true).map_or(Admit::Refuse, Admit::Evict);
+    if !ip.is_loopback() && count(ip) >= MAX_PREAUTH_PER_IP {
+        return pick(&|i| i == ip).map_or(Admit::Refuse, Admit::Evict);
     }
-    if pending.len() >= MAX_PREAUTH {
-        if let Some(k) = oldest_idle(false) {
+    if pending.len() < MAX_PREAUTH {
+        return Admit::Ok;
+    }
+    let most = pending.iter().map(|(i, _)| count(*i)).max().unwrap_or(0);
+    // the biggest holders; among equals the one with the oldest socket
+    let big: Vec<std::net::IpAddr> = pending.iter().map(|(i, _)| *i).filter(|i| count(*i) == most).collect();
+    let others: Vec<std::net::IpAddr> = big.iter().copied().filter(|i| *i != ip).collect();
+    if !others.is_empty() && (most >= 2 || pending.iter().any(|(i, age)| others.contains(i) && *age >= PREAUTH_IDLE)) {
+        if let Some(k) = pick(&|i| others.contains(&i)) {
             return Admit::Evict(k);
         }
-        if pending.len() >= 2 * MAX_PREAUTH {
-            return Admit::Refuse;
+    }
+    // the newcomer's own IP is the biggest holder (or everyone holds one fresh socket): only idle ones go
+    if let Some(k) = pending.iter().enumerate().filter(|(_, (_, age))| *age >= PREAUTH_IDLE).max_by_key(|(_, (_, age))| *age).map(|(k, _)| k) {
+        if count(pending[k].0) >= count(ip).max(1) {
+            return Admit::Evict(k);
         }
+    }
+    if pending.len() >= 2 * MAX_PREAUTH {
+        return Admit::Refuse;
     }
     Admit::Ok
 }
@@ -166,7 +189,8 @@ pub fn admit_policy(pending: &[(std::net::IpAddr, Duration)], ip: std::net::IpAd
 struct Pending {
     id: u64,
     ip: std::net::IpAddr,
-    since: Instant,
+    /// when its WebSocket handshake completed (None while still handshaking)
+    since: Option<Instant>,
     sock: TcpStream,
 }
 
@@ -174,6 +198,14 @@ struct Pending {
 struct PreGuard<'a> {
     inner: &'a Inner,
     id: u64,
+}
+impl PreGuard<'_> {
+    /// The handshake is done: idleness counts from now.
+    fn handshaken(&self) {
+        if let Some(p) = self.inner.preauth.lock().unwrap_or_else(|e| e.into_inner()).iter_mut().find(|p| p.id == self.id) {
+            p.since = Some(Instant::now());
+        }
+    }
 }
 impl Drop for PreGuard<'_> {
     fn drop(&mut self) {
@@ -378,7 +410,7 @@ impl Inner {
         let ip = peer.ip();
         loop {
             let now = Instant::now();
-            let view: Vec<(std::net::IpAddr, Duration)> = v.iter().map(|p| (p.ip, now.duration_since(p.since))).collect();
+            let view: Vec<(std::net::IpAddr, Duration)> = v.iter().map(|p| (p.ip, p.since.map_or(Duration::ZERO, |t| now.duration_since(t)))).collect();
             match admit_policy(&view, ip) {
                 Admit::Ok => break,
                 Admit::Refuse => return Err(format!("refused: too many unauthenticated connections from {ip}")),
@@ -389,7 +421,7 @@ impl Inner {
                 }
             }
         }
-        v.push(Pending { id, ip, since: Instant::now(), sock: handle });
+        v.push(Pending { id, ip, since: None, sock: handle });
         Ok(PreGuard { inner: self, id })
     }
 
@@ -525,6 +557,7 @@ impl Inner {
                 Err(tungstenite::HandshakeError::Failure(e)) => return Err(format!("handshake: {e}")),
             }
         };
+        pre.handshaken();
         let send = |ws: &mut tungstenite::WebSocket<TcpStream>, m: &ServerMsg| ws.send(Message::text(m.to_json())).map_err(|e| e.to_string());
         let refuse = |ws: &mut tungstenite::WebSocket<TcpStream>, code: ErrorCode, msg: &str| {
             let _ = send(ws, &ServerMsg::Error { code, message: msg.into() });
