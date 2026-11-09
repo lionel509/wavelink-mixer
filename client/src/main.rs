@@ -675,6 +675,7 @@ mod tests {
             inputs: vec![],
             buses: vec![p::Bus { id: "a1".into(), name: "H".into(), color: "#fff".into(), kind: p::BusKind::Physical, gain_db: -10.0, mute: false, outputs: vec![], max_db: None, ceiling_db: None }],
             zones: vec![],
+            hosts: vec![],
         };
         r.on_msg(ServerMsg::State { state: st });
         r.on_msg(ServerMsg::Delta { rev: 2, changes: vec![p::Delta::BusGain { bus: "a1".into(), db: -4.0 }] });
