@@ -145,3 +145,23 @@ fn host_volume_never_leaves_0_100_or_jumps_more_than_the_step() {
         }
     }
 }
+
+#[test]
+fn host_volume_above_100_round_trip() {
+    // Host volume is documented 0..=100. apply() clamps, so diff() must clamp too: otherwise a
+    // target of 101 leaves the client and the server states disagreeing.
+    let old = state_with(host("mac", 40, true));
+    let new = state_with(host("mac", 101, true));
+    let deltas = old.diff(&new).expect("diff");
+    assert!(
+        deltas.contains(&Delta::HostVolume { host: "mac".into(), volume: 100 }),
+        "the delta must carry the clamped volume, got {deltas:?}"
+    );
+    let mut applied = old.clone();
+    for d in &deltas {
+        applied.apply(d);
+    }
+    let mut want = new.clone();
+    want.hosts[0].volume = 100;
+    assert_eq!(applied.hosts, want.hosts);
+}
