@@ -2594,11 +2594,15 @@ pub fn activate(app: &adw::Application) {
             }
             return glib::ControlFlow::Break;
         }
+        // stems housekeeping runs here, not in the frame tick: the tick stops while the display sleeps
+        let mut remute = false;
         if let Some(g) = rx.try_iter().last() {
             st2.sync(&g);
             *st2.graph.borrow_mut() = g;
+            remute = true;
         }
         save_tick += 1;
+        stems_view::housekeep(&st2, remute, save_tick % 10 == 0);
         if save_tick % 5 == 0 && st2.dirty.get() {
             st2.cfg.borrow().save();
             st2.dirty.set(false);

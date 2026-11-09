@@ -23,7 +23,6 @@ pub(super) struct State {
     pub(super) replaced: RefCell<Option<String>>,
     session: RefCell<Option<Session>>,
     view: RefCell<Option<Rc<View>>>,
-    acc: Cell<f64>,
     srcs: RefCell<Vec<(String, String)>>,
 }
 
@@ -34,7 +33,6 @@ impl State {
             replaced: RefCell::new(None),
             session: RefCell::new(None),
             view: RefCell::new(None),
-            acc: Cell::new(0.0),
             srcs: RefCell::new(Vec::new()),
         }
     }
@@ -238,7 +236,8 @@ pub(super) fn wire(app: &Rc<App>, v: Rc<View>) {
     }
 }
 
-/// Called every frame from the window tick.
+/// Visuals only. Called every frame from the window tick, which stops while the window is unseen
+/// (display asleep, minimised), so nothing that must keep running may live here: see `housekeep`.
 pub(super) fn step(app: &Rc<App>, dt: f64) {
     let Some(v) = app.stems.view.borrow().clone() else {
         return;
@@ -252,27 +251,32 @@ pub(super) fn step(app: &Rc<App>, dt: f64) {
         *v.seen.borrow_mut() = s.clone();
         v.status.set_text(&s);
     }
+}
 
-    let acc = app.stems.acc.get() + dt;
-    if acc < 1.0 {
-        app.stems.acc.set(acc);
+/// Correctness work that must run with no frames. Called from the 100 ms `timeout_add_local` loop in ui.rs
+/// (never from the frame tick): `remute` right after a new graph arrives, `refill` every 10th pass (1 s).
+pub(super) fn housekeep(app: &Rc<App>, remute: bool, refill: bool) {
+    let Some(v) = app.stems.view.borrow().clone() else {
         return;
+    };
+    if refill {
+        // re-list the channels; rebuild the picker only when the list changed
+        let list = stemcfg::sources(&app.cfg.borrow());
+        if list != *app.stems.srcs.borrow() {
+            let keep = source_id(app, &v).unwrap_or_default();
+            fill_sources(app, &v, list, &keep);
+        }
     }
-    app.stems.acc.set(0.0);
-    // re-list the channels; rebuild the picker only when the list changed
-    let list = stemcfg::sources(&app.cfg.borrow());
-    if list != *app.stems.srcs.borrow() {
-        let keep = source_id(app, &v).unwrap_or_default();
-        fill_sources(app, &v, list, &keep);
-    }
-    // the engine's level re-apply, a bus re-spawn or the strip's own mute control can un-mute the
-    // replaced source (same node id): check its actual mute state every second and mute it again
-    let rep = app.stems.replaced.borrow().clone();
-    let node = rep.as_ref().and_then(|id| {
-        app.graph.borrow().node(&names::strip_in(id)).map(|n| (n.id, n.mute))
-    });
-    if let Some(id) = stemcfg::remute_target(rep.is_some(), node, None) {
-        crate::pw::set_mute(id, true);
+    if remute {
+        // the engine's level re-apply, a bus re-spawn or the strip's own mute control can un-mute the
+        // replaced source (same node id): check its actual mute state and mute it again
+        let rep = app.stems.replaced.borrow().clone();
+        let node = rep.as_ref().and_then(|id| {
+            app.graph.borrow().node(&names::strip_in(id)).map(|n| (n.id, n.mute))
+        });
+        if let Some(id) = stemcfg::remute_target(rep.is_some(), node, None) {
+            crate::pw::set_mute(id, true);
+        }
     }
 }
 
