@@ -81,3 +81,6 @@ fn main() -> glib::ExitCode {
     app.connect_activate(ui::activate);
     app.run_with_args::<&str>(&[])
 }
+
+#[cfg(test)]
+mod breaker_r3;
