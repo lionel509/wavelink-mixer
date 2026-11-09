@@ -225,7 +225,7 @@ pub const FPS: f64 = 22050.0 / 256.0;
 pub const BP_SAMPLES: usize = 43844;
 pub const ONSET_THRESH: f32 = 0.5;
 pub const FRAME_THRESH: f32 = 0.3;
-pub const MIN_NOTE_FRAMES: usize = 5;
+pub const MIN_NOTE_FRAMES: usize = 11;
 pub const ENERGY_TOL: usize = 11;
 
 pub struct Transcriber {
@@ -241,6 +241,12 @@ impl Transcriber {
 
     /// Mono at 44.1 kHz in; notes with t relative to the start of the input.
     pub fn notes(&mut self, mono44: &[f32]) -> Result<Vec<Note>, String> {
+        // The model normalises its input, so near-silence (below about -60 dBFS RMS) looks like full-scale
+        // noise to it and turns into notes. Treat it as silence.
+        let rms = (mono44.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / mono44.len().max(1) as f64).sqrt();
+        if rms < 1e-3 {
+            return Ok(Vec::new());
+        }
         // Mono -> stereo -> 22.05 kHz, then one channel.
         let mut stereo = Vec::with_capacity(mono44.len() * 2);
         for &v in mono44 {
@@ -368,10 +374,15 @@ pub fn frames_to_notes(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<Note> {
             }
             fp += 1;
         }
-        if end - f < MIN_NOTE_FRAMES {
+        // upstream: `if i - note_start_idx <= min_note_len: continue`, so a note needs at least 12 frames
+        if end - f <= MIN_NOTE_FRAMES {
             continue;
         }
         let mean = work[f..end].iter().map(|r| r[p]).sum::<f32>() / (end - f) as f32;
+        // a note's note grid must average at least the frame threshold (velocity >= 38)
+        if mean < FRAME_THRESH {
+            continue;
+        }
         let vel = (127.0 * mean).round().clamp(0.0, 127.0) as u8;
         out.push(Note { t: f as f64 / FPS, dur: (end - f) as f64 / FPS, pitch: (p + 21) as u8, vel });
         for r in work[f..end].iter_mut() {
