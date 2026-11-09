@@ -54,6 +54,9 @@ const STRETCH_MAX: f32 = 0.1;
 const ENV_BETA: f32 = 1.0;
 const ENV_K: f32 = 1.5;
 const ENV_H2: f32 = 0.7;
+/// The cap is at least the strongest of the 2 partials either side, times ENV_NEIGH (0 = off).
+const ENV_NEIGH: f32 = 1.0;
+const ENV_NEIGH_FROM: f32 = 55.0;
 pub const MAX_POLY: usize = 10;
 /// Whitening: the 20th percentile of ±FLOOR_HALF FFT bins, times 1.76 (the Rayleigh median / p20
 /// ratio, so noise sits at 1), evaluated every FLOOR_STEP bins; plus a floor 50 dB under the frame
@@ -106,7 +109,6 @@ const RESTART_DIP: f32 = 0.6;
 const SEMI_K: f32 = 0.7;
 /// Half the fast onset-energy window (1024), in frames.
 const EHALF: i64 = (SIZES[2] / 2 / HOP) as i64;
-const RESTRIKE_LOOK: usize = 6;
 const RESTRIKE_PART: f32 = 1.4;
 /// Global flux: bins of the 1024 FFT used, and the onset level relative to its running mean.
 const GF_BINS: usize = 256;
@@ -128,11 +130,8 @@ const RISE_LOOK: f32 = 6.0;
 const NEW_LVL_GLOBAL: f32 = 30.0;
 const NEW_LVL_KEY: f32 = 20.0;
 const LEVEL_DECAY: f32 = 0.995_99; // 3 dB/s at 86.13 frames/s
-/// ...and either a flux onset within 2 frames of its rise or a stable pitch (spread over
-/// STAB_FRAMES at most STAB_NEW semitones).
-const GF_NEW: f32 = 0.0;
-const STAB_FRAMES: i64 = 5;
-const STAB_NEW: f32 = 99.0;
+/// Flux a new note next to a sounding key needs near its rise (0 = off).
+const GF_NEAR: f32 = 0.0;
 /// Re-strike: vetoed when the key's pitch spread over 8 frames exceeds RS_STAB semitones; the fast
 /// path needs a flux of FAST_FLUX within 4 frames.
 const RS_STAB: f32 = 0.2;
@@ -142,15 +141,15 @@ const RS_STAB_FROM: usize = 50;
 const RS_LVL: f32 = 24.0;
 /// Onset: walk back from the steepest rise while the energy stays above this share of the level reached.
 const ONSET_FRAC: f32 = 0.2;
-/// Switches: starting keys as re-strike rivals, and holding a drifted (vibrato) note.
+/// Starting keys count as re-strike rivals (1 = on).
 const RIVAL_NEW: f32 = 1.0;
-/// Re-strike needs a note body before its dip (1 = on).
-const BODY: f32 = 0.0;
+/// A re-strike must lift the key's own 1st or 3rd gate partial by this factor (0 = off).
+const OWN_LIFT: f32 = 1.25;
 /// Partial-balance change that counts as a strike on the fast re-strike path.
 const SHAPE_MIN: f32 = 0.03;
+const SHAPE_MAX: f32 = 0.55;
 /// Pitch is only measured on peaks this far over the floor (a faint peak's position is noise).
 const PITCH_MIN: f32 = 8.0;
-const HOLD_DRIFT: f32 = 0.0;
 /// Intervals at which a starting key shares partials with a held key below it.
 const SHARED_STEPS: [usize; 8] = [7, 12, 19, 24, 28, 31, 34, 36];
 /// Semitones from a fundamental to its partials 2..8 and 10, 12, 16.
@@ -454,6 +453,8 @@ pub struct PianoTracker {
     /// The same at the resolution of the start gate, and its ring.
     gkern: Vec<[Kern; 4]>,
     genergy: Vec<[f32; RING]>,
+    /// Per key, per frame, per partial 1..=4: the gate-window energy.
+    hgenergy: Vec<[[f32; 4]; RING]>,
     /// Per key, per frame, per partial 1..=4: the fast-window energy.
     henergy: Vec<[[f32; 4]; RING]>,
     /// Global flux ring (relative to its running mean), the previous log spectrum, the mean.
@@ -559,6 +560,7 @@ impl PianoTracker {
             ekern,
             gkern,
             genergy: vec![[0.0; RING]; KEYS],
+            hgenergy: vec![[[0.0; 4]; RING]; KEYS],
             henergy: vec![[[0.0; 4]; RING]; KEYS],
             gflux: [0.0; RING],
             gf_prev: vec![0.0; GF_BINS],
@@ -798,12 +800,6 @@ impl PianoTracker {
             self.gflux[slot] = fl / base.max(tun!(GF_FLOOR));
             self.gf_raw[slot] = fl;
         }
-        let sum = |ffts: &[Rfft; 3], kerns: &[Kern; 4]| -> f32 {
-            kerns
-                .iter()
-                .map(|kn| ffts[kn.size as usize].mag[kn.k0 as usize..=kn.k1 as usize].iter().fold(0f32, |a, &m| a.max(m)))
-                .sum()
-        };
         for k in 0..KEYS {
             let mut tot = 0f32;
             for (h, kn) in self.ekern[k].iter().enumerate() {
@@ -812,7 +808,13 @@ impl PianoTracker {
                 tot += v;
             }
             self.energy[k][slot] = tot;
-            self.genergy[k][slot] = sum(&self.ffts, &self.gkern[k]);
+            let mut gt = 0f32;
+            for (h, kn) in self.gkern[k].iter().enumerate() {
+                let v = self.ffts[kn.size as usize].mag[kn.k0 as usize..=kn.k1 as usize].iter().fold(0f32, |a, &m| a.max(m));
+                self.hgenergy[k][slot][h] = v;
+                gt += v;
+            }
+            self.genergy[k][slot] = gt;
         }
         // decaying level references for the new-note gate
         let prev = (self.frame - 1).rem_euclid(RING as i64) as usize;
@@ -926,7 +928,20 @@ impl PianoTracker {
             } else {
                 amp(h).min(amp(h - 1))
             };
-            let sub = if h >= 2 { smooth.min(reference * tun!(ENV_K) * (h as f32).powf(-beta)) } else { smooth };
+            // the cap is the larger of the decaying envelope and the partial's neighbours: a smooth
+            // bright series (brass, reeds, whose middle partials stand above the 1st) is cancelled in
+            // full; a partial standing alone above its neighbours (a melody or chord tone on top of
+            // this note) keeps its excess
+            let mut cap = reference * tun!(ENV_K) * (h as f32).powf(-beta);
+            if tun!(ENV_NEIGH) > 0.0 && k + LOW_KEY as usize >= tun!(ENV_NEIGH_FROM) as usize {
+                let nb = [h.wrapping_sub(2), h.wrapping_sub(1), h + 1, h + 2]
+                    .iter()
+                    .filter(|&&i| i >= 1 && i <= n)
+                    .map(|&i| amp(i))
+                    .fold(0f32, f32::max);
+                cap = cap.max(nb * tun!(ENV_NEIGH));
+            }
+            let sub = if h >= 2 { smooth.min(cap) } else { smooth };
             let c = found[h].0;
             if self.fl[c] > 0.0 {
                 self.res_lin[c] = (self.res_lin[c] - sub / self.fl[c]).max(0.0);
@@ -1107,7 +1122,7 @@ impl PianoTracker {
         best.0
     }
 
-    /// Rise of key k's gate energy at frame j over its minimum in the RESTRIKE_LOOK frames before.
+    /// Rise of key k's gate energy at frame j over its minimum in the RISE_LOOK frames before.
     fn rise(&self, k: usize, j: i64) -> f32 {
         let g = |f: i64| self.genergy[k][f.rem_euclid(RING as i64) as usize];
         let mut lo = f32::MAX;
@@ -1122,7 +1137,6 @@ impl PianoTracker {
     /// bins and must not restart a key that is only ringing on).
     fn recent_rise(&self, k: usize, f: i64) -> bool {
         let ring = |j: i64| j.rem_euclid(RING as i64) as usize;
-        let stable = self.pitch_spread(k, f, STAB_FRAMES).is_some_and(|sp| sp <= tun!(STAB_NEW));
         (f - ONSET_WIN as i64..=f).any(|j| {
             let r = self.rise(k, j);
             if r <= tun!(ONSET_RISE) {
@@ -1142,10 +1156,11 @@ impl PianoTracker {
             if e < self.gref[ring(j)] * db_down(tun!(NEW_LVL_GLOBAL)) || e < before * db_down(tun!(NEW_LVL_KEY)) {
                 return false;
             }
-            // an attack (a flux onset next to the rise) or a steady pitch: a vibrato or glide that
-            // sweeps through the key is neither
-            let flux = (j - 2..=(j + 2).min(f)).any(|i| self.gflux[ring(i)] >= tun!(GF_NEW));
-            flux || stable
+            // next to a sounding key (within 2 semitones of it, its octave or its twelfth), where a
+            // vibrato or glide sweeps that key's partials through its neighbours, a new note also
+            // needs an attack: a broadband flux onset within 2 frames of its rise
+            let near = (0..KEYS).any(|q| q != k && self.sounding(q) && [0i64, 12, 19].iter().any(|&d| (k as i64 - q as i64 - d).abs() <= 2));
+            !near || (j - 2..=(j + 2).min(f)).any(|i| self.gflux[ring(i)] >= tun!(GF_NEAR))
         })
     }
 
@@ -1181,24 +1196,6 @@ impl PianoTracker {
             }
         }
         self.ppos[k][slot] = best.map_or(f32::NAN, |b| b.1);
-    }
-
-    /// Whether a sounding key's tone is still there but drifted off its bins (a wide vibrato swings it
-    /// a semitone or more): a peak near its fundamental or 2nd partial that no other sounding key owns.
-    fn held_by_drift(&self, k: usize) -> bool {
-        let fmin = tun!(FUND_MIN);
-        (0..2).any(|h| {
-            let c = (k * BPS + 1) as f32 + self.hoff[h];
-            let c = c.round() as i64;
-            (c - 4..=c + 4).any(|b| {
-                if b < 0 || b as usize >= NBINS || self.lin[b as usize] < fmin {
-                    return false;
-                }
-                // the key this peak belongs to, as a fundamental
-                let owner = ((b as usize).saturating_sub(1) + 1) / BPS;
-                owner == k || owner >= KEYS || !self.sounding(owner)
-            })
-        })
     }
 
     /// A key a harmonic interval above a sounding key that was not picked this frame (a re-strike
@@ -1277,35 +1274,33 @@ impl PianoTracker {
             return None;
         }
         let gfl = |j: i64| self.gflux[j.rem_euclid(RING as i64) as usize];
+        // the strike must lift the key's own 1st or 3rd partial (gate window): a key an octave or
+        // twelfth above struck over it lifts only its 2nd/4th or 3rd partials
+        if tun!(OWN_LIFT) > 0.0 {
+            let hg = |j: i64, h: usize| self.hgenergy[k][j.rem_euclid(RING as i64) as usize][h];
+            let lifted = |h: usize| {
+                let lo = (f - 6..f).map(|j| hg(j, h)).fold(f32::MAX, f32::min);
+                hg(f, h) >= tun!(OWN_LIFT) * lo.max(1e-12)
+            };
+            if !lifted(0) && !lifted(2) {
+                return None;
+            }
+        }
         // a re-strike reaches a level near the note's own peak: a bump in its reverb tail, tens of dB
         // down, is not a new strike
         if self.energy_at(k, f) < self.peak_e[k] * db_down(tun!(RS_LVL)) {
             return None;
         }
-        // a struck note has a body: between its attack and the dip before the new strike its energy
-        // sits near its peak most of the time (a held key decays slowly, then the damper drops it
-        // fast). A tremolo or swell is a sinusoid: it spends most of each cycle away from its peak
-        let body = {
-            let from = settled.max(f - RING as i64 + 2);
-            let dip = (from..f).min_by(|&a, &b| self.energy_at(k, a).total_cmp(&self.energy_at(k, b))).unwrap_or(f);
-            let span: Vec<f32> = (from..dip).map(|j| self.energy_at(k, j)).collect();
-            let pk = span.iter().fold(0f32, |a, &v| a.max(v));
-            span.len() >= 3 && span.iter().filter(|&&v| v >= 0.75 * pk).count() * 2 >= span.len()
-        };
         let (r4, l4) = rise(4);
-        if tun!(BODY) > 0.5 && !body {
-            return None;
-        }
         // the fast path still needs attack evidence near the rise: broadband flux, or a change in
         // the balance of the key's own partials (a new strike's partials start in their own phase
         // and brightness, so their ratios move while the old tone dies; a tremolo or swell scales
         // every partial alike and leaves the balance where it was)
-        let attack = (f - 4..=f).any(|j| gfl(j) >= tun!(FAST_FLUX)) || self.shape_change(k, f) >= tun!(SHAPE_MIN);
+        let sc = self.shape_change(k, f);
+        // (but not a scramble: chorus and bowing noise reshuffle the partials far more than a
+        // re-strike of the same string does)
+        let attack = (f - 4..=f).any(|j| gfl(j) >= tun!(FAST_FLUX)) || (sc >= tun!(SHAPE_MIN) && sc <= tun!(SHAPE_MAX));
         if r4 >= tun!(RESTRIKE_FAST) && l4 >= 3 && attack {
-            #[cfg(test)]
-            if std::env::var("DBG_RS").is_ok() {
-                eprintln!("RS fast k{} f{f} r4 {r4:.2} shape {:.2} spread {:?}", k + 21, self.shape_change(k, f), self.pitch_spread(k, f - 1, 12));
-            }
             return Some(r4);
         }
         let latch = RESTRIKE_LATCH as i64;
@@ -1319,10 +1314,6 @@ impl PianoTracker {
             return None;
         }
         let (r8, l8) = rise(latch + 2);
-        #[cfg(test)]
-        if std::env::var("DBG_RS").is_ok() && r8 >= tun!(RESTRIKE) && l8 >= 3 {
-            eprintln!("RS flux k{} f{f} r8 {r8:.2} shape {:.2} spread {:?}", k + 21, self.shape_change(k, f), self.pitch_spread(k, f - 1, 12));
-        }
         (r8 >= tun!(RESTRIKE) && l8 >= 3).then_some(r8)
     }
 
@@ -1427,10 +1418,6 @@ impl PianoTracker {
                     }
                 }
                 KeyState::On { t0 } => {
-                    if !active && tun!(HOLD_DRIFT) > 0.5 && self.held_by_drift(k) {
-                        self.quiet[k] = 0;
-                        continue;
-                    }
                     if !active {
                         self.quiet[k] += 1;
                         if self.quiet[k] >= Self::off_frames(k) {

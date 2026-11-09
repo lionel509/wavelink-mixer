@@ -755,7 +755,7 @@ fn repeats(pitch: u8, rate_hz: f64, gap: f64, count: usize, t0: f64) -> Vec<Note
 /// plan's "fast repeated notes (8/s): every re-strike is detected" is only met with the PR's 90 ms
 /// holds (a ~35 ms gap). Measured per case in the METRIC lines.
 #[test]
-#[ignore]
+#[ignore = "KNOWN GAP (round 3): FluidSynth re-strikes with a 5-10 ms gap move the level by under 2 dB within +-50 ms of the strike (measured on the 22.05 kHz render, 10 ms RMS); no energy, flux or partial-balance cue separates them from a held tone's own fluctuation without re-opening tremolo/vibrato flicker. The 20 and 35 ms gaps pass 12/12."]
 fn brk_fluidsynth_legato_repeats() {
     let mut fails = Vec::new();
     for (pitch, hz, gap) in [(60u8, 8.0f64, 0.005f64), (60, 4.0, 0.010), (72, 6.0, 0.020), (48, 4.0, 0.010), (60, 8.0, 0.035)] {

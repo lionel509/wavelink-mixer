@@ -100,6 +100,7 @@ pub(super) struct View {
     port: gtk::ToggleButton,
     split: gtk::ToggleButton,
     save: gtk::Button,
+    clear: gtk::Button,
     status: gtk::Label,
     readout: gtk::Label,
     roll: gtk::DrawingArea,
@@ -128,29 +129,44 @@ impl View {
         let split = gtk::ToggleButton::with_label("Split lanes");
         split.set_tooltip_text(Some("Save MIDI: one track per lane (Bass < C3, Mid C3–C5, High > C5) instead of one merged track"));
         let save = gtk::Button::with_label("Save MIDI");
+        let clear = gtk::Button::with_label("New take");
+        clear.set_tooltip_text(Some("Start a new take: Save MIDI forgets everything played so far"));
+        port.add_css_class("pianotoggle");
+        split.add_css_class("pianotoggle");
         let status = gtk::Label::new(None);
         status.set_xalign(0.0);
         status.set_hexpand(true);
         status.set_ellipsize(gtk::pango::EllipsizeMode::End);
         name_it(&status, "Piano status");
         let readout = gtk::Label::new(None);
-        readout.set_tooltip_text(Some("CPU per 0.5 s of audio · attack → NoteOn on the analysis stream"));
+        readout.set_tooltip_text(Some(
+            "Live CPU per 0.5 s of audio (read while the core idles between 10 ms chunks; the powersave governor makes it read about 1.5x the bench figure) · attack → NoteOn on the analysis stream: typically about 200 ms, up to about 380 ms on dense chords",
+        ));
         name_it(&readout, "Piano CPU and latency");
 
         let head = gtk::Box::new(Orientation::Horizontal, 8);
         let title = gtk::Label::new(Some("PIANO"));
         title.add_css_class("section");
         head.append(&title);
+        let engine_lbl = gtk::Label::new(Some("Engine"));
+        engine_lbl.add_css_class("small");
+        engine.update_relation(&[gtk::accessible::Relation::LabelledBy(&[engine_lbl.upcast_ref()])]);
+        head.append(&engine_lbl);
         head.append(&engine);
         let stack = gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).vhomogeneous(false).build();
 
         let dsp = gtk::Box::new(Orientation::Vertical, 4);
         let row = gtk::Box::new(Orientation::Horizontal, 8);
+        let source_lbl = gtk::Label::new(Some("Source"));
+        source_lbl.add_css_class("small");
+        source.update_relation(&[gtk::accessible::Relation::LabelledBy(&[source_lbl.upcast_ref()])]);
+        row.append(&source_lbl);
         row.append(&source);
         row.append(&on);
         row.append(&port);
         row.append(&split);
         row.append(&save);
+        row.append(&clear);
         row.append(&status);
         row.append(&readout);
         dsp.append(&row);
@@ -175,7 +191,7 @@ impl View {
         root.set_margin_top(6);
         root.append(&head);
         root.append(&stack);
-        Rc::new(View { root, engine, stack, source, on, port, split, save, status, readout, roll, quiet: Cell::new(false) })
+        Rc::new(View { root, engine, stack, source, on, port, split, save, clear, status, readout, roll, quiet: Cell::new(false) })
     }
 }
 
@@ -267,6 +283,12 @@ pub(super) fn wire(app: &Rc<App>, v: Rc<View>) {
     });
     let (a, vv) = (app.clone(), v.clone());
     v.save.connect_clicked(move |_| save_midi(&a, &vv));
+    let (a, vv) = (app.clone(), v.clone());
+    v.clear.connect_clicked(move |_| {
+        a.piano.shared.get().new_take();
+        a.piano.repaint.set(true);
+        say(&a, &vv, "new take");
+    });
     if std::env::var("MIXER_PIANO").as_deref() == Ok("1") && eng == 0 {
         v.on.set_active(true);
     }
@@ -393,7 +415,7 @@ pub(super) fn step(app: &Rc<App>, _dt: f64) {
     if !msg && v.status.text() != st {
         v.status.set_text(&st);
     }
-    let r = format!("CPU {cpu:.1} ms/0.5 s · latency {lat:.0} ms");
+    let r = format!("live CPU {cpu:.1} ms/0.5 s · latency {lat:.0} ms");
     if v.readout.text() != r {
         v.readout.set_text(&r);
     }

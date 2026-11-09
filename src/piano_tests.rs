@@ -636,8 +636,8 @@ fn fluidsynth_fixtures() {
 }
 
 /// Per-fixture F1 floor. The plan asks 0.75 everywhere. KNOWN GAP #31: "chords" (5-note voicings
-/// over a bass octave, most chord tones are partials of the bass) measures 0.660 after fix round 2
-/// (0.425 before); its floor pins that level so a regression shows. "chords" is the fixture closest
+/// over a bass octave, most chord tones are partials of the bass) measures 0.645 at 44.1 kHz after fix round 3
+/// (0.448 in round 1); its floor pins that level so a regression shows. "chords" is the fixture closest
 /// to chord-heavy songs, so it is the number to expect by ear on them.
 fn fixture_floor(name: &str) -> f64 {
     match name {
@@ -648,8 +648,8 @@ fn fixture_floor(name: &str) -> f64 {
     }
 }
 const CHORDS_FLOOR: f64 = 0.62;
-/// KNOWN GAP #31: the melody fixture's F1, measured 0.740 (its melody recall, the target, is
-/// asserted >= 0.8 above and measures 0.879).
+/// KNOWN GAP #31: the melody fixture's F1, measured 0.741 at 44.1 kHz (its melody recall, the
+/// target, is asserted >= 0.8 above and measures 0.833).
 const MELODY_FLOOR: f64 = 0.70;
 
 /// Live-path latency on real piano audio, measured the scout's way: FluidSynth renders at 44.1 kHz
@@ -689,39 +689,3 @@ fn fluidsynth_live_latency() {
     eprintln!("METRIC live latency all: p50 {:.0} p90 {:.0} max {:.0} ms (n={})", q(0.5), q(0.9), all[all.len() - 1], all.len());
 }
 
-#[test]
-#[ignore]
-fn dbg_shape() {
-    let gt: Vec<Note> = (0..12).map(|i| n(0.5 + i as f64 / 8.0, 0.09, 60, 90)).collect();
-    let rep = synth_piano(&gt, 2.5, 3);
-    let r = RATE as f64;
-    let mut ph = [0f64; 12];
-    let trem: Vec<f32> = (0..(2.5 * r) as usize)
-        .map(|i| {
-            let t = i as f64 / r;
-            let f0 = 440.0 * 2f64.powf((60.0 - 69.0) / 12.0);
-            let a = (t / 0.02).min(1.0) * (0.6 + 0.4 * (std::f64::consts::TAU * 7.0 * t).sin());
-            let mut v = 0f64;
-            for (h, p) in ph.iter_mut().enumerate() {
-                *p += std::f64::consts::TAU * (h + 1) as f64 * f0 / r;
-                v += p.sin() / (h + 1) as f64;
-            }
-            (0.15 * a * v) as f32
-        })
-        .collect();
-    let strings = if let Ok(w) = std::env::var("DBG_WAV") { let (p, r) = read_wav(&std::fs::read(w).unwrap()).unwrap(); to_rate(&p, r) } else { vec![0.0; 1000] };
-    for (name, x) in [("rep", rep), ("trem", trem), ("wav", strings)] {
-        let mut tr = PianoTracker::new();
-        let mut line = String::new();
-        for c in x.chunks(HOP) {
-            tr.push(c);
-            let f = tr.frame - 1;
-            if !(40..=110).contains(&f) {
-                continue;
-            }
-            let k = 60 - 21;
-            line += &format!("{f}:{:.2}/{:.2}/{:.2} ", tr.shape_change(k, f), tr.ppos[k][f.rem_euclid(RING as i64) as usize], tr.pitch_spread(k, f - 3, 8).unwrap_or(-1.0));
-        }
-        eprintln!("DBG {name}: {line}");
-    }
-}

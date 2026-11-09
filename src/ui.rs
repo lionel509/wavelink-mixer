@@ -139,6 +139,8 @@ label.midi { font-size: 11px; font-weight: 800; color: #55555c; margin-right: 8p
 label.midi.on { color: #3be477; }
 dropdown.instrument button { min-height: 20px; padding: 0 4px; font-size: 10px; font-weight: 700; }
 .spectrum { background: #121214; border-radius: 14px; padding: 10px 12px 6px 6px; }
+/* piano toggles: the pressed state has to be obvious (S9) */
+.pianotoggle:checked { background: #1dd1a1; color: #0b0b0d; font-weight: bold; }
 /* console fader: thin slot, grooved cap with a white index line, printed scale */
 scale.vertical trough { min-width: 4px; border-radius: 2px; background: #050506; box-shadow: inset 0 1px 2px rgba(0,0,0,.9); }
 scale.vertical highlight { background: none; }
@@ -2185,6 +2187,8 @@ fn restart_audio(st: &Rc<App>, btn: &adw::SplitButton, full: bool) {
 }
 
 pub fn activate(app: &adw::Application) {
+    // a service stop or logout closes the window cleanly instead of killing it mid-note (R2-F5)
+    crate::piano_live::install_quit_signals();
     if let Some(w) = app.active_window() {
         w.present();
         return;
@@ -2290,7 +2294,15 @@ pub fn activate(app: &adw::Application) {
     let piano_v = piano_view::View::new(&stems_v.root);
     spec_panel.append(&piano_v.root);
     // the analyser plus the Piano section is taller than the bottom pane often is (S1): it scrolls
-    let spec_scroll = gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never).vscrollbar_policy(gtk::PolicyType::Automatic).child(&spec_panel).build();
+    // it must not ask for more height than the pane has (at 1080p it ran 38 px past the window)
+    let spec_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(false)
+        .min_content_height(60)
+        .vexpand(true)
+        .child(&spec_panel)
+        .build();
     stack.add_titled(&spec_scroll, Some("spectrum"), "Spectrum");
     stack.add_titled(&patch_panel, Some("patch"), "Patch Bay");
     // System monitor: read-only health of the audio system (lives under the output strips)
@@ -2570,6 +2582,13 @@ pub fn activate(app: &adw::Application) {
     let (st2, ww) = (st.clone(), win.downgrade());
     let mut save_tick = 0u32;
     glib::timeout_add_local(Duration::from_millis(100), move || {
+        // SIGTERM / SIGINT / SIGHUP (a service stop, a logout): close the window, which runs the
+        // shutdown below on the next tick (sessions stop, every note-off goes out, port closes)
+        if crate::piano_live::quit_requested() {
+            if let Some(w) = ww.upgrade() {
+                w.close();
+            }
+        }
         if ww.upgrade().is_none() {
             stems_view::shutdown(&st2);
             piano_view::shutdown(&st2);

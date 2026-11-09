@@ -39,29 +39,56 @@ pub trait Sink {
 pub struct MidiOut<S: Sink> {
     pub sink: S,
     sounding: Vec<(u8, u8)>,
+    /// Note-offs (ch, key) the sink refused (a full non-blocking queue): retried on every later
+    /// event and on `flush`, and resent by `all_off`, so a note-off is never lost.
+    pending_off: Vec<(u8, u8)>,
+    /// Channels whose CC 123 still has to go out.
+    pending_cc: Vec<u8>,
 }
 
 impl<S: Sink> MidiOut<S> {
     pub fn new(sink: S) -> Self {
-        MidiOut { sink, sounding: Vec::new() }
+        MidiOut { sink, sounding: Vec::new(), pending_off: Vec::new(), pending_cc: Vec::new() }
+    }
+
+    fn off(&mut self, ch: u8, key: u8) {
+        if self.sink.note(false, ch, key, 0).is_err() && !self.pending_off.contains(&(ch, key)) {
+            self.pending_off.push((ch, key));
+        }
+    }
+
+    /// Retries what the sink refused earlier. Never sleeps.
+    pub fn flush(&mut self) {
+        for (ch, key) in std::mem::take(&mut self.pending_off) {
+            if self.sink.note(false, ch, key, 0).is_err() {
+                self.pending_off.push((ch, key));
+            }
+        }
+        for ch in std::mem::take(&mut self.pending_cc) {
+            if self.sink.control(ch, 123, 0).is_err() {
+                self.pending_cc.push(ch);
+            }
+        }
     }
 
     pub fn event(&mut self, e: &Ev) {
+        self.flush();
         match *e {
             Ev::On { pitch, vel, .. } => {
                 let ch = channel(pitch);
                 if self.sounding.contains(&(ch, pitch)) {
-                    let _ = self.sink.note(false, ch, pitch, 0);
+                    self.off(ch, pitch);
                 } else {
                     self.sounding.push((ch, pitch));
                 }
+                // a refused note-on is just dropped: its later note-off is harmless
                 let _ = self.sink.note(true, ch, pitch, vel.clamp(1, 127));
             }
             Ev::Off { pitch, .. } => {
                 let ch = channel(pitch);
                 if let Some(i) = self.sounding.iter().position(|x| *x == (ch, pitch)) {
                     self.sounding.swap_remove(i);
-                    let _ = self.sink.note(false, ch, pitch, 0);
+                    self.off(ch, pitch);
                 }
             }
         }
@@ -72,20 +99,38 @@ impl<S: Sink> MidiOut<S> {
         self.sounding.len()
     }
 
-    /// Note-off for every sounding note, then CC 123 (All Notes Off) on the three lane channels.
+    #[cfg(test)]
+    pub fn pending(&self) -> usize {
+        self.pending_off.len() + self.pending_cc.len()
+    }
+
+    /// Note-off for every sounding note and every earlier refused one, then CC 123 (All Notes Off)
+    /// on the three lane channels. What the sink refuses stays queued for `flush`.
     pub fn all_off(&mut self) {
+        self.flush();
         for (ch, key) in std::mem::take(&mut self.sounding) {
-            let _ = self.sink.note(false, ch, key, 0);
+            self.off(ch, key);
         }
         for ch in 0..3 {
-            let _ = self.sink.control(ch, 123, 0);
+            if self.sink.control(ch, 123, 0).is_err() && !self.pending_cc.contains(&ch) {
+                self.pending_cc.push(ch);
+            }
         }
     }
 }
 
 impl<S: Sink> Drop for MidiOut<S> {
+    /// All notes off; what the sink still refuses gets a few short retries (here, off the analysis
+    /// thread's hot path, sleeping is fine).
     fn drop(&mut self) {
         self.all_off();
+        for _ in 0..20 {
+            if self.pending_off.is_empty() && self.pending_cc.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            self.flush();
+        }
     }
 }
 
@@ -117,39 +162,25 @@ impl AlsaSink {
         format!("{}:{}", self.seq.client_id().unwrap_or(-1), self.port)
     }
 
-    /// Sends one event. A full output queue (EAGAIN on the non-blocking client) drops a note-on, but
-    /// note-offs and controllers are retried for up to 20 ms so nothing is left hanging.
-    fn send(&self, mut ev: alsa::seq::Event, must: bool) -> Result<(), String> {
+    /// Sends one event, once: a full output queue (EAGAIN on the non-blocking client) is an error
+    /// the caller queues and retries later, so the analysis thread never sleeps holding the port.
+    fn send(&self, mut ev: alsa::seq::Event) -> Result<(), String> {
         ev.set_source(self.port);
         ev.set_subs();
         ev.set_direct();
-        let mut tries = 0;
-        loop {
-            match self.seq.event_output_direct(&mut ev) {
-                Ok(_) => return Ok(()),
-                Err(e) if must && tries < 20 && e.errno() == libc_eagain() => {
-                    tries += 1;
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(e) => return Err(e.to_string()),
-            }
-        }
+        self.seq.event_output_direct(&mut ev).map(|_| ()).map_err(|e| e.to_string())
     }
-}
-
-fn libc_eagain() -> i32 {
-    11 // EAGAIN on Linux
 }
 
 impl Sink for AlsaSink {
     fn note(&mut self, on: bool, ch: u8, key: u8, vel: u8) -> Result<(), String> {
         use alsa::seq::{EvNote, Event, EventType};
         let d = EvNote { channel: ch, note: key, velocity: if on { vel } else { 0 }, off_velocity: 0, duration: 0 };
-        self.send(Event::new(if on { EventType::Noteon } else { EventType::Noteoff }, &d), !on)
+        self.send(Event::new(if on { EventType::Noteon } else { EventType::Noteoff }, &d))
     }
     fn control(&mut self, ch: u8, cc: u8, val: u8) -> Result<(), String> {
         use alsa::seq::{EvCtrl, Event, EventType};
-        self.send(Event::new(EventType::Controller, &EvCtrl { channel: ch, param: cc as u32, value: val as i32 }), true)
+        self.send(Event::new(EventType::Controller, &EvCtrl { channel: ch, param: cc as u32, value: val as i32 }))
     }
 }
 
@@ -235,6 +266,15 @@ impl Inner {
     fn sorted(mut v: Vec<Note>) -> Vec<Note> {
         v.sort_by(|a, b| a.t.total_cmp(&b.t).then(a.pitch.cmp(&b.pitch)));
         v
+    }
+
+    /// "New take": forget the finished notes and the roll; notes still sounding go into the new take.
+    pub fn new_take(&mut self) {
+        self.all.clear();
+        self.roll.clear();
+        for o in self.open.iter_mut() {
+            o.3 = false;
+        }
     }
 
     /// Save MIDI: a copy of the whole take, with sounding notes cut at `now` in the copy only.
@@ -349,6 +389,7 @@ impl Worker<'_> {
         self.audio_s += mono.len() as f64 / piano::RATE as f64;
         if let Some(p) = &self.port {
             if let Some(m) = lock(p).as_mut() {
+                m.flush();
                 for e in &evs {
                     m.event(e);
                 }
@@ -555,6 +596,21 @@ extern "C" fn on_signal(_sig: i32) {
 
 extern "C" {
     fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+}
+
+/// SIGINT, SIGTERM and SIGHUP set SIGNALLED instead of killing the process (the GUI polls it and
+/// closes its window, which stops the session and sends every note-off).
+pub fn install_quit_signals() {
+    // SAFETY: installs a handler that only stores to a static atomic.
+    unsafe {
+        signal(1, on_signal);
+        signal(2, on_signal);
+        signal(15, on_signal);
+    }
+}
+
+pub fn quit_requested() -> bool {
+    SIGNALLED.load(Ordering::Relaxed)
 }
 
 /// SIGINT and SIGTERM set SIGNALLED instead of killing the process; a watcher copies it to `flag`.
@@ -771,6 +827,66 @@ mod tests {
             m.event(&Ev::On { t: 0.0, pitch: 70, vel: 90 });
         }
         assert_eq!(*lock(&log), vec!["on 1 70", "off 1 70", "cc 0 123", "cc 1 123", "cc 2 123"]);
+    }
+
+    /// A sink that refuses its first `refuse` sends (a full non-blocking queue).
+    struct Flaky(Arc<Mutex<Vec<String>>>, usize);
+    impl Sink for Flaky {
+        fn note(&mut self, on: bool, ch: u8, key: u8, _vel: u8) -> Result<(), String> {
+            if self.1 > 0 {
+                self.1 -= 1;
+                return Err("EAGAIN".into());
+            }
+            lock(&self.0).push(format!("{} {ch} {key}", if on { "on" } else { "off" }));
+            Ok(())
+        }
+        fn control(&mut self, ch: u8, cc: u8, _val: u8) -> Result<(), String> {
+            if self.1 > 0 {
+                self.1 -= 1;
+                return Err("EAGAIN".into());
+            }
+            lock(&self.0).push(format!("cc {ch} {cc}"));
+            Ok(())
+        }
+    }
+
+    /// R2-F6: a note-off the sink refuses is queued and goes out on the next event or flush, and
+    /// all_off resends it; nothing is lost and nothing sleeps on the event path.
+    #[test]
+    fn refused_note_offs_are_retried_not_lost() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut m = MidiOut::new(Flaky(log.clone(), 0));
+        m.event(&Ev::On { t: 0.0, pitch: 60, vel: 90 });
+        m.sink.1 = 1; // the next send is refused: the note-off
+        m.event(&Ev::Off { t: 0.5, pitch: 60 });
+        assert_eq!(m.pending(), 1);
+        assert!(!lock(&log).iter().any(|l| l == "off 1 60"));
+        m.flush();
+        assert_eq!(m.pending(), 0);
+        assert!(lock(&log).iter().any(|l| l == "off 1 60"));
+        // all_off with a refusing sink keeps the offs and CCs queued, the drop delivers them
+        m.event(&Ev::On { t: 1.0, pitch: 40, vel: 90 });
+        m.sink.1 = 2;
+        m.all_off();
+        assert!(m.pending() >= 1);
+        drop(m);
+        let l = lock(&log);
+        assert!(l.iter().any(|x| x == "off 0 40"), "{l:?}");
+        for ch in 0..3 {
+            assert!(l.iter().any(|x| *x == format!("cc {ch} 123")), "{l:?}");
+        }
+    }
+
+    /// R2-2: a new take starts empty; a note sounding across it lands in the new take.
+    #[test]
+    fn new_take_forgets_the_old_one() {
+        let mut g = Inner::default();
+        g.apply(&[Ev::On { t: 0.5, pitch: 60, vel: 90 }, Ev::Off { t: 0.9, pitch: 60 }, Ev::On { t: 1.0, pitch: 64, vel: 90 }], 1.2);
+        g.new_take();
+        assert!(g.snapshot().iter().all(|n| n.pitch == 64), "{:?}", g.snapshot());
+        assert!(g.roll.is_empty());
+        g.apply(&[Ev::Off { t: 2.0, pitch: 64 }], 2.1);
+        assert_eq!(g.snapshot().len(), 1);
     }
 
     #[test]
