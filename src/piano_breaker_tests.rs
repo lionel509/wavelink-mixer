@@ -128,6 +128,7 @@ fn check_events_opt(evs: &[Ev], overlaps: bool) -> Result<(), String> {
                 Some(_) => {}
                 None => return Err(format!("Off of {pitch} at {t:.3} without an On")),
             },
+            Ev::Pedal { .. } => {}
         }
     }
     if let Some(p) = open.iter().position(|o| o.is_some()) {

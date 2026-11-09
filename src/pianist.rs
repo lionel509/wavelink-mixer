@@ -37,6 +37,10 @@ pub struct Pianist {
     voices: usize,
     /// MIXER_PIANO_PEDALMERGE: a key re-detected within 300 ms of its release rings on.
     pedal_merge: bool,
+    hands: bool,
+    /// MIXER_PIANO_CC64: a real sustain pedal on the port instead of held notes.
+    cc64: bool,
+    pedal: bool,
     held: Vec<Held>,
     /// The tracker's on for this key was dropped or merged: swallow its off.
     swallow: [u8; 128],
@@ -58,13 +62,19 @@ impl Pianist {
             hold: std::env::var("MIXER_PIANO_HOLD").ok().and_then(|v| v.parse().ok()).unwrap_or(HOLD_S),
             voices: std::env::var("MIXER_PIANO_VOICES").ok().and_then(|v| v.parse().ok()).unwrap_or(if crate::subtract::legato() || !crate::subtract::precision() { MAX_VOICES } else { 6 }),
             pedal_merge: crate::subtract::env_on("MIXER_PIANO_PEDALMERGE", true),
+            hands: crate::subtract::env_on("MIXER_PIANO_HANDS", false),
+            cc64: crate::subtract::env_on("MIXER_PIANO_CC64", false),
+            pedal: false,
             held: Vec::with_capacity(16), swallow: [0; 128], recent_ons: Vec::with_capacity(16), vel_avg: [0.0; 3], bass: None }
     }
 
     fn release_where(&mut self, t: f64, out: &mut Vec<Ev>, f: impl Fn(&Held) -> bool) {
+        let cc64 = self.cc64;
         self.held.retain(|h| {
             if f(h) {
-                out.push(Ev::Off { t: t.max(h.t_on), pitch: h.pitch });
+                if !(cc64 && h.released.is_some()) {
+                    out.push(Ev::Off { t: t.max(h.t_on), pitch: h.pitch });
+                }
                 false
             } else {
                 true
@@ -78,10 +88,22 @@ impl Pianist {
             match *e {
                 Ev::On { t, pitch, vel } => self.on(t, pitch, vel, out),
                 Ev::Off { t, pitch } => self.off(t, pitch, out),
+                Ev::Pedal { .. } => out.push(*e),
             }
         }
         let hold = self.hold;
+        let before = self.held.len();
         self.release_where(now, out, |h| h.released.is_some_and(|r| now - r > hold));
+        if self.cc64 && self.pedal && self.held.len() < before && self.held.iter().all(|h| h.released.is_some()) {
+            self.repedal(now, out);
+        }
+    }
+
+    /// CC 64: lift (everything pedalled stops) and press again.
+    fn repedal(&mut self, t: f64, out: &mut Vec<Ev>) {
+        out.push(Ev::Pedal { t, down: false });
+        out.push(Ev::Pedal { t, down: true });
+        self.held.retain(|h| h.released.is_none());
     }
 
     fn on(&mut self, t: f64, pitch: u8, vel: u8, out: &mut Vec<Ev>) {
@@ -126,16 +148,31 @@ impl Pianist {
                 None => self.bass = Some((pitch, t)),
             }
         }
-        self.release_where(t, out, |h| {
-            h.pitch == pitch || (h.released.is_some() && (new_bass || (h.pitch as i32 - pitch as i32).abs() <= 2))
-        });
+        if self.cc64 {
+            // a real pedal: down from the first note, changed on a new bass; single pedalled notes
+            // cannot be lifted
+            if !self.pedal {
+                out.push(Ev::Pedal { t, down: true });
+                self.pedal = true;
+            } else if new_bass && self.held.iter().any(|h| h.released.is_some()) {
+                self.repedal(t, out);
+            }
+            self.release_where(t, out, |h| h.pitch == pitch);
+        } else {
+            self.release_where(t, out, |h| {
+                h.pitch == pitch || (h.released.is_some() && (new_bass || (h.pitch as i32 - pitch as i32).abs() <= 2))
+            });
+        }
         while self.held.len() >= self.voices {
             let i = self.held.iter().position(|h| h.released.is_some()).unwrap_or(0);
             let h = self.held.remove(i);
-            out.push(Ev::Off { t: t.max(h.t_on), pitch: h.pitch });
+            if !(self.cc64 && h.released.is_some()) {
+                out.push(Ev::Off { t: t.max(h.t_on), pitch: h.pitch });
+            }
         }
         // velocity: smoothed per lane, squeezed to 48..112, top voice +8
-        let lane = crate::piano::lane(pitch).index();
+        // per hand (MIXER_PIANO_HANDS: left below C4, right from C4) or per lane
+        let lane = if self.hands { (pitch >= 60) as usize } else { crate::piano::lane(pitch).index() };
         let a = &mut self.vel_avg[lane];
         *a = if *a == 0.0 { vel as f32 } else { *a * 0.6 + vel as f32 * 0.4 };
         let v = 48.0 + (*a - 30.0).max(0.0) * 0.6;
@@ -159,12 +196,20 @@ impl Pianist {
             out.push(Ev::Off { t, pitch });
         } else {
             self.held[i].released = Some(t);
+            if self.cc64 {
+                // the pedal holds the sound; the key itself comes up now
+                out.push(Ev::Off { t, pitch });
+            }
         }
     }
 
     /// Everything off (end of the session).
     pub fn finish(&mut self, t: f64, out: &mut Vec<Ev>) {
         self.release_where(t, out, |_| true);
+        if self.pedal {
+            out.push(Ev::Pedal { t, down: false });
+            self.pedal = false;
+        }
         self.swallow = [0; 128];
     }
 }
@@ -179,6 +224,7 @@ pub fn perform(notes: &[Note]) -> Vec<Note> {
     let key = |e: &Ev| match *e {
         Ev::On { t, .. } => (t, 1),
         Ev::Off { t, .. } => (t, 0),
+        Ev::Pedal { t, .. } => (t, 0),
     };
     evs.sort_by(|a, b| key(a).0.total_cmp(&key(b).0).then(key(a).1.cmp(&key(b).1)));
     let mut p = Pianist::new();
@@ -189,7 +235,7 @@ pub fn perform(notes: &[Note]) -> Vec<Note> {
     }
     let end = evs.last().map_or(0.0, |e| key(e).0) + 0.5;
     p.finish(end, &mut out);
-    crate::piano::events_to_notes(&out).into_iter().filter(|n| n.dur >= MIN_DUR_S).collect()
+    crate::piano::events_to_notes(&crate::piano::apply_pedal(&out)).into_iter().filter(|n| n.dur >= MIN_DUR_S).collect()
 }
 
 #[cfg(test)]

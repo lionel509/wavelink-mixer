@@ -191,6 +191,8 @@ pub enum Ev {
     /// centre of the frame with the steepest attack), not sample-accurate.
     On { t: f64, pitch: u8, vel: u8 },
     Off { t: f64, pitch: u8 },
+    /// Sustain pedal (CC 64) down / up.
+    Pedal { t: f64, down: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1495,6 +1497,40 @@ impl PianoTracker {
     }
 }
 
+/// What the sustain pedal does to the sound, as plain notes: an Off while the pedal is down waits
+/// for the pedal to come up (or for the key to be struck again). For renders and the harness.
+pub fn apply_pedal(evs: &[Ev]) -> Vec<Ev> {
+    let mut out = Vec::with_capacity(evs.len());
+    let mut down = false;
+    let mut held: Vec<u8> = Vec::new();
+    for e in evs {
+        match *e {
+            Ev::Pedal { t, down: d } => {
+                if down && !d {
+                    for p in held.drain(..) {
+                        out.push(Ev::Off { t, pitch: p });
+                    }
+                }
+                down = d;
+            }
+            Ev::Off { pitch, .. } if down => {
+                if !held.contains(&pitch) {
+                    held.push(pitch);
+                }
+            }
+            Ev::On { t, pitch, .. } => {
+                if let Some(i) = held.iter().position(|&p| p == pitch) {
+                    held.swap_remove(i);
+                    out.push(Ev::Off { t, pitch });
+                }
+                out.push(*e);
+            }
+            _ => out.push(*e),
+        }
+    }
+    out
+}
+
 /// Pairs On/Off events into notes (sorted by start).
 pub fn events_to_notes(evs: &[Ev]) -> Vec<Note> {
     let mut open: [Option<(f64, u8)>; 128] = [None; 128];
@@ -1512,6 +1548,7 @@ pub fn events_to_notes(evs: &[Ev]) -> Vec<Note> {
                     out.push(Note { t: t0, dur: (t - t0).max(0.0), pitch, vel: v0 });
                 }
             }
+            Ev::Pedal { .. } => {}
         }
     }
     out.sort_by(|a, b| a.t.total_cmp(&b.t).then(a.pitch.cmp(&b.pitch)));

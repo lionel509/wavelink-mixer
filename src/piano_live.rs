@@ -120,6 +120,12 @@ impl<S: Sink> MidiOut<S> {
                     }
                 }
             }
+            Ev::Pedal { down, .. } => {
+                // the lanes' channels; a refused pedal is dropped (the next change corrects it)
+                for ch in 0..3u8 {
+                    let _ = self.sink.control(ch, 64, if down { 127 } else { 0 });
+                }
+            }
         }
     }
 
@@ -309,6 +315,7 @@ impl Inner {
                     self.latency_ms = if self.latency_ms == 0.0 { lat } else { self.latency_ms * 0.9 + lat * 0.1 };
                 }
                 Ev::Off { t, pitch } => self.close(pitch, t + b),
+                Ev::Pedal { .. } => {}
             }
         }
         self.now = fed + b;

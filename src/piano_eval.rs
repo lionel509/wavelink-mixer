@@ -177,7 +177,7 @@ pub fn live_notes(mono: &[f32]) -> (Vec<Note>, f64) {
     pn.push(&raw, end, &mut evs);
     pn.finish(end, &mut evs);
     let ms = t.elapsed().as_secs_f64() * 1000.0 / (mono.len() as f64 / RATE as f64 / 0.5);
-    (piano::events_to_notes(&evs), ms)
+    (piano::events_to_notes(&piano::apply_pedal(&evs)), ms)
 }
 
 pub fn eval(mono: &[f32], sections: &[(String, f64, f64)]) -> String {
