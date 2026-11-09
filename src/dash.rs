@@ -680,8 +680,8 @@ pub struct Spectrum {
     range: std::cell::Cell<(usize, usize)>,
     /// lane name drawn top-left (empty: none)
     title: std::cell::RefCell<String>,
-    /// MIDI notes overlaid on the bars: (frequency Hz, opacity 0..1, colour)
-    marks: std::cell::RefCell<Vec<(f64, f64, (f64, f64, f64))>>,
+    /// MIDI notes overlaid on the bars: (frequency Hz, opacity 0..1, colour, height 0..1 = velocity)
+    marks: std::cell::RefCell<Vec<(f64, f64, (f64, f64, f64), f64)>>,
     /// Combined view: bars tinted by band zone, (zone start Hz, name, colour), ascending
     zones: std::cell::RefCell<Vec<(f64, String, (f64, f64, f64))>>,
 }
@@ -737,7 +737,7 @@ impl Spectrum {
     }
 
     /// Notes to overlay as glowing lines at their fundamental (redraws only when they change).
-    pub fn set_marks(&self, m: Vec<(f64, f64, (f64, f64, f64))>) {
+    pub fn set_marks(&self, m: Vec<(f64, f64, (f64, f64, f64), f64)>) {
         if *self.marks.borrow() != m {
             *self.marks.borrow_mut() = m;
             self.area.queue_draw();
@@ -858,18 +858,20 @@ impl Spectrum {
         }
         // MIDI overlay: one line per note at its fundamental, in its lane colour, fading after note-off
         let (flo, fhi) = (band_edge(lo), band_edge(hi));
-        for &(f, a, (r, g, b)) in self.marks.borrow().iter() {
+        for &(f, a, (r, g, b), vh) in self.marks.borrow().iter() {
             if f < flo || f >= fhi || a <= 0.0 {
                 continue;
             }
             let x = lx + lw * (f / flo).ln() / (fhi / flo).ln();
             cr.set_source_rgba(r, g, b, 0.25 * a);
-            cr.rectangle(x - 3.0, ly, 6.0, lh);
+            // the line rises as high as the note's velocity: a soft note is a short line
+            let top = ly + lh * (1.0 - vh.clamp(0.05, 1.0));
+            cr.rectangle(x - 3.0, top, 6.0, ly + lh - top);
             let _ = cr.fill();
             cr.set_source_rgba(r, g, b, 0.95 * a);
-            cr.rectangle(x - 1.0, ly, 2.0, lh);
+            cr.rectangle(x - 1.0, top, 2.0, ly + lh - top);
             let _ = cr.fill();
-            cr.arc(x, ly + 3.0, 3.0, 0.0, 2.0 * PI);
+            cr.arc(x, top + 3.0, 3.0, 0.0, 2.0 * PI);
             let _ = cr.fill();
         }
         let title = self.title.borrow();

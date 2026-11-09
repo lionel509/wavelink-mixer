@@ -2625,7 +2625,7 @@ pub fn activate(app: &adw::Application) {
             };
             // the bar view shows the sounding notes (and ones that just ended) as lines at their pitch
             let hz = |p: u8| 440.0 * 2f64.powf((p as f64 - 69.0) / 12.0);
-            sp3.set_marks(marks.iter().filter(|m| m.ago_end < 0.4).map(|m| (hz(m.pitch), if m.ago_end <= 0.0 { 0.55 + m.vel as f64 / 280.0 } else { 0.6 * (1.0 - m.ago_end / 0.4) }, m.rgb)).collect());
+            sp3.set_marks(marks.iter().filter(|m| m.ago_end < 0.4).map(|m| (hz(m.pitch), if m.ago_end <= 0.0 { 0.55 + m.vel as f64 / 280.0 } else { 0.6 * (1.0 - m.ago_end / 0.4) }, m.rgb, m.vel as f64 / 127.0)).collect());
             sc3.set_notes(marks);
             sc3.redraw();
         }
