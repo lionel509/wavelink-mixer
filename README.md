@@ -65,6 +65,17 @@ The engine also serves the mixer on the local network so other computers can vie
 - macOS: the `Wavelink Remote (macOS)` GitHub Actions workflow uploads `wavelink-remote-macos-universal.tar.gz` (a universal, ad-hoc signed `Wavelink Remote.app`). It is not notarized: the first time, right-click the app and choose Open (or run `xattr -dr com.apple.quarantine "Wavelink Remote.app"`), and allow Local Network access when macOS asks.
 - Headless check: `WAVELINK_REMOTE_TOKEN=... wavelink-remote --probe HOST[:PORT] ['{"op":"set_bus_gain","bus":"a1","db":-20}' ...]` (or pipe the token on stdin) prints the state, sends the commands, prints acks/deltas and a few meter frames.
 
+### Mac panel (MacBook output)
+
+The Mac can join the mixer as one extra output, the **MacBook** strip. Its fader and mute set the Mac's own system output volume, and changing the volume keys on the Mac shows up on the strip. The strip appears at the end of the OUTPUTS row, on the bazzite window and on the Mac window.
+
+- Build the Mac window (needs Homebrew `gtk4 libadwaita`): `cargo build --release`.
+- Connect it once, using the token from the PC: `wavelink-mixer remote-token` on bazzite, then on the Mac `wavelink-mixer remote lionelweng-himalayas.nord --label MacBook --save`. `--save` writes the address, token and label to `~/.config/wavelink-mixer/remote-client.json` (mode 0600) on the Mac only; `config.json` is never touched. Later runs need no arguments.
+- The Mac window is the only thing that makes the strip live: it reads OFFLINE while the Mac window is closed, and its volume is the Mac's real system volume.
+- Step rule: a raise through the panel is limited to 25 points per command, so one drag cannot jump the Mac from silent to full. Lowering is never limited. The engine clamps every value to 0 to 100.
+- The engine keeps the MacBook only while it runs. After a bazzite restart the strip returns when the Mac window reconnects.
+- Deploy note: bazzite needs the new engine build, `systemctl --user restart wavelink-engine`. An older engine ignores the Mac's registration, so no MacBook strip appears until it is updated.
+
 ## Stems models
 Downloaded on first use into `~/.local/share/wavelink/models/`, checked against pinned SHA-256.
 - Live engine: StemgenRT v0.7 independent streaming HS-TasNet by Axel Delafosse, weights CC BY-NC-SA 4.0 (non-commercial), https://github.com/sweetspotsoundsystem/StemgenRT-5.8. Fetched from upstream, never redistributed by this repo.
