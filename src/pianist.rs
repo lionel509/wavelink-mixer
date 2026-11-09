@@ -62,7 +62,7 @@ impl Pianist {
         Pianist {
             hold: std::env::var("MIXER_PIANO_HOLD").ok().and_then(|v| v.parse().ok()).unwrap_or(HOLD_S),
             voices: std::env::var("MIXER_PIANO_VOICES").ok().and_then(|v| v.parse().ok()).unwrap_or(if crate::subtract::legato() || !crate::subtract::precision() { MAX_VOICES } else { 6 }),
-            pedal_merge: crate::subtract::env_on("MIXER_PIANO_PEDALMERGE", true),
+            pedal_merge: crate::subtract::env_on("MIXER_PIANO_PEDALMERGE", !crate::subtract::env_on("MIXER_PIANO_LEVELRULE", true)),
             hands: crate::subtract::env_on("MIXER_PIANO_HANDS", false),
             merge_s: std::env::var("MIXER_PIANO_MERGE_S").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3),
             cc64: crate::subtract::env_on("MIXER_PIANO_CC64", false),

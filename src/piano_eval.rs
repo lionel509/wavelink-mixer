@@ -309,6 +309,22 @@ pub fn eval(mono: &[f32], sections: &[(String, f64, f64)]) -> String {
                         eprintln!("est {pp}: {:.2}+{:.2} v{}", n.t, n.dur, n.vel);
                     }
                 }
+                // missed reference onsets: was an estimate of that pitch already sounding (merged into
+                // a held note), did one start late (> 50 ms), or nothing at all
+                let (mut merged, mut late_on, mut absent) = (0, 0, 0);
+                for g in &gt {
+                    if notes.iter().any(|n| n.pitch == g.pitch && (n.t - g.t).abs() <= 0.05) {
+                        continue;
+                    }
+                    if notes.iter().any(|n| n.pitch == g.pitch && n.t < g.t && n.t + n.dur > g.t + 0.05) {
+                        merged += 1;
+                    } else if notes.iter().any(|n| n.pitch == g.pitch && n.t > g.t && n.t < g.t + g.dur) {
+                        late_on += 1;
+                    } else {
+                        absent += 1;
+                    }
+                }
+                eprintln!("FN: merged into a held note {merged}, started late {late_on}, absent {absent}");
                 late.sort();
                 eprintln!("FP: same pitch, onset off by (ms): {late:?}");
                 eprintln!("FP: interval to the nearest sounding reference note (999 = none): {hist:?}");

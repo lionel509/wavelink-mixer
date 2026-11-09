@@ -979,6 +979,9 @@ pub struct SubTracker {
     last_on: Vec<u64>,
     /// Per key: the frame its last note ended.
     last_off: Vec<u64>,
+    /// Per key: the sounding note's level (dB, dropouts ignored) and whether re-strikes use it.
+    lvl: Vec<f32>,
+    lvl_rule: bool,
     /// Notes refused by the gates (for the harness).
     pub blocked: usize,
 }
@@ -1033,6 +1036,8 @@ impl SubTracker {
             poly: env_on("MIXER_PIANO_POLY", false),
             last_on: vec![0; KEYS],
             last_off: vec![0; KEYS],
+            lvl: vec![-120.0; KEYS],
+            lvl_rule: env_on("MIXER_PIANO_LEVELRULE", true),
             blocked: 0,
         }
     }
@@ -1223,7 +1228,10 @@ impl SubTracker {
                 KeySeg::Idle => {
                     // hold: coming back within 300 ms of its own off is the same note decaying,
                     // not a new strike, unless it is a clear attack
-                    let fresh = !(self.holdkey || self.decode) || i.saturating_sub(self.last_off[k]) > 26 || kr >= tun("REBIRTH_DB", 9.0);
+                    let since = i.saturating_sub(self.last_off[k]);
+                    // a rebound must rise above the level the note had (decayed), not above the dropout
+                    let kr_re = if self.lvl_rule { (v - (self.lvl[k] - tun("LVL_DECAY", 25.0) * fs * since as f32) - gshift).min(kr) } else { kr };
+                    let fresh = !(self.holdkey || self.decode) || since > 26 || kr_re >= tun("REBIRTH_DB", 9.0);
                     if fresh && v > on_db && (rise || v3 < on_db) {
                         KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i, rise: kr }
                     } else {
@@ -1255,6 +1263,7 @@ impl SubTracker {
                         }).unwrap_or(s);
                         if self.allow(k, s, pk, own_rise) {
                             self.last_on[k] = s;
+                            self.lvl[k] = v;
                             evs.push(Ev::On { t: Self::t(s), pitch, vel });
                             KeySeg::On { s, pk, below: 0 }
                         } else {
@@ -1267,10 +1276,15 @@ impl SubTracker {
                 }
                 KeySeg::On { s, pk, below } => {
                     let pk = pk.max(v);
+                    // the note's own level, ignoring dropouts, falling 6 dB/s: a re-strike must rise
+                    // above it (a rebound after the pursuit missed the key for a few frames is not)
+                    let lv = self.lvl[k] - tun("LVL_DECAY", 25.0) * fs;
+                    let kr = if self.lvl_rule { (v - lv - gshift).min(kr) } else { kr };
+                    self.lvl[k] = if v > pk - 18.0 { lv.max(v) } else { lv };
                     let (rs_ok, drop, nbelow) = if self.decode {
                         // interval decoding (fixed lag): the note holds while the key comes back above
                         // its floor within DECODE_LAG frames; it ends where it last was above
-                        (kr >= tun("RESTRIKE_DB", 6.0) && at > s + 21, tun("OFF_DROP", 24.0), tun("DECODE_LAG", if legato() { 40.0 } else { 26.0 }) as u8)
+                        (kr >= tun("RESTRIKE_DB", if self.lvl_rule { 4.0 } else { 6.0 }) && at > s + 21, tun("OFF_DROP", 24.0), tun("DECODE_LAG", if legato() { 40.0 } else { 26.0 }) as u8)
                     } else if self.holdkey {
                         // hold: a re-strike needs a clear new attack on this key, 250 ms after the last
                         (kr >= tun("RESTRIKE_DB", 6.0) && at > s + 21, tun("OFF_DROP", 24.0), tun("HOLD_BELOW", 8.0) as u8)
