@@ -325,6 +325,11 @@ fn meter(name: &str, target: Option<(&str, bool)>, led: Option<Rc<LedMeter>>, vu
 
 pub struct App {
     cfg: RefCell<Config>,
+    /// config.json as this window last read or wrote it: the base of the 3-way merge that keeps the
+    /// engine's remote-control writes (#26) and this window's edits from overwriting each other
+    synced: RefCell<Config>,
+    /// N (auto-normalize) buttons by input id, so a remote toggle shows up here
+    norm_btns: RefCell<HashMap<String, gtk::ToggleButton>>,
     graph: RefCell<Graph>,
     dirty: Cell<bool>,
     content: gtk::Box,
@@ -1025,12 +1030,106 @@ impl App {
     fn mark_dirty(&self) {
         self.dirty.set(true);
     }
+
+    /// Save without clobbering newer on-disk edits (the engine's remote server writes config.json too, #26):
+    /// fields this window changed since it last synced win, everything else comes from the file.
+    fn save_cfg(self: &Rc<Self>) {
+        let before = self.cfg.borrow().clone();
+        let merged = {
+            let (mut c, mut b) = (self.cfg.borrow_mut(), self.synced.borrow_mut());
+            c.save_merged(&mut b, &Config::path())
+        };
+        if merged {
+            self.apply_external(&before, None);
+        }
+    }
+
+    /// Pick up edits another writer saved since this window last synced; this window's unsaved edits stay.
+    fn pull_cfg(self: &Rc<Self>) {
+        let (before, base) = (self.cfg.borrow().clone(), self.synced.borrow().clone());
+        let disk = {
+            let (mut c, mut b) = (self.cfg.borrow_mut(), self.synced.borrow_mut());
+            c.pull_merged(&mut b, &Config::path())
+        };
+        if let Some(d) = disk {
+            self.apply_external(&before, Some((&base, &d)));
+        }
+    }
+
+    /// Show what changed in `self.cfg` relative to `before` after a merge. Faders, mutes and send switches
+    /// already follow the live graph (the engine applied the change there); this updates the rest. Anything
+    /// beyond levels (EQ, rack, names, colours, channels) rebuilds the window.
+    /// `remote` = (old sync base, file): a gain the other writer changed wins over an unsaved auto-normalize move.
+    fn apply_external(self: &Rc<Self>, before: &Config, remote: Option<(&Config, &Config)>) {
+        if let Some((base, disk)) = remote {
+            let mut c = self.cfg.borrow_mut();
+            for i in c.inputs.iter_mut() {
+                let (b, d) = (base.inputs.iter().find(|x| x.id == i.id), disk.inputs.iter().find(|x| x.id == i.id));
+                if let (Some(b), Some(d)) = (b, d) {
+                    if b.gain_db != d.gain_db {
+                        i.gain_db = d.gain_db;
+                    }
+                }
+            }
+        }
+        let now = self.cfg.borrow().clone();
+        if now == *before {
+            return;
+        }
+        // levels-only? copy the remote-controllable fields back and compare the rest
+        let mut masked = now.clone();
+        for (m, b) in masked.inputs.iter_mut().zip(&before.inputs) {
+            if m.id == b.id {
+                m.gain_db = b.gain_db;
+                m.mute = b.mute;
+                m.routes = b.routes.clone();
+                m.normalize = b.normalize;
+                m.norm_base = b.norm_base;
+                m.norm_out = b.norm_out;
+            }
+        }
+        for (m, b) in masked.buses.iter_mut().zip(&before.buses) {
+            if m.id == b.id {
+                m.gain_db = b.gain_db;
+                m.mute = b.mute;
+            }
+        }
+        if masked != *before {
+            let app = self.clone();
+            glib::timeout_add_local_once(Duration::from_millis(50), move || app.rebuild());
+            return;
+        }
+        for (n, b) in now.inputs.iter().zip(&before.inputs) {
+            if n.gain_db != b.gain_db {
+                // a remote fader move is his move for auto-normalize too
+                self.fader_manual(&names::strip_in(&n.id), n.gain_db);
+            } else if n.norm_out != b.norm_out {
+                if let (Some(o), Some(c)) = (n.norm_out, self.norm.borrow_mut().get_mut(&n.id)) {
+                    c.out = o;
+                    c.pending = false;
+                }
+            }
+            if n.normalize != b.normalize {
+                let btn = self.norm_btns.borrow().get(&n.id).cloned();
+                if let Some(btn) = btn {
+                    btn.set_active(n.normalize); // its handler records the same value and pauses auto when off
+                }
+            }
+            for (bus, r) in &n.routes {
+                if b.route(bus).level_db != r.level_db {
+                    if let Some(k) = self.send_knobs.borrow().get(&(n.id.clone(), bus.clone())) {
+                        k.set_value(db_to_pos(r.level_db));
+                    }
+                }
+            }
+        }
+    }
     fn node_id(&self, name: &str) -> Option<u64> {
         self.graph.borrow().node(name).map(|n| n.id)
     }
     /// Save + rebuild after a structural change (engine picks the file up within a second).
     fn structural(self: &Rc<Self>) {
-        self.cfg.borrow().save();
+        self.save_cfg();
         self.dirty.set(false);
         let app = self.clone();
         glib::timeout_add_local_once(Duration::from_millis(50), move || app.rebuild());
@@ -1184,7 +1283,7 @@ impl App {
             dd.connect_selected_notify(move |d| {
                 if let Some((_, prog)) = config::INSTRUMENTS.get(d.selected() as usize) {
                     app.cfg.borrow_mut().piano.program = *prog;
-                    app.cfg.borrow().save(); // the engine picks it up within a second
+                    app.save_cfg(); // the engine picks it up within a second
                 }
             });
             row.append(&dd);
@@ -1491,6 +1590,7 @@ impl App {
                     }
                 });
             }
+            self.norm_btns.borrow_mut().insert(id.clone(), n_btn.clone());
             fader_rc.btns.append(&n_btn);
         }
         strip.append(&screw_row());
@@ -1858,6 +1958,7 @@ impl App {
         self.keep.borrow_mut().clear();
         self.solo_btns.borrow_mut().clear();
         self.send_knobs.borrow_mut().clear();
+        self.norm_btns.borrow_mut().clear();
         self.levels.borrow_mut().clear();
         self.spectra.borrow_mut().clear();
         self.console_ticks.borrow_mut().clear();
@@ -2140,7 +2241,7 @@ impl App {
 /// window so meters reconnect to the fresh graph.
 fn restart_audio(st: &Rc<App>, btn: &adw::SplitButton, full: bool) {
     if st.dirty.get() {
-        st.cfg.borrow().save();
+        st.save_cfg();
         st.dirty.set(false);
     }
     // Engine restart; if PipeWire itself is unresponsive, escalate to a full restart.
@@ -2395,6 +2496,8 @@ pub fn activate(app: &adw::Application) {
 
     let st = Rc::new(App {
         cfg: RefCell::new(Config::load()),
+        synced: RefCell::new(Config::load()),
+        norm_btns: RefCell::new(HashMap::new()),
         graph: RefCell::new(Graph::read().unwrap_or_default()),
         dirty: Cell::new(false),
         content,
@@ -2590,7 +2693,7 @@ pub fn activate(app: &adw::Application) {
                 st2.dirty.set(true);
             }
             if st2.dirty.get() {
-                st2.cfg.borrow().save();
+                st2.save_cfg();
             }
             return glib::ControlFlow::Break;
         }
@@ -2604,8 +2707,11 @@ pub fn activate(app: &adw::Application) {
         save_tick += 1;
         stems_view::housekeep(&st2, remute, save_tick % 10 == 0);
         if save_tick % 5 == 0 && st2.dirty.get() {
-            st2.cfg.borrow().save();
+            st2.save_cfg();
             st2.dirty.set(false);
+        } else if save_tick % 10 == 0 {
+            // edits the engine's remote server (or another writer) saved: merge them in (#26)
+            st2.pull_cfg();
         }
         glib::ControlFlow::Continue
     });
