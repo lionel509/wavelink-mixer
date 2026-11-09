@@ -47,6 +47,8 @@ pub struct NoteScope {
     kvalid: RefCell<Vec<bool>>,
     know: RefCell<Vec<f32>>,
     chord: RefCell<String>,
+    /// zone colour per band and per key, computed when the zones are set
+    tints: RefCell<(Vec<(f64, f64, f64)>, Vec<(f64, f64, f64)>)>,
 }
 
 const KEYS: usize = 88;
@@ -83,6 +85,7 @@ impl NoteScope {
             kvalid: RefCell::new(vec![false; COLS]),
             know: RefCell::new(Vec::new()),
             chord: RefCell::new(String::new()),
+            tints: RefCell::new((Vec::new(), Vec::new())),
         });
         let w = Rc::downgrade(&s);
         area.set_draw_func(move |_, cr, wd, ht| {
@@ -103,6 +106,9 @@ impl NoteScope {
 
     pub fn set_zones(&self, z: Vec<(f64, String, (f64, f64, f64))>) {
         *self.zones.borrow_mut() = z;
+        let bands = (0..BANDS).map(|i| self.zone_rgb(F_LO * (F_HI / F_LO).powf((i as f64 + 0.5) / BANDS as f64))).collect();
+        let keys = (0..KEYS).map(|k| self.zone_rgb(hz(21.0 + k as f64))).collect();
+        *self.tints.borrow_mut() = (bands, keys);
     }
 
     fn zone_rgb(&self, f: f64) -> (f64, f64, f64) {
@@ -116,15 +122,14 @@ impl NoteScope {
             let mut img = self.img.borrow_mut();
             img.flush();
             let stride = img.stride() as usize;
-            let tints: Vec<(f64, f64, f64)> = (0..BANDS)
-                .map(|i| self.zone_rgb(F_LO * (F_HI / F_LO).powf((i as f64 + 0.5) / BANDS as f64)))
-                .collect();
+            let tc = self.tints.borrow();
+            let tints = &tc.0;
             if let Ok(mut data) = img.data() {
                 for i in 0..BANDS {
                     let v = bands.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0) as f64;
                     // a little gamma so quiet partials still show
                     let a = v.powf(0.7);
-                    let (r, g, b) = tints[i];
+                    let (r, g, b) = tints.get(i).copied().unwrap_or((0.8, 0.8, 0.85));
                     // row 0 is the top of the image = the highest band
                     let row = BANDS - 1 - i;
                     let o = row * stride + col * 4;
@@ -155,12 +160,13 @@ impl NoteScope {
         let mut img = self.kimg.borrow_mut();
         img.flush();
         let stride = img.stride() as usize;
-        let tints: Vec<(f64, f64, f64)> = (0..KEYS).map(|k| self.zone_rgb(hz(21.0 + k as f64))).collect();
+        let tc = self.tints.borrow();
+        let tints = &tc.1;
         if let Ok(mut data) = img.data() {
             for k in 0..KEYS {
                 let v = keys.get(k).copied().unwrap_or(0.0).clamp(0.0, 1.0) as f64;
                 let a = v.powf(0.8);
-                let (r, g, b) = tints[k];
+                let (r, g, b) = tints.get(k).copied().unwrap_or((0.8, 0.8, 0.85));
                 let o = (KEYS - 1 - k) * stride + col * 4;
                 data[o] = (b * a * 255.0) as u8;
                 data[o + 1] = (g * a * 255.0) as u8;
@@ -212,7 +218,7 @@ impl NoteScope {
                 cr.translate(gx + (dst0 as f64 - src0 as f64) * cw, gy);
                 cr.scale(cw, gh / BANDS as f64);
                 let _ = cr.set_source_surface(&*img, 0.0, 0.0);
-                cr.source().set_filter(cairo::Filter::Good);
+                cr.source().set_filter(cairo::Filter::Fast);
                 let _ = cr.paint();
                 cr.restore().ok();
             }
