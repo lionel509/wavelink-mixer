@@ -201,8 +201,7 @@ fn is_meshnet_if(dev: &str) -> bool {
 /// A physical Ethernet or Wi-Fi NIC (an allowlist, not a VPN denylist, breaker #36 R2-3): the kernel
 /// shows it with a backing device (`/sys/class/net/<if>/device`) and link type 1 (ARPHRD_ETHER, which
 /// Wi-Fi uses too). Bridges, veths, podman, WireGuard/OpenVPN/AnyConnect/... have no device. An
-/// interface the kernel doesn't list (tests, another machine's names) falls back to the predictable
-/// physical names: en*, eth*, wl*.
+/// interface the kernel doesn't list is never bound.
 pub fn is_physical_nic(dev: &str) -> bool {
     is_physical_nic_in(std::path::Path::new("/sys/class/net"), dev)
 }
@@ -217,7 +216,8 @@ pub fn is_physical_nic_in(sys: &Path, dev: &str) -> bool {
         let ether = std::fs::read_to_string(base.join("type")).map(|t| t.trim() == "1").unwrap_or(false);
         return ether && base.join("device").exists();
     }
-    ["en", "eth", "wl"].iter().any(|p| dev.starts_with(p))
+    // not listed by the kernel (another namespace, a stale `ip` line): not a NIC we know, so no listener
+    false
 }
 
 /// (interface, IPv4) from `ip -4 -o addr show scope global`.
@@ -234,13 +234,22 @@ pub fn parse_ip_addrs(out: &str) -> Vec<(String, String)> {
 
 /// The addresses of physical NICs (Wi-Fi, Ethernet), plus Meshnet/Tailscale with `meshnet`.
 pub fn lan_addrs(ifs: &[(String, String)], meshnet: bool) -> Vec<(String, String)> {
-    ifs.iter().filter(|(d, _)| is_physical_nic(d) || (meshnet && is_meshnet_if(d))).cloned().collect()
+    lan_addrs_with(ifs, meshnet, &is_physical_nic)
+}
+
+fn lan_addrs_with(ifs: &[(String, String)], meshnet: bool, nic: &dyn Fn(&str) -> bool) -> Vec<(String, String)> {
+    ifs.iter().filter(|(d, _)| nic(d) || (meshnet && is_meshnet_if(d))).cloned().collect()
 }
 
 /// Addresses to listen on for a `bind` setting; `ifs` = the machine's interfaces (parse_ip_addrs).
 pub fn bind_addrs(bind: &str, meshnet: bool, ifs: &[(String, String)]) -> Vec<String> {
+    bind_addrs_with(bind, meshnet, ifs, &is_physical_nic)
+}
+
+/// `bind_addrs` with the NIC test passed in (tests use a fake sysfs).
+pub fn bind_addrs_with(bind: &str, meshnet: bool, ifs: &[(String, String)], nic: &dyn Fn(&str) -> bool) -> Vec<String> {
     if bind.trim().is_empty() || bind.trim() == "auto" {
-        let mut v: Vec<String> = lan_addrs(ifs, meshnet).into_iter().map(|(_, ip)| ip).collect();
+        let mut v: Vec<String> = lan_addrs_with(ifs, meshnet, nic).into_iter().map(|(_, ip)| ip).collect();
         v.push("127.0.0.1".into());
         v.dedup();
         v
@@ -319,8 +328,8 @@ mod tests {
         for (n, want) in [("eno1", true), ("wlan0", true), ("enx_usb_vpn", false), ("podman0", false), ("proton0", false), ("ib0", false), ("veth1@if3", false), ("../etc", false)] {
             assert_eq!(is_physical_nic_in(&sys, n), want, "{n}");
         }
-        // unknown to the kernel: the predictable physical names only
-        for (n, want) in [("enp3s0", true), ("eth1", true), ("wlp2s0", true), ("cscotun0", false), ("gpd0", false), ("mullvad-se1", false), ("ipsec0", false)] {
+        // unknown to the kernel: never, whatever the name
+        for (n, want) in [("enp3s0", false), ("eth1", false), ("wlp2s0", false), ("cscotun0", false), ("gpd0", false), ("mullvad-se1", false), ("ipsec0", false)] {
             assert_eq!(is_physical_nic_in(&sys, n), want, "{n}");
         }
         let _ = std::fs::remove_dir_all(&sys);
@@ -330,10 +339,22 @@ mod tests {
     fn auto_bind_is_lan_only() {
         let out = "2: enp14s0    inet 192.168.1.231/24 brd 192.168.1.255 scope global dynamic\n3: podman0    inet 10.88.0.1/16 scope global\n4: wlp15s0    inet 192.168.1.157/24 scope global\n5: nordlynx    inet 100.85.247.147/10 scope global\n6: veth0@if2    inet 10.89.0.1/24 scope global\n7: tun0    inet 10.8.0.2/24 scope global\n";
         let ifs = parse_ip_addrs(out);
-        assert_eq!(bind_addrs("auto", false, &ifs), vec!["192.168.1.231", "192.168.1.157", "127.0.0.1"]);
-        assert_eq!(bind_addrs("", true, &ifs), vec!["192.168.1.231", "192.168.1.157", "100.85.247.147", "127.0.0.1"]);
-        assert_eq!(bind_addrs("192.168.1.157, 127.0.0.1", false, &ifs), vec!["192.168.1.157", "127.0.0.1"]);
-        assert_eq!(bind_addrs("0.0.0.0", false, &ifs), vec!["0.0.0.0"]);
+        // a fake sysfs: only the two real NICs have a device (veth/podman/tun/nordlynx don't)
+        let sys = std::env::temp_dir().join(format!("wavelink-sysnet-bind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sys);
+        for (n, ty, dev) in [("enp14s0", "1", true), ("wlp15s0", "1", true), ("podman0", "1", false), ("veth0", "1", false), ("nordlynx", "65534", false), ("tun0", "65534", false)] {
+            std::fs::create_dir_all(sys.join(n)).unwrap();
+            std::fs::write(sys.join(n).join("type"), ty).unwrap();
+            if dev {
+                std::fs::create_dir_all(sys.join(n).join("device")).unwrap();
+            }
+        }
+        let nic = |d: &str| is_physical_nic_in(&sys, d);
+        assert_eq!(bind_addrs_with("auto", false, &ifs, &nic), vec!["192.168.1.231", "192.168.1.157", "127.0.0.1"]);
+        assert_eq!(bind_addrs_with("", true, &ifs, &nic), vec!["192.168.1.231", "192.168.1.157", "100.85.247.147", "127.0.0.1"]);
+        assert_eq!(bind_addrs_with("192.168.1.157, 127.0.0.1", false, &ifs, &nic), vec!["192.168.1.157", "127.0.0.1"]);
+        assert_eq!(bind_addrs_with("0.0.0.0", false, &ifs, &nic), vec!["0.0.0.0"]);
+        let _ = std::fs::remove_dir_all(&sys);
     }
 
     #[test]

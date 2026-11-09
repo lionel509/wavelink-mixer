@@ -1090,29 +1090,34 @@ impl App {
                 }
             }
             Err(e) => {
-                let n = self.merge_fails.get() + 1;
-                self.merge_fails.set(n);
-                if n < MERGE_TRIES {
-                    eprintln!("wavelink: {e} (try {n}/{MERGE_TRIES})");
-                    self.dirty.set(true); // retry on a later tick, merging again
-                    return;
-                }
-                // it keeps failing: never spin silently, never overwrite the newer file. Park his config
-                // next to it, warn, and continue from the file.
-                self.merge_fails.set(0);
-                let parked = Config::path().with_extension("json.wavelink-failed");
-                let ok = before.save_to(&parked);
-                eprintln!(
-                    "wavelink: WARNING: config.json could not be merged {MERGE_TRIES} times in a row; {} ({e}). The window now follows config.json.",
-                    if ok { format!("this window's settings were saved to {}", parked.display()) } else { format!("saving them to {} failed too", parked.display()) }
-                );
-                if let Some(d) = Config::peek(&Config::path()) {
-                    *self.cfg.borrow_mut() = d.clone();
-                    *self.synced.borrow_mut() = d;
-                    self.dirty.set(false);
-                    self.apply_external(&before, &[]);
-                }
+                self.dirty.set(true); // a save retries (merging again) on a later tick
+                self.merge_failed(&before, &e);
             }
+        }
+    }
+
+    /// A merge (save or pull) failed. Retry on later ticks; after MERGE_TRIES in a row never spin
+    /// silently and never overwrite the newer file: park this window's config in a timestamped
+    /// config.json.wavelink-failed-<time>, warn, and follow config.json from then on.
+    fn merge_failed(self: &Rc<Self>, mine: &Config, e: &str) {
+        let n = self.merge_fails.get() + 1;
+        self.merge_fails.set(n);
+        if n < MERGE_TRIES {
+            eprintln!("wavelink: {e} (try {n}/{MERGE_TRIES})");
+            return;
+        }
+        self.merge_fails.set(0);
+        let parked = config::parked_path(&Config::path(), std::time::SystemTime::now());
+        let ok = mine.save_to(&parked);
+        eprintln!(
+            "wavelink: WARNING: config.json could not be merged {MERGE_TRIES} times in a row; {} ({e}). The window now follows config.json.",
+            if ok { format!("this window's settings were saved to {}", parked.display()) } else { format!("saving them to {} failed too", parked.display()) }
+        );
+        if let Some(d) = Config::peek(&Config::path()) {
+            *self.cfg.borrow_mut() = d.clone();
+            *self.synced.borrow_mut() = d;
+            self.dirty.set(false);
+            self.apply_external(mine, &[]);
         }
     }
 
@@ -1127,8 +1132,14 @@ impl App {
             let (mut c, mut b) = (self.cfg.borrow_mut(), self.synced.borrow_mut());
             c.pull_merged_with(&mut b, &Config::path(), &prefer)
         };
-        if disk.is_some() {
-            self.apply_external(&before, &won.into_inner());
+        match disk {
+            Ok(Some(_)) => {
+                self.merge_fails.set(0);
+                self.apply_external(&before, &won.into_inner());
+            }
+            Ok(None) => {}
+            // counted like a failed save: parked after MERGE_TRIES in a row, even when nothing is dirty
+            Err(e) => self.merge_failed(&before, &e),
         }
     }
 

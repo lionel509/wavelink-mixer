@@ -822,6 +822,8 @@ fn r3_probe_allowlist_sysfs_wins_over_name() {
     assert!(!super::settings::is_physical_nic_in(&sys, "wlan_vpn"));
     assert!(super::settings::is_physical_nic_in(&sys, "enp5s0"));
     // not in sysfs: name fallback (broad but only reachable for names the kernel doesn't show)
-    assert!(super::settings::is_physical_nic_in(&sys, "enwhatever"));
+    // [fix round 4: the coordinator asked for the stricter nit the review suggested, so a name sysfs
+    // doesn't list is now never physical; this line is inverted on purpose]
+    assert!(!super::settings::is_physical_nic_in(&sys, "enwhatever"));
     let _ = std::fs::remove_dir_all(&sys);
 }

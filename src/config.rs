@@ -465,27 +465,27 @@ impl Config {
     /// Returns the file's config when it differed from `base` (`self` is then merged, `base` = file).
     #[allow(dead_code)]
     pub fn pull_merged(&mut self, base: &mut Config, p: &std::path::Path) -> Option<Config> {
-        self.pull_merged_with(base, p, &|_, _, _| {})
+        self.pull_merged_with(base, p, &|_, _, _| {}).unwrap_or_else(|e| {
+            eprintln!("wavelink: {e}");
+            None
+        })
     }
 
-    /// `pull_merged` with the same `prefer` hook as `save_merged_with`. A failed merge changes nothing
-    /// (`base` stays, so the next save still merges instead of overwriting) and is logged.
-    pub fn pull_merged_with(&mut self, base: &mut Config, p: &std::path::Path, prefer: &dyn Fn(&Config, &Config, &mut Config)) -> Option<Config> {
-        let d = Config::peek(p)?;
+    /// `pull_merged` with the same `prefer` hook as `save_merged_with`. Err = the merge failed: nothing
+    /// changes (`base` stays, so the next save still merges instead of overwriting).
+    pub fn pull_merged_with(&mut self, base: &mut Config, p: &std::path::Path, prefer: &dyn Fn(&Config, &Config, &mut Config)) -> Result<Option<Config>, String> {
+        let Some(d) = Config::peek(p) else { return Ok(None) };
         if &d == base {
-            return None;
+            return Ok(None);
         }
         let mut mine = self.clone();
         prefer(base, &d, &mut mine);
         match merge3(base, &mine, &d) {
             Some(m) => *self = m,
-            None => {
-                eprintln!("wavelink: {}: merge with the newer file failed; keeping the window's config", p.display());
-                return None;
-            }
+            None => return Err(format!("{}: merge with the newer file failed; keeping the window's config", p.display())),
         }
         *base = d.clone();
-        Some(d)
+        Ok(Some(d))
     }
 
     /// Everything that needs the engine to rebuild the graph (not levels/mutes/EQ).
@@ -549,6 +549,19 @@ impl Config {
             ],
         }
     }
+}
+
+/// Where the window parks its config when merging keeps failing: next to config.json, timestamped so a
+/// second park never overwrites the first (config.json.wavelink-failed-<unix seconds>).
+pub fn parked_path(p: &std::path::Path, now: std::time::SystemTime) -> PathBuf {
+    let secs = now.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let mut q = p.with_extension(format!("json.wavelink-failed-{secs}"));
+    let mut n = 1;
+    while q.exists() {
+        q = p.with_extension(format!("json.wavelink-failed-{secs}-{n}"));
+        n += 1;
+    }
+    q
 }
 
 /// For inputs whose in-memory gain moved only by auto-normalize (`auto`), a gain another writer saved
@@ -894,8 +907,24 @@ mod tests {
         remote.inputs[1].gain_db = -33.0;
         remote.save_to(&p);
         gui.inputs[1].gain_db = -9.0;
-        assert!(gui.pull_merged_with(&mut base, &p, &prefer).is_some());
+        assert!(gui.pull_merged_with(&mut base, &p, &prefer).unwrap().is_some());
         assert_eq!(gui.inputs[1].gain_db, -33.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parked_files_never_overwrite_each_other() {
+        let dir = std::env::temp_dir().join(format!("wavelink-park-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let a = parked_path(&p, t);
+        assert_eq!(a.file_name().unwrap(), "config.json.wavelink-failed-1800000000");
+        std::fs::write(&a, b"x").unwrap();
+        let b = parked_path(&p, t);
+        assert_ne!(a, b);
+        assert!(b.to_string_lossy().ends_with("-1800000000-1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -920,7 +949,7 @@ mod tests {
         assert_eq!(base, Config::default_config(), "base kept: the next save merges again");
         let mut g2 = Config::default_config();
         let mut b2 = Config::default_config();
-        assert!(g2.pull_merged_with(&mut b2, &p, &bad).is_none());
+        assert!(g2.pull_merged_with(&mut b2, &p, &bad).is_err());
         assert_eq!(b2, Config::default_config());
         let _ = std::fs::remove_dir_all(&dir);
     }
