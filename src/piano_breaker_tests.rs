@@ -209,7 +209,7 @@ fn brk_note_on_chunk_edge_not_split_or_doubled() {
     }
 }
 
-/// RED (F6). The live path (44.1 kHz stereo in odd pieces -> Downmix -> tracker) must give the same
+/// RED (F5). The live path (44.1 kHz stereo in odd pieces -> Downmix -> tracker) must give the same
 /// notes as `transcribe` of the same 44.1 kHz file. Measured: 28 vs 29 notes and different
 /// durations. Root cause: `to_rate` drops the decimator's 16-sample group delay (DELAY_OUT), the live
 /// `Downmix` does not, so the live grid sits 0.73 ms later. Dropping DELAY_OUT samples from the live
@@ -695,9 +695,9 @@ fn brk_restrikes_found_when_stream_starts_mid_sound() {
     assert!(fails.is_empty(), "{}", fails.join("\n"));
 }
 
-/// GREEN probe (context for F6). The tracker is sensitive to the sub-hop grid phase: shifting the
+/// GREEN probe (context for F5). The tracker is sensitive to the sub-hop grid phase: shifting the
 /// piece by 0..256 samples moves F1 between 0.679 and 0.760 (note count 25..29). This is why the
-/// uncompensated 0.73 ms live decimator delay (F6) changes notes. Pinned loosely so it can't get worse.
+/// uncompensated 0.73 ms live decimator delay (F5) changes notes. Pinned loosely so it can't get worse.
 #[test]
 fn brk_grid_phase_sensitivity() {
     let gt = piece();
