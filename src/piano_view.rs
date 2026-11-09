@@ -31,11 +31,13 @@ pub(super) struct PianoCfg {
     pub engine: String,
     pub port: bool,
     pub split: bool,
+    /// "notes" (transcription) or "talking" (talking piano: spectral resynthesis)
+    pub mode: String,
 }
 
 impl Default for PianoCfg {
     fn default() -> Self {
-        PianoCfg { source: "spotify".into(), engine: "dsp".into(), port: false, split: true }
+        PianoCfg { source: "spotify".into(), engine: "dsp".into(), port: false, split: true, mode: "notes".into() }
     }
 }
 
@@ -94,6 +96,7 @@ impl State {
 pub(super) struct View {
     pub(super) root: gtk::Box,
     engine: gtk::DropDown,
+    mode: gtk::DropDown,
     stack: gtk::Stack,
     source: gtk::DropDown,
     on: gtk::Switch,
@@ -117,6 +120,9 @@ impl View {
         let engine = gtk::DropDown::from_strings(&["Piano DSP", "Neural stems"]);
         engine.set_tooltip_text(Some("Piano DSP: our own CPU algorithm, song → piano MIDI. Neural stems: the separator from #16."));
         name_it(&engine, "Piano engine");
+        let mode = gtk::DropDown::from_strings(&["Notes", "Talking piano"]);
+        mode.set_tooltip_text(Some("Notes: transcribe the song into piano notes. Talking piano: re-strike the 88 keys every 60 ms with the spectrum's energy, so voices come out of the piano"));
+        name_it(&mode, "Piano mode");
         let source = gtk::DropDown::from_strings(&[]);
         source.set_tooltip_text(Some("Channel to listen to (a passive tap: nothing is added to the mix)"));
         name_it(&source, "Piano source");
@@ -153,6 +159,11 @@ impl View {
         engine.update_relation(&[gtk::accessible::Relation::LabelledBy(&[engine_lbl.upcast_ref()])]);
         head.append(&engine_lbl);
         head.append(&engine);
+        let mode_lbl = gtk::Label::new(Some("Mode"));
+        mode_lbl.add_css_class("small");
+        mode.update_relation(&[gtk::accessible::Relation::LabelledBy(&[mode_lbl.upcast_ref()])]);
+        head.append(&mode_lbl);
+        head.append(&mode);
         let stack = gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).vhomogeneous(false).build();
 
         let dsp = gtk::Box::new(Orientation::Vertical, 4);
@@ -183,7 +194,7 @@ impl View {
         root.append(&head);
         stack.set_hexpand(true);
         root.append(&stack);
-        Rc::new(View { root, engine, stack, source, on, port, split, save, clear, status, readout, roll, quiet: Cell::new(false) })
+        Rc::new(View { root, engine, mode, stack, source, on, port, split, save, clear, status, readout, roll, quiet: Cell::new(false) })
     }
 }
 
@@ -219,6 +230,8 @@ pub(super) fn wire(app: &Rc<App>, v: Rc<View>) {
     v.stack.set_visible_child_name(engine_name(eng));
     v.port.set_active(saved.port);
     v.split.set_active(saved.split);
+    v.mode.set_selected(if saved.mode == "talking" { 1 } else { 0 });
+    app.piano.shared.get().mode = saved.mode.clone();
     v.quiet.set(false);
     set_port(app, &v, saved.port);
 
@@ -237,6 +250,16 @@ pub(super) fn wire(app: &Rc<App>, v: Rc<View>) {
             super::stems_view::turn_off(&a);
         }
         edit(|c| c.engine = engine_name(d.selected()).into());
+    });
+    let (a, vv) = (app.clone(), v.clone());
+    v.mode.connect_selected_notify(move |d| {
+        if vv.quiet.get() {
+            return;
+        }
+        let m = if d.selected() == 1 { "talking" } else { "notes" };
+        a.piano.shared.get().mode = m.to_string();
+        edit(|c| c.mode = m.into());
+        restart_if_on(&a);
     });
     let (a, vv) = (app.clone(), v.clone());
     v.source.connect_selected_notify(move |_| {
@@ -525,7 +548,7 @@ mod tests {
         assert_eq!((d.source.as_str(), d.engine.as_str(), d.port, d.split), ("spotify", "dsp", false, true));
         let dir = std::env::temp_dir().join(format!("wl-piano-cfg-{}", std::process::id()));
         let p = dir.join("piano.json");
-        let c = PianoCfg { source: "game".into(), engine: "neural".into(), port: true, split: false };
+        let c = PianoCfg { source: "game".into(), engine: "neural".into(), port: true, split: false, mode: "talking".into() };
         save_to(&c, &p);
         assert_eq!(load_from(&p), c);
         std::fs::write(&p, r#"{"port":true}"#).unwrap();

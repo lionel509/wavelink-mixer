@@ -261,6 +261,9 @@ pub struct Inner {
     /// there (0..1 over 40 dB under the running loudest), 0 where none was found. Empty with the
     /// old tracker core.
     pub found: VecDeque<(f64, Vec<f32>)>,
+    /// "notes" (transcription, the default) or "talking" (spectral resynthesis); read when a
+    /// session starts. MIXER_PIANO_MODE overrides.
+    pub mode: String,
     /// The detected chord right now, e.g. "F", "Bbmaj7", "Dm7"; empty when there is none.
     pub chord: String,
 }
@@ -469,10 +472,16 @@ fn push_ring(ring: &mut VecDeque<(f64, Vec<f32>)>, now: f64, vals: &[f32]) {
 enum Core {
     Sub(Box<crate::subtract::SubTracker>),
     Tracker(Box<PianoTracker>),
+    /// The talking piano: spectral resynthesis, no pianist layer.
+    Spectral(Box<crate::spectral::Spectral>),
 }
 
 impl Core {
-    fn new() -> Core {
+    fn new(mode: &str) -> Core {
+        let mode = std::env::var("MIXER_PIANO_MODE").unwrap_or_else(|_| mode.to_string());
+        if mode == "talking" {
+            return Core::Spectral(Box::new(crate::spectral::Spectral::new()));
+        }
         if std::env::var("MIXER_PIANO_CORE").as_deref() == Ok("tracker") {
             Core::Tracker(Box::new(PianoTracker::new()))
         } else {
@@ -483,18 +492,21 @@ impl Core {
         match self {
             Core::Sub(s) => s.push(x),
             Core::Tracker(t) => t.push(x),
+            Core::Spectral(s) => s.push(x),
         }
     }
     fn now(&self) -> f64 {
         match self {
             Core::Sub(s) => s.now(),
             Core::Tracker(t) => t.now(),
+            Core::Spectral(s) => s.now(),
         }
     }
     fn all_off(&mut self, t: f64) -> Vec<Ev> {
         match self {
             Core::Sub(s) => s.all_off(t),
             Core::Tracker(tr) => tr.all_off(t),
+            Core::Spectral(s) => s.all_off(t),
         }
     }
 }
@@ -517,7 +529,11 @@ impl Worker<'_> {
         let t = Instant::now();
         let raw = self.tr.push(mono);
         let mut evs = Vec::with_capacity(raw.len() + 4);
-        self.pianist.push(&raw, self.tr.now(), &mut evs);
+        if matches!(self.tr, Core::Spectral(_)) {
+            evs.extend_from_slice(&raw);
+        } else {
+            self.pianist.push(&raw, self.tr.now(), &mut evs);
+        }
         self.busy_s += (t.elapsed() + busy).as_secs_f64();
         self.audio_s += mono.len() as f64 / piano::RATE as f64;
         if let Some(p) = &self.port {
@@ -535,6 +551,9 @@ impl Worker<'_> {
             Core::Sub(st) => {
                 raw_row = st.raw_view;
                 found_row = Some(st.found_view);
+            }
+            Core::Spectral(sp) => {
+                raw_row = sp.last_view;
             }
             Core::Tracker(tr) => {
                 let sal = tr.key_salience();
@@ -583,7 +602,7 @@ fn run(o: &Opts, shared: &Shared, stop: &AtomicBool, child: &Mutex<Option<Child>
         None => None,
     };
     shared.get().port = port.as_ref().and_then(port_address);
-    let mut w = Worker { shared, port, tr: Core::new(), pianist: crate::pianist::Pianist::new(), spec_peak: 0.0, audio_s: 0.0, busy_s: 0.0 };
+    let mut w = Worker { shared, port, tr: Core::new(&shared.get().mode.clone()), pianist: crate::pianist::Pianist::new(), spec_peak: 0.0, audio_s: 0.0, busy_s: 0.0 };
     if let Some(path) = &o.wav {
         let r = replay(path, &mut w, stop);
         w.finish();
@@ -670,6 +689,7 @@ pub fn cli(args: Vec<String>) -> i32 {
     let mut v3 = None::<bool>;
     let mut drums = None::<String>;
     let mut eval = None::<String>;
+    let mut spectral = false;
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -689,11 +709,40 @@ pub fn cli(args: Vec<String>) -> i32 {
             "--vocal" => vocal = it.next(),
             "--drums" => drums = it.next(),
             "--eval" => eval = it.next(),
+            "--spectral" => spectral = true,
             other => return usage(&format!("unknown argument {other}")),
         }
     }
     if bench {
         return run_bench();
+    }
+    if let (Some(w), true) = (&wav, spectral) {
+        let (pcm, rate) = match std::fs::read(w).map_err(|e| e.to_string()).and_then(|b| piano::read_wav(&b)) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("{w}: {e}");
+                return 1;
+            }
+        };
+        let x = piano::to_rate(&pcm, rate);
+        let t = Instant::now();
+        let notes = crate::spectral::notes(&x);
+        let secs = x.len() as f64 / piano::RATE as f64;
+        println!(
+            "talking piano: {} strikes over {secs:.1} s ({:.0} note-ons/s, period {:.0} ms) in {:.2} ms per 0.5 s",
+            notes.len(),
+            notes.len() as f64 / secs,
+            crate::spectral::period_s() * 1000.0,
+            t.elapsed().as_secs_f64() * 1000.0 / (secs / 0.5)
+        );
+        if let Some(path) = out.as_deref() {
+            if let Err(e) = write_midi(path, &notes, true, Some(0.0)) {
+                eprintln!("{e}");
+                return 1;
+            }
+            println!("wrote {path}");
+        }
+        return 0;
     }
     if let Some(w) = eval {
         let (pcm, rate) = match std::fs::read(&w).map_err(|e| e.to_string()).and_then(|b| piano::read_wav(&b)) {

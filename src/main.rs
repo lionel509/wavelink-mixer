@@ -15,6 +15,7 @@ mod arrange;
 mod subtract;
 mod drums;
 mod piano_eval;
+mod spectral;
 mod sep;
 mod stemcfg;
 mod stems;
