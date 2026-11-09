@@ -1030,6 +1030,8 @@ pub struct SubTracker {
     attack_rebirth: bool,
     /// The key's own attack (short window) also counts as its onset for the onset lock.
     attack_lock: bool,
+    shh: Vec<[f32; 16]>,
+    short_onset: bool,
     /// Notes refused by the gates (for the harness).
     pub blocked: usize,
 }
@@ -1088,6 +1090,8 @@ impl SubTracker {
             sh: vec![[-120.0; 4]; KEYS],
             attack_rebirth: env_on("MIXER_PIANO_ATTACK_REBIRTH", false),
             attack_lock: env_on("MIXER_PIANO_ATTACK_LOCK", true),
+            shh: vec![[-120.0; 16]; KEYS],
+            short_onset: env_on("MIXER_PIANO_SHORT_ONSET", true),
             attack: env_on("MIXER_PIANO_ATTACK", true),
             lvl_rule: env_on("MIXER_PIANO_LEVELRULE", true),
             blocked: 0,
@@ -1277,6 +1281,7 @@ impl SubTracker {
                 let r = &mut self.sh[k];
                 let mn = r.iter().enumerate().filter(|(j, _)| *j as u64 != i % 4).map(|(_, &x)| x).fold(f32::INFINITY, f32::min);
                 r[(i % 4) as usize] = fo.short[k];
+                self.shh[k][(i % 16) as usize] = fo.short[k];
                 fo.short[k] - mn
             };
             let rise = kr > 5.0;
@@ -1323,7 +1328,23 @@ impl SubTracker {
                         if self.allow(k, s, pk, own_rise) {
                             self.last_on[k] = s;
                             self.lvl[k] = v;
-                            evs.push(Ev::On { t: (Self::t(s) - tun("ONSET_SHIFT", 0.02) as f64).max(0.0), pitch, vel });
+                            // onset time: the steepest rise of the key's short-window energy near s
+                            // (adapts to soft vs sharp attacks); else a fixed shift
+                            let t_on = if self.attack && self.short_onset {
+                                let sh = &self.shh[k];
+                                let lo = s.saturating_sub(4).max(i.saturating_sub(15));
+                                let hi = (s + 6).min(i);
+                                let j = (lo..hi.max(lo + 1))
+                                    .max_by(|&x, &y| {
+                                        let d = |j: u64| sh[((j + 1) % 16) as usize] - sh[(j % 16) as usize];
+                                        d(x).total_cmp(&d(y))
+                                    })
+                                    .unwrap_or(s);
+                                Self::t(j + 1) - tun("SHORT_LEAD", 0.012) as f64
+                            } else {
+                                Self::t(s) - tun("ONSET_SHIFT", 0.02) as f64
+                            };
+                            evs.push(Ev::On { t: t_on.max(0.0), pitch, vel });
                             KeySeg::On { s, pk, below: 0 }
                         } else {
                             self.blocked += 1;
