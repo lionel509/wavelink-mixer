@@ -8,45 +8,7 @@ set -euo pipefail
 BIN=$(readlink -f "$1"); SECS=${2:-60}; shift $(( $# < 2 ? $# : 2 ))
 SIZES=("$@"); [ ${#SIZES[@]} -eq 0 ] && SIZES=("7 5" "8 5" "10 6")
 HERE=$(dirname "$(readlink -f "$0")")
-D=$(mktemp -d /tmp/pwi-XXXXXX) || exit 1
-[ -n "$D" ] && [ -d "$D" ] || exit 1
-chmod 700 "$D"
-PIDS=()
-cleanup(){
-  trap - EXIT INT TERM
-  for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill_tree "$p"; done
-  sleep 1; rm -rf "$D"
-}
-kill_tree(){ local c; kill -STOP "$1" 2>/dev/null || true; for c in $(pgrep -P "$1" 2>/dev/null || true); do kill_tree "$c"; done; kill -CONT "$1" 2>/dev/null || true; kill "$1" 2>/dev/null || true; }
-trap cleanup EXIT INT TERM
-LIM="ulimit -Sn 1024"; [ "${HARD:-0}" = 1 ] && LIM="ulimit -n 1024"
-unset DBUS_SESSION_BUS_ADDRESS PULSE_SERVER
-export XDG_RUNTIME_DIR=$D PIPEWIRE_RUNTIME_DIR=$D XDG_CONFIG_HOME=$D/cfg XDG_STATE_HOME=$D/state XDG_DATA_HOME=$D/data
-mkdir -p "$D/cfg/wireplumber/wireplumber.conf.d" "$D/home"
-cat > "$D/cfg/wireplumber/wireplumber.conf.d/99-no-hw.conf" <<'C'
-wireplumber.profiles = {
-  main = {
-    monitor.alsa = disabled
-    monitor.alsa-midi = disabled
-    monitor.bluez = disabled
-    monitor.bluez-midi = disabled
-    monitor.v4l2 = disabled
-    monitor.libcamera = disabled
-  }
-}
-C
-( eval "$LIM"; HOME=$D/home exec pipewire >"$D/pw.log" 2>&1 ) & PIDS+=($!)
-sleep 1
-( eval "$LIM"; HOME=$D/home exec wireplumber >"$D/wp.log" 2>&1 ) & PIDS+=($!)
-sleep 3
-case $(pw-cli info 0 2>&1) in *"Core/4"*) ;; *) echo "private pipewire not up"; exit 1;; esac
-. "$HERE/guard.sh"
-if hw_visible; then echo "ABORT: a real hardware (alsa/bluez/v4l2/raop) node is visible in the private daemon"; exit 1; fi
-# stand-in outputs (names are made up; the monitors above are off so nothing real can match)
-for n in test_hw_a1 test_hw_a2 test_hw_a3; do
-  pw-cli create-node adapter "{ factory.name=support.null-audio-sink node.name=$n media.class=Audio/Sink object.linger=true audio.position=[FL,FR] }" >/dev/null
-done
-pw-cli create-node adapter "{ factory.name=support.null-audio-sink node.name=easyeffects_source media.class=Audio/Source/Virtual object.linger=true audio.position=[FL,FR] }" >/dev/null
+. "$HERE/private_daemon.sh"
 # synthetic base config: the engine's own default, plus a third hardware bus (never the live config)
 mkdir -p "$D/base"
 HOME=$D/base "$BIN" preset nosuch - - >/dev/null 2>&1 || true
