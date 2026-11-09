@@ -622,8 +622,8 @@ pub fn screw_row() -> gtk::DrawingArea {
 
 // ---------- RGB spectrum analyser ----------
 
-const FFT_N: usize = 4096;
-pub const BANDS: usize = 72;
+const FFT_N: usize = 16384;
+pub const BANDS: usize = 432;
 const F_LO: f64 = 25.0;
 const F_HI: f64 = 18000.0;
 const RATE: f64 = 48000.0;
@@ -809,6 +809,8 @@ impl Spectrum {
         let pk = self.peaks.borrow();
         let (lo, hi) = self.range.get();
         let bw = lw / (hi - lo).max(1) as f64;
+        // keep bars readable when there are hundreds of them: the gap shrinks with the bar
+        let gap = (bw * 0.25).min(2.0);
         for i in lo..hi {
             // hue keyed by the absolute band, so a frequency has the same colour in every lane;
             // in the combined view the band's zone colour wins
@@ -822,12 +824,12 @@ impl Spectrum {
             let x = lx + (i - lo) as f64 * bw;
             let bh = sh[i] * lh;
             cr.set_source_rgba(r, g, b, 0.85);
-            cr.rectangle(x, ly + lh - bh, (bw - 2.0).max(1.0), bh);
+            cr.rectangle(x, ly + lh - bh, (bw - gap).max(1.0), bh);
             let _ = cr.fill();
             // peak line left behind
             let py = (ly + lh - pk[i].0 * lh).min(ly + lh - 1.0);
             cr.set_source_rgba(r, g, b, 1.0);
-            cr.rectangle(x, py - 1.5, (bw - 2.0).max(1.0), 1.5);
+            cr.rectangle(x, py - 1.5, (bw - gap).max(1.0), 1.5);
             let _ = cr.fill();
         }
         drop((sh, pk));

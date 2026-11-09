@@ -2268,7 +2268,7 @@ pub fn activate(app: &adw::Application) {
     {
         let c = |i: usize| crate::dash::hex_rgb(piano_view::LANE_COLORS[i]);
         scope.set_zones(vec![(0.0, "BASS".into(), c(0)), (250.0, "MID".into(), c(1)), (4000.0, "HIGH".into(), c(2))]);
-        spectrum.set_zones(vec![(0.0, "BASS".into(), c(0)), (250.0, "MID".into(), c(1)), (4000.0, "HIGH".into(), c(2))]);
+        // the main bars stay RGB; the note lines carry the Bass/Mid/High colours
         spectrum.area.set_content_height(200);
         scope.area.set_content_height(180);
         scope.area.set_vexpand(true);
