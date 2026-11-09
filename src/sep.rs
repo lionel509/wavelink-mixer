@@ -282,6 +282,38 @@ pub fn pick_grids(names: &[String]) -> Result<(usize, usize), String> {
     }
 }
 
+/// Port of basic-pitch `get_infered_onsets` (n_diff = 2): where the note grid rises over the last two
+/// frames, raise the onset grid to the rise scaled to the global onset maximum.
+pub fn infer_onsets(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    const N_DIFF: usize = 2;
+    let frames = note.len();
+    let mut out: Vec<Vec<f32>> = onset.to_vec();
+    if frames == 0 {
+        return out;
+    }
+    let pitches = note[0].len();
+    let at = |f: usize, n: usize, p: usize| -> f32 { if f >= n { note[f - n][p] } else { 0.0 } };
+    let mut diff = vec![vec![0f32; pitches]; frames];
+    let mut dmax = 0f32;
+    for f in N_DIFF..frames {
+        for p in 0..pitches {
+            let d = (1..=N_DIFF).map(|n| note[f][p] - at(f, n, p)).fold(f32::INFINITY, f32::min).max(0.0);
+            diff[f][p] = d;
+            dmax = dmax.max(d);
+        }
+    }
+    if dmax <= 0.0 {
+        return out;
+    }
+    let omax = onset.iter().flat_map(|r| r.iter().copied()).fold(0f32, f32::max);
+    for f in 0..frames {
+        for p in 0..pitches {
+            out[f][p] = out[f][p].max(omax * diff[f][p] / dmax);
+        }
+    }
+    out
+}
+
 /// note and onset are [frame][pitch] grids (172 x 88).
 pub fn frames_to_notes(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<Note> {
     let frames = note.len();
@@ -290,6 +322,8 @@ pub fn frames_to_notes(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<Note> {
     }
     let pitches = note[0].len();
     let mut work: Vec<Vec<f32>> = note.to_vec();
+    let inferred = infer_onsets(note, onset);
+    let onset = &inferred[..];
 
     // Onset candidates: at or above the threshold and a local maximum in time.
     let mut cands: Vec<(f32, usize, usize)> = Vec::new();
@@ -306,7 +340,8 @@ pub fn frames_to_notes(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<Note> {
             }
         }
     }
-    cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    // deterministic: strongest first, then earliest frame, then lowest pitch
+    cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
 
     let mut out: Vec<Note> = Vec::new();
     for &(_, f, p) in &cands {
@@ -547,11 +582,15 @@ mod tests {
     fn transcriber_finds_a2() {
         let m = models::ensure(&["basic-pitch-nmp.onnx"], &|s: String| println!("{s}")).unwrap();
         let mut tr = Transcriber::load(&m).unwrap();
-        let x: Vec<f32> = (0..88200).map(|i| ((2.0 * std::f64::consts::PI * 110.0 * i as f64 / 44100.0).sin() as f32) * 0.4).collect();
+        // 1 s silence, then 1 s of A2: the attack sits at ~0.988 s (the model window starts 0.012 s in)
+        let x: Vec<f32> = (0..88200)
+            .map(|i| if i < 44100 { 0.0 } else { ((2.0 * std::f64::consts::PI * 110.0 * i as f64 / 44100.0).sin() as f32) * 0.4 })
+            .collect();
         let t0 = Instant::now();
         let ns = tr.notes(&x).unwrap();
         println!("notes ms {:.1}", t0.elapsed().as_secs_f64() * 1000.0);
-        assert!(ns.iter().any(|n| (44..=46).contains(&n.pitch) && n.t < 0.2), "{ns:?}");
+        println!("notes {ns:?}");
+        assert!(ns.iter().any(|n| (44..=46).contains(&n.pitch) && (n.t - 0.988).abs() < 0.06), "{ns:?}");
     }
 
     fn names(v: &[&str]) -> Vec<String> {
