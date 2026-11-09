@@ -324,6 +324,14 @@ pub fn eval(mono: &[f32], sections: &[(String, f64, f64)]) -> String {
                         absent += 1;
                     }
                 }
+                let mut offs: Vec<i32> = gt
+                    .iter()
+                    .filter_map(|g| notes.iter().filter(|n| n.pitch == g.pitch && (n.t - g.t).abs() < 0.15).map(|n| ((n.t - g.t) * 1000.0) as i32).min_by_key(|d| d.abs()))
+                    .collect();
+                offs.sort();
+                if !offs.is_empty() {
+                    eprintln!("onset error (est - ref, ms): median {} p10 {} p90 {} of {}", offs[offs.len() / 2], offs[offs.len() / 10], offs[offs.len() * 9 / 10], offs.len());
+                }
                 eprintln!("FN: merged into a held note {merged}, started late {late_on}, absent {absent}");
                 late.sort();
                 eprintln!("FP: same pitch, onset off by (ms): {late:?}");

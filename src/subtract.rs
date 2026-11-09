@@ -22,6 +22,8 @@ pub const HOP: usize = 256;
 /// The long window for bass pitch decisions (< 110 Hz): it ends where the short one ends, so it
 /// adds no latency.
 pub const LONG: usize = 8192;
+/// The short window for per-key attack evidence.
+pub const SHORT: usize = 1024;
 const KMAX: usize = 1000; // ~5.4 kHz
 const MAX_NOTES: usize = 14;
 
@@ -210,6 +212,11 @@ pub struct Analyzer {
     mag2: Vec<f32>,
     long_ok: bool,
     drums: Option<crate::drums::Drums>,
+    attack: bool,
+    sfft: Fft,
+    swin: Vec<f32>,
+    sre: Vec<f32>,
+    sim: Vec<f32>,
     bass_long: bool,
     cluster: bool,
     /// The last 16 short frames' per-band (drum energy, total energy), newest first.
@@ -228,6 +235,8 @@ pub struct FrameOut {
     pub hits: Vec<(u8, u8)>,
     /// Audio chroma of this frame (60 Hz-4 kHz, before whitening and subtraction).
     pub chroma: [f32; 12],
+    /// Per key, short-window (1024) energy of partials 1-4, dB: attack evidence.
+    pub short: [f32; KEYS],
 }
 
 /// The drum frame's centre relative to the analysis frame's centre.
@@ -259,6 +268,11 @@ impl Analyzer {
             mag2: vec![0.0; LONG / 8],
             long_ok: false,
             drums: if env_on("MIXER_PIANO_DRUMS", false) { Some(crate::drums::Drums::new()) } else { None },
+            attack: env_on("MIXER_PIANO_ATTACK", true),
+            sfft: Fft::new(SHORT),
+            swin: hann(SHORT),
+            sre: vec![0.0; SHORT],
+            sim: vec![0.0; SHORT],
             bass_long: env_on("MIXER_PIANO_BASSWIN", true),
             cluster: env_on("MIXER_PIANO_CLUSTER", true),
             dring: vec![[[0.0; 48]; 2]; 16],
@@ -286,6 +300,34 @@ impl Analyzer {
         } else {
             self.rr.copy_from_slice(&self.lr);
             self.ri.copy_from_slice(&self.li);
+        }
+        // attack evidence: a 1024-point window centred on the frame, per key the strongest bins near
+        // partials 1-4 (dB); its rise over a few hops is a key's own attack (the long window smears it)
+        let mut short = [-120f32; KEYS];
+        if self.attack {
+            let sn = SHORT;
+            let off = (N / 2 - sn / 2) as isize;
+            for i in 0..sn {
+                let (a, b) = get(off + i as isize);
+                self.sre[i] = if stereo { 0.5 * (a + b) } else { a } * self.swin[i];
+                self.sim[i] = 0.0;
+            }
+            self.sfft.run(&mut self.sre, &mut self.sim, false);
+            let sdf = RATE as f32 / sn as f32;
+            let sm: Vec<f32> = (0..sn / 2).map(|k| (self.sre[k] * self.sre[k] + self.sim[k] * self.sim[k]).sqrt()).collect();
+            for k in 0..KEYS {
+                let f0 = key_hz(k);
+                let mut e = 0f32;
+                for h in 1..=4 {
+                    let c = h as f32 * f0 / sdf;
+                    if c + 1.0 >= (sn / 2) as f32 {
+                        break;
+                    }
+                    let b0 = c.round() as usize;
+                    e += sm[b0.saturating_sub(1)..=(b0 + 1).min(sn / 2 - 1)].iter().fold(0f32, |m, &v| m.max(v)).powi(2);
+                }
+                short[k] = 10.0 * e.max(1e-14).log10();
+            }
         }
         let mut cen = vec![0f32; KMAX];
         let (mut xr, mut xi) = (vec![0f32; KMAX], vec![0f32; KMAX]);
@@ -557,7 +599,7 @@ impl Analyzer {
             act[k] = amp;
             found.push(Found { key: (LOW_KEY as usize + k) as u8, f0, amp, partials: parts });
         }
-        FrameOut { act, raw, found, cen, gain: self.g.clone(), hits, chroma }
+        FrameOut { act, raw, found, cen, gain: self.g.clone(), hits, chroma, short }
     }
 }
 
@@ -982,6 +1024,10 @@ pub struct SubTracker {
     /// Per key: the sounding note's level (dB, dropouts ignored) and whether re-strikes use it.
     lvl: Vec<f32>,
     lvl_rule: bool,
+    /// Per key: short-window dB for the last 4 frames (attack evidence), indexed frame % 4.
+    sh: Vec<[f32; 4]>,
+    attack: bool,
+    attack_rebirth: bool,
     /// Notes refused by the gates (for the harness).
     pub blocked: usize,
 }
@@ -1037,6 +1083,9 @@ impl SubTracker {
             last_on: vec![0; KEYS],
             last_off: vec![0; KEYS],
             lvl: vec![-120.0; KEYS],
+            sh: vec![[-120.0; 4]; KEYS],
+            attack_rebirth: env_on("MIXER_PIANO_ATTACK_REBIRTH", false),
+            attack: env_on("MIXER_PIANO_ATTACK", true),
             lvl_rule: env_on("MIXER_PIANO_LEVELRULE", true),
             blocked: 0,
         }
@@ -1220,6 +1269,13 @@ impl SubTracker {
             }
             // pumping (sidechain, compressor): a rise every sounding key shares is not an attack
             let kr = v - v3 - gshift;
+            // the key's own attack: short-window energy over its minimum of the previous 3 frames
+            let att = {
+                let r = &mut self.sh[k];
+                let mn = r.iter().enumerate().filter(|(j, _)| *j as u64 != i % 4).map(|(_, &x)| x).fold(f32::INFINITY, f32::min);
+                r[(i % 4) as usize] = fo.short[k];
+                fo.short[k] - mn
+            };
             let rise = kr > 5.0;
             let pitch = (LOW_KEY as usize + k) as u8;
             // the smoothed value is centred one frame back
@@ -1231,7 +1287,7 @@ impl SubTracker {
                     let since = i.saturating_sub(self.last_off[k]);
                     // a rebound must rise above the level the note had (decayed), not above the dropout
                     let kr_re = if self.lvl_rule { (v - (self.lvl[k] - tun("LVL_DECAY", 25.0) * fs * since as f32) - gshift).min(kr) } else { kr };
-                    let fresh = !(self.holdkey || self.decode) || since > 26 || kr_re >= tun("REBIRTH_DB", 9.0);
+                    let fresh = !(self.holdkey || self.decode) || since > 26 || kr_re >= tun("REBIRTH_DB", 9.0) || (self.attack_rebirth && att >= tun("ATTACK_DB", 11.0));
                     if fresh && v > on_db && (rise || v3 < on_db) {
                         KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i, rise: kr }
                     } else {
@@ -1284,7 +1340,7 @@ impl SubTracker {
                     let (rs_ok, drop, nbelow) = if self.decode {
                         // interval decoding (fixed lag): the note holds while the key comes back above
                         // its floor within DECODE_LAG frames; it ends where it last was above
-                        (kr >= tun("RESTRIKE_DB", if self.lvl_rule { 4.0 } else { 6.0 }) && at > s + 21, tun("OFF_DROP", 24.0), tun("DECODE_LAG", if legato() { 40.0 } else { 26.0 }) as u8)
+                        ((kr >= tun("RESTRIKE_DB", if self.lvl_rule { 4.0 } else { 6.0 }) || (self.attack && att >= tun("ATTACK_DB", 11.0))) && at > s + 21, tun("OFF_DROP", 24.0), tun("DECODE_LAG", if legato() { 40.0 } else { 26.0 }) as u8)
                     } else if self.holdkey {
                         // hold: a re-strike needs a clear new attack on this key, 250 ms after the last
                         (kr >= tun("RESTRIKE_DB", 6.0) && at > s + 21, tun("OFF_DROP", 24.0), tun("HOLD_BELOW", 8.0) as u8)
