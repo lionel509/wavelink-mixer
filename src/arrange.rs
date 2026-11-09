@@ -189,7 +189,7 @@ fn corr(a: &[f32; 12], b: &[f32; 12]) -> f32 {
     n / (da * db).sqrt().max(1e-9)
 }
 
-fn detect_key(chroma: &[f32; 12]) -> (u8, bool) {
+pub fn detect_key(chroma: &[f32; 12]) -> (u8, bool) {
     let mut best = (f32::NEG_INFINITY, 0u8, true);
     for t in 0..12u8 {
         for (prof, maj) in [(&KK_MAJ, true), (&KK_MIN, false)] {
@@ -206,7 +206,7 @@ fn detect_key(chroma: &[f32; 12]) -> (u8, bool) {
     (best.1, best.2)
 }
 
-fn scale_of(key: (u8, bool)) -> [bool; 12] {
+pub fn scale_of(key: (u8, bool)) -> [bool; 12] {
     let iv: &[u8] = if key.1 { &[0, 2, 4, 5, 7, 9, 11] } else { &[0, 2, 3, 5, 7, 8, 10] };
     let mut s = [false; 12];
     for i in iv {

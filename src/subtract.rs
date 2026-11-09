@@ -219,6 +219,8 @@ pub struct FrameOut {
     /// Drum hits found in the short frame that ends with this window: (GM note, velocity); its
     /// centre is DRUM_LEAD_S after this frame's centre.
     pub hits: Vec<(u8, u8)>,
+    /// Audio chroma of this frame (60 Hz-4 kHz, before whitening and subtraction).
+    pub chroma: [f32; 12],
 }
 
 /// The drum frame's centre relative to the analysis frame's centre.
@@ -350,6 +352,11 @@ impl Analyzer {
                 xi[k] *= m;
                 self.mag[k] *= m;
             }
+        }
+        let mut chroma = [0f32; 12];
+        for k in ((60.0 / self.df) as usize).max(1)..((4000.0 / self.df) as usize).min(KMAX) {
+            let pc = ((69.0 + 12.0 * ((k as f32 * self.df) / 440.0).log2()).round() as i32).rem_euclid(12) as usize;
+            chroma[pc] += self.mag[k].sqrt();
         }
         whiten(&self.mag, &mut self.g);
         for k in 0..KMAX {
@@ -538,7 +545,7 @@ impl Analyzer {
             act[k] = amp;
             found.push(Found { key: (LOW_KEY as usize + k) as u8, f0, amp, partials: parts });
         }
-        FrameOut { act, raw, found, cen, gain: self.g.clone(), hits }
+        FrameOut { act, raw, found, cen, gain: self.g.clone(), hits, chroma }
     }
 }
 
@@ -941,14 +948,27 @@ pub struct SubTracker {
     pub found_view: [f32; KEYS],
     raw_peak: f32,
     pub busy: std::time::Duration,
+    ctx: [f32; 12],
+    long: [f32; 12],
+    scale: [bool; 12],
+    flux_mean: f32,
+    flux_prev: f32,
+    onsets: std::collections::VecDeque<u64>,
+    gate: bool,
+    onset_lock: bool,
+    oct: bool,
+    /// Notes refused by the gates (for the harness).
+    pub blocked: usize,
 }
 
 #[derive(Clone, Copy)]
 enum KeySeg {
     Idle,
     /// Started at frame s, peak dB pk, seen since frame i0.
-    Pending { s: u64, pk: f32, i0: u64 },
+    Pending { s: u64, pk: f32, i0: u64, rise: f32 },
     On { s: u64, pk: f32, below: u8 },
+    /// Refused by a gate: waits until the key goes quiet before it may start again.
+    Blocked,
 }
 
 impl Default for SubTracker {
@@ -974,6 +994,16 @@ impl SubTracker {
             found_view: [0.0; KEYS],
             raw_peak: 1e-6,
             busy: std::time::Duration::ZERO,
+            ctx: [0.0; 12],
+            long: [0.0; 12],
+            scale: [true; 12],
+            flux_mean: 0.0,
+            flux_prev: 0.0,
+            onsets: std::collections::VecDeque::with_capacity(33),
+            gate: env_on("MIXER_PIANO_GATE", true),
+            onset_lock: env_on("MIXER_PIANO_ONSET", true),
+            oct: env_on("MIXER_PIANO_OCT", false),
+            blocked: 0,
         }
     }
 
@@ -1015,6 +1045,47 @@ impl SubTracker {
         evs
     }
 
+    /// The birth gates for a note on key `k` starting at frame `s` with peak `pk` dB (re the running
+    /// loudest): harmonic context (MIXER_PIANO_GATE), onset lock (MIXER_PIANO_ONSET), octave/fifth
+    /// over a stronger sounding note (MIXER_PIANO_OCT).
+    fn allow(&self, k: usize, s: u64, pk: f32, rise_db: f32) -> bool {
+        let own_rise = rise_db >= tun("RISE_DB", 15.0);
+        let pc = (LOW_KEY as usize + k) % 12;
+        let pk_of = |j: usize| match self.seg[j] {
+            KeySeg::On { pk, .. } => Some(pk),
+            _ => None,
+        };
+        if self.gate {
+            let mut idx: Vec<usize> = (0..12).collect();
+            idx.sort_by(|&a, &b| self.ctx[b].total_cmp(&self.ctx[a]));
+            let top = idx[..tun("GATE_TOP", 4.0) as usize].contains(&pc);
+            let strong_in_key = self.scale[pc] && pk > tun("GATE_KEY_DB", -6.0);
+            let melody = LOW_KEY as usize + k >= 60 && pk > -14.0 && (k + 1..KEYS).all(|j| pk_of(j).is_none());
+            let overwhelming = pk > tun("GATE_OFF_DB", -4.0);
+            if !(top || strong_in_key || melody || overwhelming) {
+                return false;
+            }
+        }
+        if self.onset_lock && !own_rise {
+            let w = tun("ONSET_W", 3.0) as u64;
+            if !self.onsets.iter().any(|&o| o + w >= s && o <= s + w) {
+                return false;
+            }
+        }
+        if self.oct {
+            for d in [12usize, 19, 24] {
+                if k >= d {
+                    if let Some(p) = pk_of(k - d) {
+                        if pk < p - tun("OCT_DB", 6.0) && !own_rise {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
     fn step(&mut self, fo: &FrameOut, evs: &mut Vec<crate::piano::Ev>) {
         use crate::piano::Ev;
         let on_db = tun("ON_DB", -26.0);
@@ -1029,6 +1100,30 @@ impl SubTracker {
         let rmax = fo.raw.iter().fold(0f32, |m, &v| m.max(v));
         self.raw_peak = (self.raw_peak * 10f32.powf(-0.15 * fs)).max(rmax).max(1e-6);
         let i = self.frame;
+        // harmonic context: chroma over ~1 beat, the key from the long-term chroma
+        let a = (fs / 0.75).min(1.0);
+        let ak = (fs / 30.0).min(1.0);
+        for c in 0..12 {
+            self.ctx[c] += a * (fo.chroma[c] - self.ctx[c]);
+            self.long[c] += ak * (fo.chroma[c] - self.long[c]);
+        }
+        if i % 43 == 0 {
+            self.scale = crate::arrange::scale_of(crate::arrange::detect_key(&self.long));
+        }
+        // global onsets: positive flux of the raw per-key scores against its running mean
+        let mut flux = 0f32;
+        for k in 0..KEYS {
+            let r = (fo.raw[k] / self.raw_peak).sqrt().min(1.0);
+            flux += (r - self.raw_view[k]).max(0.0);
+        }
+        self.flux_mean += (fs / 1.0).min(1.0) * (flux - self.flux_mean);
+        if flux > tun("ONSET_K", 1.5) * self.flux_mean && flux > self.flux_prev {
+            self.onsets.push_back(i);
+            while self.onsets.len() > 32 {
+                self.onsets.pop_front();
+            }
+        }
+        self.flux_prev = flux;
         for k in 0..KEYS {
             self.rawh[k][(i % 16) as usize] = fo.act[k];
             self.raw_view[k] = (fo.raw[k] / self.raw_peak).sqrt().min(1.0);
@@ -1045,12 +1140,22 @@ impl SubTracker {
             self.seg[k] = match self.seg[k] {
                 KeySeg::Idle => {
                     if v > on_db && (rise || v3 < on_db) {
-                        KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i }
+                        KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i, rise: v - v3 }
                     } else {
                         KeySeg::Idle
                     }
                 }
-                KeySeg::Pending { s, pk, i0 } => {
+                KeySeg::Blocked => {
+                    if v < off_db || v < -40.0 {
+                        KeySeg::Idle
+                    } else if rise && v > on_db {
+                        // a fresh attack on a blocked key gets a new chance
+                        KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i, rise: v - v3 }
+                    } else {
+                        KeySeg::Blocked
+                    }
+                }
+                KeySeg::Pending { s, pk, i0, rise: own_rise } => {
                     let pk = pk.max(v);
                     if v < off_db || v < pk - 18.0 {
                         KeySeg::Idle
@@ -1063,17 +1168,22 @@ impl SubTracker {
                             let d = |j: u64| rh[((j + 1) % 16) as usize] - rh[(j % 16) as usize];
                             d(x).total_cmp(&d(y))
                         }).unwrap_or(s);
-                        evs.push(Ev::On { t: Self::t(s), pitch, vel });
-                        KeySeg::On { s, pk, below: 0 }
+                        if self.allow(k, s, pk, own_rise) {
+                            evs.push(Ev::On { t: Self::t(s), pitch, vel });
+                            KeySeg::On { s, pk, below: 0 }
+                        } else {
+                            self.blocked += 1;
+                            KeySeg::Blocked
+                        }
                     } else {
-                        KeySeg::Pending { s, pk, i0 }
+                        KeySeg::Pending { s, pk, i0, rise: own_rise }
                     }
                 }
                 KeySeg::On { s, pk, below } => {
                     let pk = pk.max(v);
                     if rise && at > s + 8 && v > on_db {
                         evs.push(Ev::Off { t: Self::t(at.saturating_sub(1)), pitch });
-                        KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i }
+                        KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i, rise: v - v3 }
                     } else {
                         let below = if v < off_db || v < pk - 18.0 { below + 1 } else { 0 };
                         if below >= 3 {
