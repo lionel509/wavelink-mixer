@@ -121,6 +121,38 @@ const ONSET_RISE: f32 = 1.5;
 const ONSET_WIN: usize = 12;
 /// ...and at least this share of the larger rise of its two neighbouring keys.
 const NEIGH_RISE: f32 = 0.7;
+/// The new-note rise is measured over this many frames (a steep attack, not a slow creep).
+const RISE_LOOK: f32 = 6.0;
+/// A new note must reach the loudest key's level minus NEW_LVL_GLOBAL dB and its own key's recent
+/// peak minus NEW_LVL_KEY dB (both references decay at 3 dB/s).
+const NEW_LVL_GLOBAL: f32 = 30.0;
+const NEW_LVL_KEY: f32 = 20.0;
+const LEVEL_DECAY: f32 = 0.995_99; // 3 dB/s at 86.13 frames/s
+/// ...and either a flux onset within 2 frames of its rise or a stable pitch (spread over
+/// STAB_FRAMES at most STAB_NEW semitones).
+const GF_NEW: f32 = 0.0;
+const STAB_FRAMES: i64 = 5;
+const STAB_NEW: f32 = 99.0;
+/// Re-strike: vetoed when the key's pitch spread over 8 frames exceeds RS_STAB semitones; the fast
+/// path needs a flux of FAST_FLUX within 4 frames.
+const RS_STAB: f32 = 0.2;
+const FAST_FLUX: f32 = 99.0;
+const RS_STAB_FROM: usize = 50;
+/// A re-strike must reach the note's own peak minus RS_LVL dB.
+const RS_LVL: f32 = 24.0;
+/// Onset: walk back from the steepest rise while the energy stays above this share of the level reached.
+const ONSET_FRAC: f32 = 0.2;
+/// Switches: starting keys as re-strike rivals, and holding a drifted (vibrato) note.
+const RIVAL_NEW: f32 = 1.0;
+/// Re-strike needs a note body before its dip (1 = on).
+const BODY: f32 = 0.0;
+/// Partial-balance change that counts as a strike on the fast re-strike path.
+const SHAPE_MIN: f32 = 0.03;
+/// Pitch is only measured on peaks this far over the floor (a faint peak's position is noise).
+const PITCH_MIN: f32 = 8.0;
+const HOLD_DRIFT: f32 = 0.0;
+/// Intervals at which a starting key shares partials with a held key below it.
+const SHARED_STEPS: [usize; 8] = [7, 12, 19, 24, 28, 31, 34, 36];
 /// Semitones from a fundamental to its partials 2..8 and 10, 12, 16.
 const HARMONIC_STEPS: [usize; 10] = [12, 19, 24, 28, 31, 34, 36, 40, 43, 48];
 /// Per-key short-window energy ring (frames).
@@ -206,6 +238,11 @@ pub fn split_lanes(notes: &[Note]) -> [Vec<Note>; 3] {
         out[lane(n.pitch).index()].push(n.clone());
     }
     out
+}
+
+/// The linear factor of `db` decibels down.
+fn db_down(db: f32) -> f32 {
+    10f32.powf(-db / 20.0)
 }
 
 /// Peak-to-floor ratio -> compressed salience units (cube root, 0 at or under the floor).
@@ -468,6 +505,13 @@ pub struct PianoTracker {
     quiet: Vec<u32>,
     /// Per key: peak fast energy of the sounding note so far.
     peak_e: Vec<f32>,
+    /// Per key, per frame: pitch of its strongest low partial relative to the key, in semitones (NaN
+    /// when it has no peak there): the pitch-stability evidence.
+    ppos: Vec<[f32; RING]>,
+    /// Per key, per frame: its gate-energy peak, decaying 3 dB/s (the level a new note must reach).
+    kpk: Vec<[f32; RING]>,
+    /// Per frame: the loudest key's gate energy, decaying the same way.
+    gref: [f32; RING],
     last_trig: Vec<i64>,
     agc_db: Option<f32>,
     dc_x: f32,
@@ -556,6 +600,9 @@ impl PianoTracker {
             ended: vec![i64::MIN / 2; KEYS],
             quiet: vec![0; KEYS],
             peak_e: vec![0.0; KEYS],
+            ppos: vec![[f32::NAN; RING]; KEYS],
+            kpk: vec![[0.0; RING]; KEYS],
+            gref: [0.0; RING],
             last_trig: vec![i64::MIN / 2; KEYS],
             agc_db: None,
             dc_x: 0.0,
@@ -767,6 +814,15 @@ impl PianoTracker {
             self.energy[k][slot] = tot;
             self.genergy[k][slot] = sum(&self.ffts, &self.gkern[k]);
         }
+        // decaying level references for the new-note gate
+        let prev = (self.frame - 1).rem_euclid(RING as i64) as usize;
+        let mut top = 0f32;
+        for k in 0..KEYS {
+            let g = self.genergy[k][slot];
+            top = top.max(g);
+            self.kpk[k][slot] = (self.kpk[k][prev] * LEVEL_DECAY).max(g);
+        }
+        self.gref[slot] = (self.gref[prev] * LEVEL_DECAY).max(top);
     }
 
     fn harm_bin(k: usize, h: usize) -> usize {
@@ -1037,6 +1093,17 @@ impl PianoTracker {
                 best = (f, r);
             }
         }
+        // a slow attack (bowed, blown) rises over many frames and its steepest point comes late: walk
+        // back to where the rise began, the first frame at ONSET_FRAC of the level reached
+        let frac = tun!(ONSET_FRAC);
+        if frac > 0.0 {
+            let top = (best.0..=to).map(|j| self.energy_at(k, j)).fold(0f32, f32::max);
+            let mut j = best.0;
+            while j > from && self.energy_at(k, j - 1) >= frac * top && self.energy_at(k, j - 1) < self.energy_at(k, j) {
+                j -= 1;
+            }
+            return j;
+        }
         best.0
     }
 
@@ -1044,7 +1111,7 @@ impl PianoTracker {
     fn rise(&self, k: usize, j: i64) -> f32 {
         let g = |f: i64| self.genergy[k][f.rem_euclid(RING as i64) as usize];
         let mut lo = f32::MAX;
-        for i in j - RESTRIKE_LOOK as i64..j {
+        for i in j - tun!(RISE_LOOK) as i64..j {
             lo = lo.min(g(i));
         }
         g(j) / lo.max(1e-12)
@@ -1054,6 +1121,8 @@ impl PianoTracker {
     /// least as much as its neighbouring keys did (a new note a semitone away leaks into this key's
     /// bins and must not restart a key that is only ringing on).
     fn recent_rise(&self, k: usize, f: i64) -> bool {
+        let ring = |j: i64| j.rem_euclid(RING as i64) as usize;
+        let stable = self.pitch_spread(k, f, STAB_FRAMES).is_some_and(|sp| sp <= tun!(STAB_NEW));
         (f - ONSET_WIN as i64..=f).any(|j| {
             let r = self.rise(k, j);
             if r <= tun!(ONSET_RISE) {
@@ -1062,7 +1131,73 @@ impl PianoTracker {
             let nb = |kk: usize| self.rise(kk, j);
             let left = if k > 0 { nb(k - 1) } else { 0.0 };
             let right = if k + 1 < KEYS { nb(k + 1) } else { 0.0 };
-            r >= tun!(NEIGH_RISE) * left.max(right)
+            if r < tun!(NEIGH_RISE) * left.max(right) {
+                return false;
+            }
+            // level: the rise must reach a level near the loudest key of the moment and near this
+            // key's own recent peak (taken before the rise began), so a reverb tail 30+ dB down whose
+            // level beats in the comb filters is not a new note
+            let e = self.genergy[k][ring(j)];
+            let before = self.kpk[k][ring(j - tun!(RISE_LOOK) as i64 - 1)];
+            if e < self.gref[ring(j)] * db_down(tun!(NEW_LVL_GLOBAL)) || e < before * db_down(tun!(NEW_LVL_KEY)) {
+                return false;
+            }
+            // an attack (a flux onset next to the rise) or a steady pitch: a vibrato or glide that
+            // sweeps through the key is neither
+            let flux = (j - 2..=(j + 2).min(f)).any(|i| self.gflux[ring(i)] >= tun!(GF_NEW));
+            flux || stable
+        })
+    }
+
+    /// Spread (trimmed max - min, semitones) of key k's measured pitch over the last n frames up to f,
+    /// if it was measured in at least 3 of them.
+    fn pitch_spread(&self, k: usize, f: i64, n: i64) -> Option<f32> {
+        let mut v: Vec<f32> = (f - n + 1..=f).map(|j| self.ppos[k][j.rem_euclid(RING as i64) as usize]).filter(|v| v.is_finite()).collect();
+        if v.len() < 3 {
+            return None;
+        }
+        v.sort_by(|a, b| a.total_cmp(b));
+        // robust spread: 4x the median absolute deviation (a few transient frames at a strike don't
+        // count; a vibrato moves the pitch most of the time). For a sine of amplitude A it reads
+        // about 2.8 A, for a steady tone with rare outliers near 0
+        let med = v[v.len() / 2];
+        let mut d: Vec<f32> = v.iter().map(|x| (x - med).abs()).collect();
+        d.sort_by(|a, b| a.total_cmp(b));
+        Some(4.0 * d[d.len() / 2])
+    }
+
+    /// Records key k's pitch for this frame: the position of its strongest peak among partials 1..3,
+    /// relative to where that partial belongs, in semitones.
+    fn measure_pitch(&mut self, k: usize) {
+        let slot = self.frame.rem_euclid(RING as i64) as usize;
+        let mut best: Option<(f32, f32)> = None;
+        for h in 0..(self.nh[k] as usize).min(3) {
+            let c = self.pb[k][h] as usize;
+            for b in c - 1..=c + 1 {
+                if self.lin[b] >= tun!(PITCH_MIN) && best.is_none_or(|x| self.lin[b] > x.0) {
+                    let ideal = (k * BPS + 1) as f32 + self.hoff[h];
+                    best = Some((self.lin[b], (self.pos[b] - ideal) / BPS as f32));
+                }
+            }
+        }
+        self.ppos[k][slot] = best.map_or(f32::NAN, |b| b.1);
+    }
+
+    /// Whether a sounding key's tone is still there but drifted off its bins (a wide vibrato swings it
+    /// a semitone or more): a peak near its fundamental or 2nd partial that no other sounding key owns.
+    fn held_by_drift(&self, k: usize) -> bool {
+        let fmin = tun!(FUND_MIN);
+        (0..2).any(|h| {
+            let c = (k * BPS + 1) as f32 + self.hoff[h];
+            let c = c.round() as i64;
+            (c - 4..=c + 4).any(|b| {
+                if b < 0 || b as usize >= NBINS || self.lin[b as usize] < fmin {
+                    return false;
+                }
+                // the key this peak belongs to, as a fundamental
+                let owner = ((b as usize).saturating_sub(1) + 1) / BPS;
+                owner == k || owner >= KEYS || !self.sounding(owner)
+            })
         })
     }
 
@@ -1134,8 +1269,43 @@ impl PianoTracker {
             }
             (e / lo.max(1e-12), lifted)
         };
+        // a modulated tone (vibrato, chorus) moves in pitch; a re-strike does not
+        // (measured before the attack frames, whose transient blurs every peak position)
+        // (from D3 up: below it the long windows smear a re-strike's transient over too many frames
+        // for the pitch track to stay clean)
+        if k + LOW_KEY as usize >= RS_STAB_FROM && self.pitch_spread(k, f - 1, 12).is_some_and(|sp| sp > tun!(RS_STAB)) {
+            return None;
+        }
+        let gfl = |j: i64| self.gflux[j.rem_euclid(RING as i64) as usize];
+        // a re-strike reaches a level near the note's own peak: a bump in its reverb tail, tens of dB
+        // down, is not a new strike
+        if self.energy_at(k, f) < self.peak_e[k] * db_down(tun!(RS_LVL)) {
+            return None;
+        }
+        // a struck note has a body: between its attack and the dip before the new strike its energy
+        // sits near its peak most of the time (a held key decays slowly, then the damper drops it
+        // fast). A tremolo or swell is a sinusoid: it spends most of each cycle away from its peak
+        let body = {
+            let from = settled.max(f - RING as i64 + 2);
+            let dip = (from..f).min_by(|&a, &b| self.energy_at(k, a).total_cmp(&self.energy_at(k, b))).unwrap_or(f);
+            let span: Vec<f32> = (from..dip).map(|j| self.energy_at(k, j)).collect();
+            let pk = span.iter().fold(0f32, |a, &v| a.max(v));
+            span.len() >= 3 && span.iter().filter(|&&v| v >= 0.75 * pk).count() * 2 >= span.len()
+        };
         let (r4, l4) = rise(4);
-        if r4 >= tun!(RESTRIKE_FAST) && l4 >= 3 {
+        if tun!(BODY) > 0.5 && !body {
+            return None;
+        }
+        // the fast path still needs attack evidence near the rise: broadband flux, or a change in
+        // the balance of the key's own partials (a new strike's partials start in their own phase
+        // and brightness, so their ratios move while the old tone dies; a tremolo or swell scales
+        // every partial alike and leaves the balance where it was)
+        let attack = (f - 4..=f).any(|j| gfl(j) >= tun!(FAST_FLUX)) || self.shape_change(k, f) >= tun!(SHAPE_MIN);
+        if r4 >= tun!(RESTRIKE_FAST) && l4 >= 3 && attack {
+            #[cfg(test)]
+            if std::env::var("DBG_RS").is_ok() {
+                eprintln!("RS fast k{} f{f} r4 {r4:.2} shape {:.2} spread {:?}", k + 21, self.shape_change(k, f), self.pitch_spread(k, f - 1, 12));
+            }
             return Some(r4);
         }
         let latch = RESTRIKE_LATCH as i64;
@@ -1149,7 +1319,28 @@ impl PianoTracker {
             return None;
         }
         let (r8, l8) = rise(latch + 2);
+        #[cfg(test)]
+        if std::env::var("DBG_RS").is_ok() && r8 >= tun!(RESTRIKE) && l8 >= 3 {
+            eprintln!("RS flux k{} f{f} r8 {r8:.2} shape {:.2} spread {:?}", k + 21, self.shape_change(k, f), self.pitch_spread(k, f - 1, 12));
+        }
         (r8 >= tun!(RESTRIKE) && l8 >= 3).then_some(r8)
+    }
+
+    /// The largest change, over the last 5 frames, of the balance of key k's fast partials: the mean
+    /// absolute change of each partial's log share of the key's energy against 3 frames earlier.
+    fn shape_change(&self, k: usize, f: i64) -> f32 {
+        let he = |j: i64| self.henergy[k][j.rem_euclid(RING as i64) as usize];
+        let share = |j: i64| -> [f32; 4] {
+            let e = he(j);
+            let tot: f32 = e.iter().sum::<f32>().max(1e-12);
+            e.map(|v| (v.max(1e-12) / tot).ln())
+        };
+        (f - 4..=f)
+            .map(|j| {
+                let (a, b) = (share(j), share(j - 3));
+                (0..4).map(|h| (a[h] - b[h]).abs()).sum::<f32>() / 4.0
+            })
+            .fold(0f32, f32::max)
     }
 
     fn track(&mut self, out: &mut Vec<Ev>) {
@@ -1163,6 +1354,17 @@ impl PianoTracker {
         // re-strike candidates first: when keys that share partials (an octave, twelfth, ...) rise
         // together, only the one with the larger own rise is re-struck (C3 struck lifts the partials
         // of a held C2 too)
+        for k in 0..KEYS {
+            if self.nh[k] > 0 {
+                self.measure_pitch(k);
+            } else {
+                self.ppos[k][f.rem_euclid(RING as i64) as usize] = f32::NAN;
+            }
+        }
+        // keys about to start a note this frame (rivals of held keys whose partials they share)
+        let starting: Vec<bool> = (0..KEYS)
+            .map(|k| tun!(RIVAL_NEW) > 0.5 && matches!(self.state[k], KeyState::Idle) && self.picked.contains(&k) && self.recent_rise(k, f))
+            .collect();
         let mut rs: Vec<Option<f32>> = vec![None; KEYS];
         for k in 0..KEYS {
             // running peak of the sounding note's fast energy, measured up to the previous frame
@@ -1177,6 +1379,11 @@ impl PianoTracker {
         let strike: Vec<bool> = (0..KEYS)
             .map(|k| {
                 let Some(r) = rs[k] else { return false };
+                // a new key a fifth, octave, twelfth... above starting now is the attack, not a
+                // re-strike of the held key under it
+                if SHARED_STEPS.iter().any(|&d| k + d < KEYS && starting[k + d]) {
+                    return false;
+                }
                 !HARMONIC_STEPS.iter().any(|&d| {
                     (k + d < KEYS && rs[k + d].is_some_and(|q| q >= r)) || (k >= d && rs[k - d].is_some_and(|q| q > r))
                 })
@@ -1220,6 +1427,10 @@ impl PianoTracker {
                     }
                 }
                 KeyState::On { t0 } => {
+                    if !active && tun!(HOLD_DRIFT) > 0.5 && self.held_by_drift(k) {
+                        self.quiet[k] = 0;
+                        continue;
+                    }
                     if !active {
                         self.quiet[k] += 1;
                         if self.quiet[k] >= Self::off_frames(k) {
@@ -1640,6 +1851,15 @@ pub fn note_f1(est: &[Note], gt: &[Note], tol: f64) -> (f64, f64, f64) {
     let r = if gt.is_empty() { 1.0 } else { hit as f64 / gt.len() as f64 };
     let f = if p + r > 0.0 { 2.0 * p * r / (p + r) } else { 0.0 };
     (p, r, f)
+}
+
+/// Test renders go to ~/.cache/<name>/run-<pid>: unique per test process, so two worktrees or
+/// sessions running the FluidSynth tests at once never overwrite each other's files mid-read.
+#[cfg(test)]
+pub(crate) fn test_render_dir(name: &str) -> std::path::PathBuf {
+    let d = crate::config::glib_home().join(".cache").join(name).join(format!("run-{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    d
 }
 
 #[cfg(test)]

@@ -720,9 +720,9 @@ fn brk_grid_phase_sensitivity() {
 // ---------------------------------------------------------------------------------------------
 
 /// Renders `notes` with GM `prog` through FluidSynth (FluidR3_GM, offline -F) at `rate`, into
-/// ~/.cache/wavelink-piano-breaker/, and returns the mono PCM.
+/// ~/.cache/wavelink-piano-breaker/run-<pid>/, and returns the mono PCM.
 fn fluid(name: &str, notes: &[Note], prog: u8, rate: u32) -> Vec<f32> {
-    let dir = crate::config::glib_home().join(".cache/wavelink-piano-breaker");
+    let dir = crate::piano::test_render_dir("wavelink-piano-breaker");
     std::fs::create_dir_all(&dir).unwrap();
     let mid = dir.join(format!("{name}.mid"));
     let wav = dir.join(format!("{name}-{rate}.wav"));

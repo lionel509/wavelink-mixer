@@ -17,9 +17,9 @@ fn hz_midi(f: f64) -> f64 {
     69.0 + 12.0 * (f / 440.0).log2()
 }
 
-/// FluidSynth render with extra settings (`-o name=value`), into ~/.cache/wavelink-piano-breaker/.
+/// FluidSynth render with extra settings (`-o name=value`), into ~/.cache/wavelink-piano-breaker/run-<pid>/.
 fn fluid_opts(name: &str, notes: &[Note], prog: u8, rate: u32, opts: &[&str]) -> Vec<f32> {
-    let dir = crate::config::glib_home().join(".cache/wavelink-piano-breaker");
+    let dir = crate::piano::test_render_dir("wavelink-piano-breaker");
     std::fs::create_dir_all(&dir).unwrap();
     let mid = dir.join(format!("{name}.mid"));
     let wav = dir.join(format!("{name}-{rate}.wav"));

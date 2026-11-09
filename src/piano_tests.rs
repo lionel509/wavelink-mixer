@@ -559,80 +559,79 @@ pub(crate) fn melody_fixtures() -> Vec<(&'static str, Vec<(u8, Vec<Note>)>, Vec<
     ]
 }
 
-/// FluidSynth renders of known MIDI (FluidR3_GM, Acoustic Grand, default reverb/chorus), transcribed.
-/// fluidsynth is on the PC only (host or through distrobox-host-exec), hence #[ignore].
+/// Renders `parts` (GM program, notes) with FluidSynth (offline, -F) at `rate` into this process's
+/// own render dir; writes `<name>.mid` too and returns the mono PCM. Default reverb and chorus stay
+/// on (a song has a room too); PIANO_FIX_DRY=1 turns them off.
+pub(crate) fn fluid_render(name: &str, parts: &[(u8, Vec<Note>)], rate: u32) -> Vec<f32> {
+    let dir = test_render_dir("wavelink-piano-fixtures");
+    let font = crate::notes::synth_font().expect("FluidR3_GM.sf2 missing");
+    let bin = crate::notes::synth_bin();
+    let mid = dir.join(format!("{name}.mid"));
+    let tracks: Vec<(crate::notes::TrackSpec, Vec<Note>)> =
+        parts.iter().enumerate().map(|(i, (prog, v))| (crate::notes::TrackSpec { ch: i as u8, prog: Some(*prog), name: None }, v.clone())).collect();
+    std::fs::write(&mid, crate::notes::smf_bytes(&tracks, Some(0.0))).unwrap();
+    let dry = std::env::var("PIANO_FIX_DRY").is_ok();
+    let wav = dir.join(format!("{name}-{rate}{}.wav", if dry { "-dry" } else { "" }));
+    let fx: &[&str] = if dry { &["-R", "0", "-C", "0"] } else { &[] };
+    let args: Vec<String> = ["-ni", "-q", "-g", "0.6", "-r", &rate.to_string()]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(fx.iter().map(|s| s.to_string()))
+        .chain(["-F".to_string(), wav.display().to_string(), font.display().to_string(), mid.display().to_string()])
+        .collect();
+    let st = if std::path::Path::new(bin).exists() {
+        std::process::Command::new(bin).args(&args).status()
+    } else {
+        std::process::Command::new("distrobox-host-exec").arg("/home/linuxbrew/.linuxbrew/bin/fluidsynth").args(&args).status()
+    };
+    assert!(st.map(|s| s.success()).unwrap_or(false), "fluidsynth failed for {name}");
+    let (pcm, r) = read_wav(&std::fs::read(&wav).unwrap()).unwrap();
+    assert_eq!(r, rate);
+    pcm
+}
+
+/// Every fixture: (name, parts, melody notes). The first three are solo piano.
+pub(crate) fn all_fixtures() -> Vec<(&'static str, Vec<(u8, Vec<Note>)>, Vec<Note>)> {
+    let mut v: Vec<(&str, Vec<(u8, Vec<Note>)>, Vec<Note>)> = fixture_pieces().into_iter().map(|(n, notes)| (n, vec![(0u8, notes)], Vec::new())).collect();
+    v.extend(melody_fixtures());
+    v
+}
+
+/// FluidSynth renders of known MIDI (FluidR3_GM, default reverb/chorus), transcribed. The PRIMARY
+/// rate is 44.1 kHz, what the live tap delivers (the floors and the melody target are asserted
+/// there); 22.05 kHz renders are scored too for comparison. fluidsynth is on the PC only, hence
+/// #[ignore].
 #[test]
 #[ignore]
 fn fluidsynth_fixtures() {
-    let dir = crate::config::glib_home().join(".cache/wavelink-piano-fixtures");
-    std::fs::create_dir_all(&dir).unwrap();
-    let font = crate::notes::synth_font().expect("FluidR3_GM.sf2 missing");
-    let bin = crate::notes::synth_bin();
-    let mut worst = 1.0f64;
-    let mut report = Vec::new();
-    let mut pieces: Vec<(&str, Vec<(u8, Vec<Note>)>, Vec<Note>)> = fixture_pieces().into_iter().map(|(n, v)| (n, vec![(0u8, v)], Vec::new())).collect();
-    pieces.extend(melody_fixtures());
     let mut fails = Vec::new();
-    for (name, parts, melody) in pieces {
+    let mut report = Vec::new();
+    for (name, parts, melody) in all_fixtures() {
         let gt: Vec<Note> = parts.iter().flat_map(|p| p.1.iter().cloned()).collect();
-        let mid = dir.join(format!("{name}.mid"));
-        let wav = dir.join(format!("{name}.wav"));
-        let tracks: Vec<(crate::notes::TrackSpec, Vec<Note>)> =
-            parts.iter().enumerate().map(|(i, (prog, v))| (crate::notes::TrackSpec { ch: i as u8, prog: Some(*prog), name: None }, v.clone())).collect();
-        std::fs::write(&mid, crate::notes::smf_bytes(&tracks, Some(0.0))).unwrap();
-        // FluidSynth's default reverb and chorus stay on (a song has a room too); PIANO_FIX_DRY=1 turns them off
-        let dry = std::env::var("PIANO_FIX_DRY").is_ok();
-        let wav = if dry { dir.join(format!("{name}-dry.wav")) } else { wav };
-        let fx: &[&str] = if dry { &["-R", "0", "-C", "0"] } else { &[] };
-        let args: Vec<String> = ["-ni", "-q", "-g", "0.6", "-r", "22050"]
-            .iter()
-            .chain(fx.iter())
-            .chain(["-F"].iter())
-            .map(|s| s.to_string())
-            .chain([wav.display().to_string(), font.display().to_string(), mid.display().to_string()])
-            .collect();
-        let st = if std::path::Path::new(bin).exists() {
-            std::process::Command::new(bin).args(&args).status()
-        } else {
-            std::process::Command::new("distrobox-host-exec").arg("/home/linuxbrew/.linuxbrew/bin/fluidsynth").args(&args).status()
-        };
-        assert!(st.map(|s| s.success()).unwrap_or(false), "fluidsynth failed for {name}");
-        let (pcm, rate) = read_wav(&std::fs::read(&wav).unwrap()).unwrap();
-        let est = transcribe(&pcm, rate);
-        let (p, r, f) = note_f1(&est, &gt, TOL);
-        eprintln!("METRIC diag {name}: {}", diag(&est, &gt));
-        eprintln!("METRIC fluidsynth {name}: {} ref notes, {} est: P {p:.3} R {r:.3} F1 {f:.3}", gt.len(), est.len());
-        report.push((name, f));
-        if !melody.is_empty() {
-            let (_, mr, _) = note_f1(&est, &melody, TOL);
-            eprintln!("METRIC fluidsynth {name} melody recall {mr:.3} ({} melody notes)", melody.len());
-            if std::env::var("DBG_FIX").as_deref() == Ok(name) {
-                for m in &melody {
-                    let hit = est.iter().any(|e| e.pitch == m.pitch && (e.t - m.t).abs() <= TOL);
-                    let near: Vec<String> = est.iter().filter(|e| (e.t - m.t).abs() < 0.25).map(|e| format!("{}@{:+.0}", e.pitch, (e.t - m.t) * 1000.0)).collect();
-                    eprintln!("DBG mel {} @{:.2} {} | est {:?}", m.pitch, m.t, if hit { "ok  " } else { "MISS" }, near);
+        for rate in [44100u32, 22050] {
+            let est = transcribe(&fluid_render(name, &parts, rate), rate);
+            let (p, r, f) = note_f1(&est, &gt, TOL);
+            let tag = if rate == 44100 { "" } else { "@22k" };
+            eprintln!("METRIC diag {name}{tag}: {}", diag(&est, &gt));
+            eprintln!("METRIC fluidsynth {name}{tag}: {} ref notes, {} est: P {p:.3} R {r:.3} F1 {f:.3}", gt.len(), est.len());
+            if !melody.is_empty() {
+                let (_, mr, _) = note_f1(&est, &melody, TOL);
+                eprintln!("METRIC fluidsynth {name}{tag} melody recall {mr:.3} ({} melody notes)", melody.len());
+                // the tune must come through: a pianist's right hand over left-hand chords
+                if rate == 44100 && name == "melody" && mr < 0.8 {
+                    fails.push(format!("{name}: melody recall {mr:.3} < 0.8"));
                 }
             }
-            // the tune must come through: a pianist's right hand over left-hand chords
-            if name == "melody" && mr < 0.8 {
-                fails.push(format!("{name}: melody recall {mr:.3} < 0.8"));
+            if rate == 44100 {
+                report.push((name, f));
+                let floor = fixture_floor(name);
+                if f < floor {
+                    fails.push(format!("{name}: F1 {f:.3} < {floor}"));
+                }
             }
         }
-        let floor = fixture_floor(name);
-        if f < floor {
-            fails.push(format!("{name}: F1 {f:.3} < {floor}"));
-        }
-        if std::env::var("DBG_FIX").as_deref() == Ok(name) {
-            for w in 0..12 {
-                let (a, b) = (w as f64, w as f64 + 1.0);
-                let g: Vec<String> = gt.iter().filter(|x| x.t >= a && x.t < b).map(|x| format!("{}@{:.2}", x.pitch, x.t)).collect();
-                let e: Vec<String> = est.iter().filter(|x| x.t >= a && x.t < b).map(|x| format!("{}@{:.2}/{:.2}", x.pitch, x.t, x.dur)).collect();
-                eprintln!("DBG [{a:.0}s] gt {g:?}\n         est {e:?}");
-            }
-        }
-        worst = worst.min(f);
     }
-    eprintln!("METRIC fluidsynth worst {worst:.3}: {report:?}");
+    eprintln!("METRIC fluidsynth 44.1k: {report:?}");
     assert!(fails.is_empty(), "{}", fails.join("\n"));
 }
 
@@ -654,33 +653,17 @@ const CHORDS_FLOOR: f64 = 0.62;
 const MELODY_FLOOR: f64 = 0.70;
 
 /// Live-path latency on real piano audio, measured the scout's way: FluidSynth renders at 44.1 kHz
-/// (run `fluidsynth_fixtures` first for the .mid files), fed as stereo in 10 ms chunks through
+/// (rendered here from the fixture notes), fed as stereo in 10 ms chunks through
 /// Downmix and the tracker; each NoteOn's emission time minus its matched reference onset.
 /// Prints p50 / p90 / max and the share over 250 ms. FluidSynth on the PC only, hence #[ignore].
 #[test]
 #[ignore]
 fn fluidsynth_live_latency() {
-    let dir = crate::config::glib_home().join(".cache/wavelink-piano-fixtures");
-    let font = crate::notes::synth_font().expect("FluidR3_GM.sf2 missing");
-    let bin = crate::notes::synth_bin();
     let mut all = Vec::new();
-    for name in ["scales", "chords", "piece", "melody"] {
-        let mid = dir.join(format!("{name}.mid"));
-        let wav = dir.join(format!("{name}-44k.wav"));
-        let args: Vec<String> = ["-ni", "-q", "-g", "0.6", "-r", "44100", "-F"]
-            .iter()
-            .map(|s| s.to_string())
-            .chain([wav.display().to_string(), font.display().to_string(), mid.display().to_string()])
-            .collect();
-        let st = if std::path::Path::new(bin).exists() {
-            std::process::Command::new(bin).args(&args).status()
-        } else {
-            std::process::Command::new("distrobox-host-exec").arg("/home/linuxbrew/.linuxbrew/bin/fluidsynth").args(&args).status()
-        };
-        assert!(st.map(|s| s.success()).unwrap_or(false), "fluidsynth failed for {name}");
-        let (mono, rate) = read_wav(&std::fs::read(&wav).unwrap()).unwrap();
-        assert_eq!(rate, 44100);
-        let gt: Vec<Note> = crate::notes::parse_smf(&std::fs::read(&mid).unwrap()).unwrap().into_iter().map(|p| p.note).collect();
+    for (name, parts, _) in all_fixtures().into_iter().filter(|f| f.0 != "band") {
+        let gt: Vec<Note> = parts.iter().flat_map(|p| p.1.iter().cloned()).collect();
+        let mono = fluid_render(name, &parts, 44100);
+
         let (mut tr, mut dm) = (PianoTracker::new(), Downmix::new());
         let (mut fed, mut lat) = (0f64, Vec::new());
         for c in mono.chunks(441) {
@@ -704,4 +687,41 @@ fn fluidsynth_live_latency() {
     all.sort_by(|a, b| a.total_cmp(b));
     let q = |f: f64| all[((all.len() as f64 * f).ceil() as usize).clamp(1, all.len()) - 1];
     eprintln!("METRIC live latency all: p50 {:.0} p90 {:.0} max {:.0} ms (n={})", q(0.5), q(0.9), all[all.len() - 1], all.len());
+}
+
+#[test]
+#[ignore]
+fn dbg_shape() {
+    let gt: Vec<Note> = (0..12).map(|i| n(0.5 + i as f64 / 8.0, 0.09, 60, 90)).collect();
+    let rep = synth_piano(&gt, 2.5, 3);
+    let r = RATE as f64;
+    let mut ph = [0f64; 12];
+    let trem: Vec<f32> = (0..(2.5 * r) as usize)
+        .map(|i| {
+            let t = i as f64 / r;
+            let f0 = 440.0 * 2f64.powf((60.0 - 69.0) / 12.0);
+            let a = (t / 0.02).min(1.0) * (0.6 + 0.4 * (std::f64::consts::TAU * 7.0 * t).sin());
+            let mut v = 0f64;
+            for (h, p) in ph.iter_mut().enumerate() {
+                *p += std::f64::consts::TAU * (h + 1) as f64 * f0 / r;
+                v += p.sin() / (h + 1) as f64;
+            }
+            (0.15 * a * v) as f32
+        })
+        .collect();
+    let strings = if let Ok(w) = std::env::var("DBG_WAV") { let (p, r) = read_wav(&std::fs::read(w).unwrap()).unwrap(); to_rate(&p, r) } else { vec![0.0; 1000] };
+    for (name, x) in [("rep", rep), ("trem", trem), ("wav", strings)] {
+        let mut tr = PianoTracker::new();
+        let mut line = String::new();
+        for c in x.chunks(HOP) {
+            tr.push(c);
+            let f = tr.frame - 1;
+            if !(40..=110).contains(&f) {
+                continue;
+            }
+            let k = 60 - 21;
+            line += &format!("{f}:{:.2}/{:.2}/{:.2} ", tr.shape_change(k, f), tr.ppos[k][f.rem_euclid(RING as i64) as usize], tr.pitch_spread(k, f - 3, 8).unwrap_or(-1.0));
+        }
+        eprintln!("DBG {name}: {line}");
+    }
 }
