@@ -32,11 +32,10 @@ pub const STABLE_AFTER: Duration = Duration::from_secs(30);
 pub const MIN_CHILD_AGE: Duration = Duration::from_secs(5);
 /// An alive child that owns none of its expected nodes after this long is treated like a dead one.
 pub const ZERO_NODES_AFTER: Duration = Duration::from_secs(10);
-/// Failed restarts that leave the same set missing before the engine stops tearing the graph down.
-pub const SAME_SET_RESTARTS: u32 = 3;
-/// Stuck restarts allowed per rolling hour (any missing set, not cleared by a stable stretch)
-/// before giving up on what is missing: a node that flaps on its own ends up degraded.
-pub const RESTART_BUDGET_PER_HOUR: usize = 6;
+/// Failed restarts allowed per rolling hour before giving up on what is missing. A restart is
+/// "failed" unless the graph completed within the fresh-spawn patience and then stayed complete
+/// for STABLE_AFTER, which refunds its slot.
+pub const RESTART_BUDGET_PER_HOUR: usize = 3;
 /// While degraded, retry (one restart) only this rarely; a structure change retries at once.
 pub const DEGRADED_RETRY: Duration = Duration::from_secs(60 * 60);
 
@@ -90,16 +89,22 @@ pub struct Supervisor {
     spawned_at: Option<Instant>,
     seen_complete: bool,
     complete_since: Option<Instant>,
-    /// consecutive stuck restarts without a stable complete graph (drives the backoff)
+    /// age of the child when its graph first became complete
+    first_complete_age: Option<Duration>,
+    /// consecutive failed restarts (drives the patience backoff)
     pub stuck_restarts: u32,
-    same_set: u32,
-    /// times of recent stuck restarts (rolling hour), kept across stable stretches
+    /// failed restarts in the last hour (a worked restart is refunded)
     restart_log: Vec<Instant>,
-    /// consecutive "child owns none of its nodes" restarts (drives their capped backoff)
-    zero_restarts: u32,
-    last_set: Vec<String>,
+    /// the newest log entry may still be refunded
+    slot_open: bool,
     last_restart: Option<Instant>,
+    /// consecutive "child owns none of its nodes" restarts (capped backoff)
+    zero_restarts: u32,
+    /// the missing set the engine gave up on (partial graph kept)
     degraded: Option<Vec<String>>,
+    last_eligible: Option<usize>,
+    /// a dependency came back: the next stuck restart is not a failure
+    free_restart: bool,
 }
 
 impl Supervisor {
@@ -108,20 +113,12 @@ impl Supervisor {
         self.degraded.as_deref()
     }
 
-    fn forget_failures(&mut self) {
-        self.stuck_restarts = 0;
-        self.same_set = 0;
-        self.zero_restarts = 0;
-        self.last_set.clear();
-        self.degraded = None;
-    }
-
     /// The patience that applies to the next stuck decision.
-    pub fn patience(&self, expected_nodes: usize) -> Duration {
+    pub fn patience(&self, eligible: usize) -> Duration {
         if self.seen_complete && self.stuck_restarts == 0 {
             LOSS_GRACE
         } else {
-            graph_patience(expected_nodes, self.stuck_restarts)
+            graph_patience(eligible, self.stuck_restarts)
         }
     }
 
@@ -130,33 +127,56 @@ impl Supervisor {
         self.spawned_at = Some(now);
         self.seen_complete = false;
         self.complete_since = None;
+        self.first_complete_age = None;
     }
 
-    /// `missing`: expected child nodes that are absent (dependencies present); `expected_total`:
-    /// how many child nodes the config expects. Returns the reason to restart now, if any.
-    pub fn tick(&mut self, now: Instant, alive: bool, structure_changed: bool, missing: &[String], expected_total: usize) -> Option<Why> {
+    /// `missing`: expected child nodes that are absent (dependencies present); `eligible`: how many
+    /// child nodes have their dependencies present (see `eligible_and_missing`). Returns the reason
+    /// to restart now, if any.
+    pub fn tick(&mut self, now: Instant, alive: bool, structure_changed: bool, missing: &[String], eligible: usize) -> Option<Why> {
         let age = self.spawned_at.map(|t| now.saturating_duration_since(t));
         let old_enough = age.map_or(true, |a| a > MIN_CHILD_AGE);
+        let fresh_patience = graph_patience(eligible, 0);
+
+        // a dependency (e.g. easyeffects_source) appearing or vanishing changes what is eligible
+        if let Some(prev) = self.last_eligible.filter(|p| *p != eligible) {
+            if eligible > prev {
+                self.free_restart = true;
+            }
+            self.settle.reset(now);
+            self.stuck_restarts = 0;
+        }
+        self.last_eligible = Some(eligible);
+
         if missing.is_empty() {
             self.seen_complete = true;
+            self.free_restart = false;
+            self.first_complete_age = self.first_complete_age.or(age);
             let since = *self.complete_since.get_or_insert(now);
             if now.saturating_duration_since(since) >= STABLE_AFTER {
-                self.forget_failures();
+                self.stuck_restarts = 0;
+                self.degraded = None;
+                if self.slot_open && self.first_complete_age.map_or(false, |a| a <= fresh_patience) {
+                    self.restart_log.pop(); // that restart worked
+                }
+                self.slot_open = false;
             }
         } else {
             self.complete_since = None;
         }
         if structure_changed {
             // a different graph deserves fresh patience and a clean slate
-            self.forget_failures();
+            self.stuck_restarts = 0;
+            self.degraded = None;
             self.restart_log.clear();
+            self.slot_open = false;
+            self.free_restart = false;
             return old_enough.then_some(Why::Structure);
         }
         if !alive || self.spawned_at.is_none() {
             return old_enough.then_some(Why::Dead);
         }
-        // `expected_total` counts only nodes whose dependencies exist (the same filter as `missing`)
-        let all_missing = expected_total > 0 && missing.len() == expected_total;
+        let all_missing = eligible > 0 && missing.len() == eligible;
         if !all_missing {
             self.zero_restarts = 0;
         }
@@ -170,41 +190,62 @@ impl Supervisor {
             return None;
         }
         if let Some(d) = &self.degraded {
-            if missing.iter().all(|m| d.contains(m)) {
-                if self.last_restart.map_or(false, |t| now.saturating_duration_since(t) >= DEGRADED_RETRY) {
-                    // one more attempt, then back to degraded if it did not help
-                    self.degraded = None;
-                    self.same_set = SAME_SET_RESTARTS - 1;
-                    self.last_set = missing.to_vec();
-                    self.restart_log.clear();
-                } else {
-                    return None;
-                }
-            } else {
-                // something new is missing: the normal policy applies to it (the old set stays given up on only while it is all that is missing)
+            if age.map_or(false, |a| a < fresh_patience) {
+                return None; // a young child is still creating its nodes: no verdict yet
+            }
+            if missing.iter().any(|m| !d.contains(m)) {
+                // a new name is missing: give it a fresh budget
                 self.degraded = None;
-                self.same_set = 0;
+                self.restart_log.clear();
+                self.slot_open = false;
                 self.stuck_restarts = 0;
-                self.last_set.clear();
                 self.settle.reset(now);
+            } else if self.last_restart.map_or(false, |t| now.saturating_duration_since(t) >= DEGRADED_RETRY) {
+                // one more attempt, then degraded again if it fails
+                self.degraded = None;
+                self.restart_log = vec![now; RESTART_BUDGET_PER_HOUR - 1];
+                self.slot_open = false;
+            } else {
+                return None;
             }
         }
-        let stuck = self.settle.stuck(missing.len(), now, self.patience(expected_total));
+        let stuck = self.settle.stuck(missing.len(), now, self.patience(eligible));
         if !stuck || !old_enough {
             return None;
         }
+        if self.free_restart {
+            self.free_restart = false;
+            self.slot_open = false;
+            return Some(Why::Stuck);
+        }
         self.restart_log.retain(|t| now.saturating_duration_since(*t) < Duration::from_secs(3600));
-        if self.same_set >= SAME_SET_RESTARTS || self.restart_log.len() >= RESTART_BUDGET_PER_HOUR {
+        if self.restart_log.len() >= RESTART_BUDGET_PER_HOUR {
             self.degraded = Some(missing.to_vec());
             return None;
         }
-        self.same_set = if missing == self.last_set.as_slice() { self.same_set + 1 } else { 1 };
-        self.last_set = missing.to_vec();
         self.restart_log.push(now);
+        self.slot_open = true;
         self.stuck_restarts += 1;
         self.last_restart = Some(now);
         Some(Why::Stuck)
     }
+}
+
+/// The child nodes the config expects, split the way the supervisor needs: how many have their
+/// dependencies present (`eligible`), and which of those are absent (`missing`). One function so
+/// run() and the tests cannot drift apart.
+pub fn eligible_and_missing(cfg: &Config, has: impl Fn(&str) -> bool) -> (usize, Vec<String>) {
+    let mut eligible = 0;
+    let mut missing = vec![];
+    for (n, dep) in expected(cfg) {
+        if dep.as_ref().map(|d| has(d)).unwrap_or(true) {
+            eligible += 1;
+            if !has(&n) {
+                missing.push(n);
+            }
+        }
+    }
+    (eligible, missing)
 }
 
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
@@ -655,13 +696,7 @@ pub fn run() {
         // 2. child process: (re)start on structure change, exit, or missing nodes
         let structure = cfg.structure();
         let alive = child.as_mut().map(|c| matches!(c.try_wait(), Ok(None))).unwrap_or(false);
-        let missing: Vec<_> = expected(&cfg)
-            .into_iter()
-            .filter(|(n, dep)| !g.has(n) && dep.as_ref().map(|d| g.has(d)).unwrap_or(true))
-            .collect();
-        let missing_names: Vec<String> = missing.iter().map(|m| m.0.clone()).collect();
-        // eligible = dependencies present (same filter as `missing`, without the "is it up" test)
-        let eligible = expected(&cfg).into_iter().filter(|(_, dep)| dep.as_ref().map(|d| g.has(d)).unwrap_or(true)).count();
+        let (eligible, missing_names) = eligible_and_missing(&cfg, |n| g.has(n));
         let why = sup.tick(Instant::now(), alive, structure != child_structure, &missing_names, eligible);
         match (sup.degraded(), was_degraded) {
             (Some(d), false) => {
@@ -764,7 +799,7 @@ pub fn run() {
         }
 
         // 5. levels once everything exists
-        if levels_pending && missing.is_empty() {
+        if levels_pending && missing_names.is_empty() {
             apply_levels(&cfg, &g);
             levels_pending = false;
         }
@@ -1002,8 +1037,71 @@ mod supervisor_tests {
             let miss: &[String] = if (t / 40) % 2 == 1 { &m } else { &[] };
             if sup.tick(at(t), true, false, miss, 50).is_some() { restarts += 1; sup.spawned(at(t)); }
         }
-        assert_eq!(restarts, RESTART_BUDGET_PER_HOUR);
+        // a restart that happens to coincide with the node returning looks like success and is refunded,
+        // so a flapping node may cost a few more than the budget, but stays bounded
+        assert!((RESTART_BUDGET_PER_HOUR..=2 * RESTART_BUDGET_PER_HOUR).contains(&restarts), "{restarts}");
         assert!(sup.degraded().is_some());
+    }
+
+    #[test]
+    fn eligible_and_missing_filters_by_dependency() {
+        let cfg = Config::default_config();
+        let has = |x: &str| x.starts_with("ch_") || x.starts_with("bus_"); // EasyEffects absent
+        let (eligible, missing) = eligible_and_missing(&cfg, has);
+        assert!(eligible < expected(&cfg).len(), "mic strips are gated by easyeffects_source");
+        assert_eq!(missing.len(), eligible, "nothing of the child is up");
+        assert!(!missing.iter().any(|n| n == "strip_mic"));
+        let has2 = |x: &str| has(x) || x == "easyeffects_source";
+        let (e2, m2) = eligible_and_missing(&cfg, has2);
+        assert_eq!(e2, eligible + 2);
+        assert!(m2.iter().any(|n| n == "strip_mic"));
+    }
+
+    #[test]
+    fn restart_that_worked_is_refunded_and_a_new_loss_is_always_fixed() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut sup = Supervisor::default();
+        sup.spawned(at(0));
+        let mut restarts = vec![];
+        let mut fixed = 0;
+        for t in 1..8000u64 {
+            // a different fault every 10 min, each fixed by its own restart
+            let k = t / 600;
+            let broken = k >= 1 && fixed < k && t % 600 >= 1;
+            let m = if broken { vec![format!("r{k}")] } else { vec![] };
+            if sup.tick(at(t), true, false, &m, 50).is_some() {
+                restarts.push(t);
+                fixed = k;
+                sup.spawned(at(t));
+            }
+            assert!(sup.degraded().is_none(), "t={t}");
+        }
+        assert!(restarts.len() >= 12, "{restarts:?}");
+        assert!(restarts.iter().all(|t| t % 600 <= 8), "{restarts:?}");
+    }
+
+    #[test]
+    fn dependency_returning_gets_a_free_restart_without_spending_budget() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let strips = names(2);
+        let mut sup = Supervisor::default();
+        sup.spawned(at(0));
+        let mut t = 1;
+        let mut restarts = 0;
+        // EasyEffects restarts every 480 s (absent 3 s); the strips die when it returns
+        let mut alive_strips = true;
+        while t < 4 * 3600 {
+            let dep = t % 480 >= 3;
+            if t % 480 == 3 { alive_strips = false; }
+            let (elig, m): (usize, Vec<String>) = if dep { (50, if alive_strips { vec![] } else { strips.clone() }) } else { (48, vec![]) };
+            if sup.tick(at(t), true, false, &m, elig).is_some() { restarts += 1; alive_strips = true; sup.spawned(at(t)); }
+            assert!(sup.degraded().is_none(), "t={t}");
+            t += 1;
+        }
+        assert_eq!(restarts, 4 * 3600 / 480);
+        assert_eq!(sup.stuck_restarts, 0);
     }
 
     #[test]
