@@ -44,11 +44,14 @@ pub struct MidiOut<S: Sink> {
     pending_off: Vec<(u8, u8)>,
     /// Channels whose CC 123 still has to go out.
     pending_cc: Vec<u8>,
+    /// Note-ons held back because their key still had an undelivered note-off: they go out after
+    /// it, so a stale off can never cut the newer note (R3-F6).
+    pending_on: Vec<(u8, u8, u8)>,
 }
 
 impl<S: Sink> MidiOut<S> {
     pub fn new(sink: S) -> Self {
-        MidiOut { sink, sounding: Vec::new(), pending_off: Vec::new(), pending_cc: Vec::new() }
+        MidiOut { sink, sounding: Vec::new(), pending_off: Vec::new(), pending_cc: Vec::new(), pending_on: Vec::new() }
     }
 
     fn off(&mut self, ch: u8, key: u8) {
@@ -69,6 +72,27 @@ impl<S: Sink> MidiOut<S> {
                 self.pending_cc.push(ch);
             }
         }
+        // held-back note-ons whose key's off is out now
+        for (ch, key, vel) in std::mem::take(&mut self.pending_on) {
+            if self.pending_off.contains(&(ch, key)) || self.sink.note(true, ch, key, vel).is_err() {
+                self.pending_on.push((ch, key, vel));
+            }
+        }
+    }
+
+    /// Sends a note-on unless an older note-off of the same key is still undelivered: then that off
+    /// goes first, and if it is refused again the on waits behind it.
+    fn on(&mut self, ch: u8, key: u8, vel: u8) {
+        if let Some(i) = self.pending_off.iter().position(|x| *x == (ch, key)) {
+            if self.sink.note(false, ch, key, 0).is_err() {
+                self.pending_on.retain(|x| (x.0, x.1) != (ch, key));
+                self.pending_on.push((ch, key, vel));
+                return;
+            }
+            self.pending_off.swap_remove(i);
+        }
+        // a refused note-on is just dropped: its later note-off is harmless
+        let _ = self.sink.note(true, ch, key, vel);
     }
 
     pub fn event(&mut self, e: &Ev) {
@@ -81,14 +105,18 @@ impl<S: Sink> MidiOut<S> {
                 } else {
                     self.sounding.push((ch, pitch));
                 }
-                // a refused note-on is just dropped: its later note-off is harmless
-                let _ = self.sink.note(true, ch, pitch, vel.clamp(1, 127));
+                self.on(ch, pitch, vel.clamp(1, 127));
             }
             Ev::Off { pitch, .. } => {
                 let ch = channel(pitch);
                 if let Some(i) = self.sounding.iter().position(|x| *x == (ch, pitch)) {
                     self.sounding.swap_remove(i);
-                    self.off(ch, pitch);
+                    if let Some(j) = self.pending_on.iter().position(|x| (x.0, x.1) == (ch, pitch)) {
+                        // its on never went out: nothing to turn off
+                        self.pending_on.swap_remove(j);
+                    } else {
+                        self.off(ch, pitch);
+                    }
                 }
             }
         }
@@ -108,6 +136,7 @@ impl<S: Sink> MidiOut<S> {
     /// on the three lane channels. What the sink refuses stays queued for `flush`.
     pub fn all_off(&mut self) {
         self.flush();
+        self.pending_on.clear();
         for (ch, key) in std::mem::take(&mut self.sounding) {
             self.off(ch, key);
         }
