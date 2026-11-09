@@ -704,4 +704,34 @@ mod tests {
         println!("steady 220 Hz tone: {} notes, first {:?}", ns.len(), ns.first());
         assert!(bad.is_empty(), "notes on white noise (amp, count): {bad:?}");
     }
+
+    /// F18: a note's note grid must average at least FRAME_THRESH. A 13-frame blob alternating 0.32 / 0.05
+    /// (7 voiced of 13, so it passes a half-density rule) with an onset peak at its first frame is no note.
+    #[test]
+    fn frames_to_notes_sparse_note_dropped() {
+        let mut note = vec![vec![0f32; 88]; 172];
+        let mut onset = vec![vec![0f32; 88]; 172];
+        for k in 0..13 {
+            note[40 + k][30] = if k % 2 == 0 { 0.32 } else { 0.05 };
+        }
+        onset[40][30] = 0.9;
+        let ns = frames_to_notes(&note, &onset);
+        assert!(ns.is_empty(), "{ns:?}");
+    }
+
+    /// F18 (ignored, CPU, model): digital silence and about -60 dBFS noise are not music.
+    #[test]
+    #[ignore]
+    fn transcriber_silence_no_notes() {
+        let m = models::ensure(&["basic-pitch-nmp.onnx"], &|s: String| println!("{s}")).unwrap();
+        let mut tr = Transcriber::load(&m).unwrap();
+        let ns = tr.notes(&vec![0f32; 88200]).unwrap();
+        println!("silence: {} notes {ns:?}", ns.len());
+        let mut x = 777u64;
+        let noise: Vec<f32> = (0..88200).map(|_| (lcg(&mut x) * 2.0 - 1.0) * 0.001).collect();
+        let nn = tr.notes(&noise).unwrap();
+        println!("noise +-0.001: {} notes {nn:?}", nn.len());
+        assert!(ns.is_empty(), "notes on silence: {ns:?}");
+        assert!(nn.is_empty(), "notes on -60 dBFS noise: {nn:?}");
+    }
 }
