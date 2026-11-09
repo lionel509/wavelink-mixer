@@ -48,13 +48,19 @@ fn client_file_path() -> PathBuf {
 }
 
 fn save_client_file(f: &ClientFile) -> std::io::Result<()> {
+    save_client_file_to(&client_file_path(), f)
+}
+
+/// Writes the client file at `p` with mode 0600. `mode()` only applies on create, so the
+/// permissions are set explicitly, which also tightens a file that already existed.
+fn save_client_file_to(p: &std::path::Path, f: &ClientFile) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let p = client_file_path();
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&p)?;
+    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(p)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let body = serde_json::to_string_pretty(f).unwrap_or_default();
     file.write_all(body.as_bytes())?;
     file.write_all(b"\n")
@@ -827,6 +833,21 @@ fn activate(app: &adw::Application, o: Opts) {
 mod tests {
     use super::*;
     use wavelink_proto::Delta;
+
+    #[test]
+    fn save_client_file_tightens_an_existing_0644_file_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("wavelink-clientfile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("remote-client.json");
+        std::fs::write(&p, "{}").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let f: ClientFile = serde_json::from_str(r#"{"addr":"127.0.0.1:8791","token":"t","label":"m"}"#).unwrap();
+        save_client_file_to(&p, &f).unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mode, 0o600);
+    }
 
     #[test]
     fn sanitize_host_id_lowercases_and_strips() {

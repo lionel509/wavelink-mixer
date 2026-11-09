@@ -72,7 +72,7 @@ The Mac can join the mixer as one extra output, the **MacBook** strip. Its fader
 - Build the Mac window (needs Homebrew `gtk4 libadwaita`): `cargo build --release`.
 - Connect it once, using the token from the PC: `wavelink-mixer remote-token` on bazzite, then on the Mac `wavelink-mixer remote lionelweng-himalayas.nord --label MacBook --save`. `--save` writes the address, token and label to `~/.config/wavelink-mixer/remote-client.json` (mode 0600) on the Mac only; `config.json` is never touched. Later runs need no arguments.
 - The Mac window is the only thing that makes the strip live: it reads OFFLINE while the Mac window is closed, and its volume is the Mac's real system volume.
-- Step rule: a raise through the panel is limited to 25 points per command, so one drag cannot jump the Mac from silent to full. Lowering is never limited. The engine clamps every value to 0 to 100.
+- Step rule: the engine limits each raise to 25 points per `SetHostVolume` command. A single raise (a click on the fader, a probe) moves the Mac at most 25 points, but a drag sends a command every 40 ms, so it climbs 25 points per step and can reach full in a few hundred ms. Lowering is never limited. The engine clamps every value to 0 to 100.
 - The engine keeps the MacBook only while it runs. After a bazzite restart the strip returns when the Mac window reconnects.
 - Deploy note: bazzite needs the new engine build, `systemctl --user restart wavelink-engine`. An older engine ignores the Mac's registration, so no MacBook strip appears until it is updated.
 
