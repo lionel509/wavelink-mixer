@@ -628,7 +628,7 @@ const F_LO: f64 = 25.0;
 const F_HI: f64 = 18000.0;
 const RATE: f64 = 48000.0;
 
-fn fft(re: &mut [f32], im: &mut [f32]) {
+pub(crate) fn fft(re: &mut [f32], im: &mut [f32]) {
     let n = re.len();
     let mut j = 0;
     for i in 1..n {
@@ -673,6 +673,7 @@ pub struct Spectrum {
     peaks: std::cell::RefCell<Vec<(f64, f64)>>, // (level, hold time)
     target: std::cell::RefCell<String>,
     born: Instant,
+    compact: std::cell::Cell<bool>,
 }
 
 impl Spectrum {
@@ -686,6 +687,7 @@ impl Spectrum {
             peaks: std::cell::RefCell::new(vec![(0.0, 0.0); BANDS]),
             target: std::cell::RefCell::new(target.to_string()),
             born: Instant::now(),
+            compact: std::cell::Cell::new(false),
         });
         let w = Rc::downgrade(&s);
         area.set_draw_func(move |_, cr, wd, ht| {
@@ -694,6 +696,11 @@ impl Spectrum {
             }
         });
         s
+    }
+
+    /// Compact layout for strips: no dB or Hz labels, bars use the whole area.
+    pub fn set_compact(&self, on: bool) {
+        self.compact.set(on);
     }
 
     /// Which bus this spectrum is labelled and keyed by.
@@ -716,24 +723,27 @@ impl Spectrum {
     }
 
     fn draw(&self, cr: &cairo::Context, w: f64, h: f64) {
-        let (lx, ly, lw, lh) = (30.0, 6.0, w - 36.0, h - 24.0);
+        let compact = self.compact.get();
+        let (lx, ly, lw, lh) = if compact { (2.0, 2.0, w - 4.0, h - 4.0) } else { (30.0, 6.0, w - 36.0, h - 24.0) };
         cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
         cr.set_font_size(9.0);
         cr.set_line_width(1.0);
-        for db in [0, 24, 48] {
-            let y = (ly + lh * db as f64 / 72.0).round() + 0.5;
-            cr.set_source_rgba(1.0, 1.0, 1.0, 0.06);
-            cr.move_to(lx, y);
-            cr.line_to(lx + lw, y);
-            let _ = cr.stroke();
+        if !compact {
+            for db in [0, 24, 48] {
+                let y = (ly + lh * db as f64 / 72.0).round() + 0.5;
+                cr.set_source_rgba(1.0, 1.0, 1.0, 0.06);
+                cr.move_to(lx, y);
+                cr.line_to(lx + lw, y);
+                let _ = cr.stroke();
+                cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
+                cr.move_to(4.0, y + 3.0);
+                let _ = cr.show_text(&if db == 0 { "0".to_string() } else { format!("-{db}") });
+            }
+            let fx = |f: f64| lx + lw * (f / F_LO).ln() / (F_HI / F_LO).ln();
             cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
-            cr.move_to(4.0, y + 3.0);
-            let _ = cr.show_text(&if db == 0 { "0".to_string() } else { format!("-{db}") });
-        }
-        let fx = |f: f64| lx + lw * (f / F_LO).ln() / (F_HI / F_LO).ln();
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
-        for (f, s) in [(50.0, "50"), (100.0, "100"), (250.0, "250"), (500.0, "500"), (1000.0, "1k"), (2500.0, "2.5k"), (5000.0, "5k"), (10000.0, "10k")] {
-            text_centered(cr, fx(f), ly + lh + 10.0, s);
+            for (f, s) in [(50.0, "50"), (100.0, "100"), (250.0, "250"), (500.0, "500"), (1000.0, "1k"), (2500.0, "2.5k"), (5000.0, "5k"), (10000.0, "10k")] {
+                text_centered(cr, fx(f), ly + lh + 10.0, s);
+            }
         }
         // bars: hue runs across the frequency range and slowly cycles
         let t = self.born.elapsed().as_secs_f64();
@@ -993,8 +1003,13 @@ pub struct Fft {
 
 impl Fft {
     pub fn new() -> Fft {
+        Fft::with_rate(RATE)
+    }
+
+    /// Same bands as `new`, for a stream at `rate` Hz.
+    pub fn with_rate(rate: f64) -> Fft {
         Fft {
-            edges: (0..=BANDS).map(|i| F_LO * (F_HI / F_LO).powf(i as f64 / BANDS as f64) * FFT_N as f64 / RATE).collect(),
+            edges: (0..=BANDS).map(|i| F_LO * (F_HI / F_LO).powf(i as f64 / BANDS as f64) * FFT_N as f64 / rate).collect(),
             window: (0..FFT_N).map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (FFT_N - 1) as f32).cos()).collect(),
             ring: vec![0.0; FFT_N],
             pos: 0,
@@ -1795,5 +1810,15 @@ mod redraw_tests {
         b.step(f64::NAN, 1.0 / 30.0);
         assert!(b.level <= M_MIN + 0.5 && b.peak <= M_MIN + 0.5,
             "a NaN reading lit the meter: level {} peak {} (expected silence at {})", b.level, b.peak, M_MIN);
+    }
+
+    #[test]
+    fn fft_with_rate_scales_edges() {
+        let a = Fft::with_rate(44100.0);
+        let b = Fft::new();
+        for k in 0..=BANDS {
+            let (x, y) = (a.edges[k] * 44100.0, b.edges[k] * 48000.0);
+            assert!((x - y).abs() <= 1e-9 * y.abs(), "edge {k}: {x} vs {y}");
+        }
     }
 }

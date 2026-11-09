@@ -363,7 +363,8 @@ impl Config {
         if s.is_empty() || s.chars().next().unwrap().is_ascii_digit() {
             s = format!("x{s}");
         }
-        let taken = |x: &str| self.inputs.iter().any(|i| i.id == x) || self.buses.iter().any(|b| b.id == x);
+        // CHANNEL_ID belongs to the Stems feature: a user channel named "Stems" gets a suffixed id.
+        let taken = |x: &str| x == crate::stemcfg::CHANNEL_ID || self.inputs.iter().any(|i| i.id == x) || self.buses.iter().any(|b| b.id == x);
         let mut id = s.clone();
         let mut n = 2;
         while taken(&id) {

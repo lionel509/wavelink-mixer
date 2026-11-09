@@ -36,3 +36,9 @@ Config lives at `~/.config/wavelink-mixer/config.json`.
 - The system panel's "ms per cycle" is one graph cycle, not the end-to-end delay; use `latency` for that.
 - The force is system-wide (every app, games included) and stays after the engine stops. To release it: set `"quantum": 0` in `config.json` while the engine runs, or run `pw-metadata -n settings 0 clock.force-quantum 0`; it also clears when PipeWire restarts. Valid values: 0 or 32–2048 (numbers may be quoted); other numbers are clamped to that range and rounded up to a power of two, and an unreadable value falls back to 256.
 - If `config.json` can't be parsed, the mixer saves a copy as `config.json.bad` (or `config.json.bad.1`, `.2`, … if that name is taken) before writing defaults. If the copy can't be written, the file is left alone and defaults are used in memory only.
+
+## Stems models
+Downloaded on first use into `~/.local/share/wavelink/models/`, checked against pinned SHA-256.
+- Live engine: StemgenRT v0.7 independent streaming HS-TasNet by Axel Delafosse, weights CC BY-NC-SA 4.0 (non-commercial), https://github.com/sweetspotsoundsystem/StemgenRT-5.8. Fetched from upstream, never redistributed by this repo.
+- Quality engine: Open-Unmix UMX-HQ (MIT, sigsep/open-unmix-pytorch), ONNX exports in this repo's `models-v1` release, made by `tools/export_models.py`.
+- Notes: Basic Pitch `nmp.onnx` by Spotify, Apache-2.0, https://github.com/spotify/basic-pitch. Fetched from upstream.

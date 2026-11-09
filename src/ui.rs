@@ -1,4 +1,6 @@
 //! Mixer window: input strips (gain, EQ, FX, routes), buses, and an apps panel.
+#[path = "stems_view.rs"]
+mod stems_view;
 use crate::config::{self, db_to_vol, fmt_db, names, Bus, BusKind, Config, Input, InputKind, Route, FX_PRESETS};
 use crate::engine::bus_fader_node;
 use crate::dash::{db_to_pos, hex_rgb, Hit, pos_to_db, screw_row, Analyzer, Fft, GrMeter, Knob, Lamp, LedMeter, Patch, PatchBay, Spectrum, Vu};
@@ -374,6 +376,7 @@ pub struct App {
     apps: gtk::ListBox,
     apps_sig: RefCell<String>,
     css: gtk::CssProvider,
+    stems: stems_view::State,
 }
 
 fn label_x(text: &str) -> gtk::Label {
@@ -938,7 +941,7 @@ impl App {
         let solo = self.solo.borrow().clone();
         let inputs: Vec<(String, bool)> = self.cfg.borrow().inputs.iter().map(|i| (i.id.clone(), i.mute)).collect();
         for (id, muted) in inputs {
-            let m = muted || (!solo.is_empty() && !solo.contains(&id));
+            let m = crate::stemcfg::effective_mute(muted, &id, &solo, self.stems.replaced.borrow().as_deref());
             if let Some(nid) = self.node_id(&names::strip_in(&id)) {
                 pw::set_mute(nid, m);
             }
@@ -2280,6 +2283,11 @@ pub fn activate(app: &adw::Application) {
     patch_panel.append(&patch.area);
     stack.add_titled(&spec_panel, Some("spectrum"), "Spectrum");
     stack.add_titled(&patch_panel, Some("patch"), "Patch Bay");
+    let stems_v = stems_view::View::new();
+    let stems_panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    stems_panel.add_css_class("spectrum");
+    stems_panel.append(&stems_v.root);
+    stack.add_titled(&stems_panel, Some("stems"), "Stems");
     // System monitor: read-only health of the audio system (lives under the output strips)
     let sys_panel = gtk::Box::new(gtk::Orientation::Vertical, 6);
     sys_panel.add_css_class("syspanel");
@@ -2422,7 +2430,9 @@ pub fn activate(app: &adw::Application) {
         apps,
         apps_sig: RefCell::new(String::new()),
         css: dynamic,
+        stems: stems_view::State::new(),
     });
+    stems_view::wire(&st, stems_v.clone());
 
     let add_in = gtk::MenuButton::builder().label("+ Input").popover(&st.add_input_popover()).build();
     let add_bus = gtk::MenuButton::builder().label("+ Output").popover(&st.add_bus_popover()).build();
@@ -2545,12 +2555,14 @@ pub fn activate(app: &adw::Application) {
         // the bottom spectrum reads the bus tap's bands (no pw-record of its own)
         let src = st3.spectra.borrow().get(&format!("bus:{}", sp3.target())).cloned();
         sp3.step(dt, src.as_ref());
+        stems_view::step(&st3, dt);
         glib::ControlFlow::Continue
     });
     let (st2, ww) = (st.clone(), win.downgrade());
     let mut save_tick = 0u32;
     glib::timeout_add_local(Duration::from_millis(100), move || {
         if ww.upgrade().is_none() {
+            stems_view::shutdown(&st2);
             // never leave channels muted by a solo when the window closes
             if !st2.solo.borrow().is_empty() {
                 st2.solo.borrow_mut().clear();
@@ -2582,11 +2594,15 @@ pub fn activate(app: &adw::Application) {
             }
             return glib::ControlFlow::Break;
         }
+        // stems housekeeping runs here, not in the frame tick: the tick stops while the display sleeps
+        let mut remute = false;
         if let Some(g) = rx.try_iter().last() {
             st2.sync(&g);
             *st2.graph.borrow_mut() = g;
+            remute = true;
         }
         save_tick += 1;
+        stems_view::housekeep(&st2, remute, save_tick % 10 == 0);
         if save_tick % 5 == 0 && st2.dirty.get() {
             st2.cfg.borrow().save();
             st2.dirty.set(false);
