@@ -668,6 +668,7 @@ pub fn cli(args: Vec<String>) -> i32 {
     let mut arrange = None::<bool>;
     let (mut subtract, mut vocal) = (false, None::<String>);
     let mut v3 = None::<bool>;
+    let mut drums = None::<String>;
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -685,6 +686,7 @@ pub fn cli(args: Vec<String>) -> i32 {
             "--arrange3" => v3 = Some(false),
             "--piano3" => v3 = Some(true),
             "--vocal" => vocal = it.next(),
+            "--drums" => drums = it.next(),
             other => return usage(&format!("unknown argument {other}")),
         }
     }
@@ -693,6 +695,9 @@ pub fn cli(args: Vec<String>) -> i32 {
     }
     if let (Some(w), Some(po)) = (&wav, v3) {
         return arrange3_cli(w, out.as_deref(), po);
+    }
+    if let (Some(w), Some(d)) = (&wav, &drums) {
+        return drums_cli(w, d);
     }
     if let (Some(w), true) = (&wav, subtract || vocal.is_some()) {
         return subtract_cli(w, out.as_deref(), vocal.as_deref());
@@ -757,6 +762,39 @@ fn arrange3_cli(wav: &str, out: Option<&str>, piano_only: bool) -> i32 {
         }
         println!("wrote {path} and {}", mp.display());
     }
+    0
+}
+
+/// `piano --wav X --drums stem.wav`: the drum stem (template subtraction) and stem.mid (GM ch 10).
+fn drums_cli(wav: &str, stem: &str) -> i32 {
+    let (pcm, rate) = match std::fs::read(wav).map_err(|e| e.to_string()).and_then(|b| piano::read_wav(&b)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{wav}: {e}");
+            return 1;
+        }
+    };
+    let x = piano::to_rate(&pcm, rate);
+    let t = Instant::now();
+    let (st, notes) = crate::drums::stem_and_notes(&x);
+    let secs = x.len() as f64 / piano::RATE as f64;
+    let count = |p: u8| notes.iter().filter(|n| n.pitch == p).count();
+    println!(
+        "drums: {} hits (kick {}, snare {}, hat {}, cowbell {}) in {:.2} ms per 0.5 s",
+        notes.len(),
+        count(36),
+        count(38),
+        count(42),
+        count(56),
+        t.elapsed().as_secs_f64() * 1000.0 / (secs / 0.5)
+    );
+    let mp = std::path::Path::new(stem).with_extension("mid");
+    let mid = crate::notes::smf_bytes(&[(crate::notes::TrackSpec { ch: 9, prog: None, name: Some("Drums".into()) }, notes)], Some(0.0));
+    if let Err(e) = std::fs::write(stem, crate::subtract::wav16(&st, piano::RATE)).and_then(|_| std::fs::write(&mp, mid)) {
+        eprintln!("{stem}: {e}");
+        return 1;
+    }
+    println!("wrote {stem} and {}", mp.display());
     0
 }
 

@@ -13,6 +13,7 @@ mod piano_live;
 mod pianist;
 mod arrange;
 mod subtract;
+mod drums;
 mod sep;
 mod stemcfg;
 mod stems;

@@ -25,6 +25,15 @@ pub const LONG: usize = 8192;
 const KMAX: usize = 1000; // ~5.4 kHz
 const MAX_NOTES: usize = 14;
 
+/// Runtime A/B switches for the live path: "0"/"1" (unset: the default).
+pub fn env_on(name: &str, def: bool) -> bool {
+    match std::env::var(name).as_deref() {
+        Ok("0") | Ok("off") | Ok("false") => false,
+        Ok("1") | Ok("on") | Ok("true") => true,
+        _ => def,
+    }
+}
+
 fn tun(name: &str, def: f32) -> f32 {
     std::env::var("SUB_TUNE")
         .ok()
@@ -188,6 +197,10 @@ pub struct Analyzer {
     im2: Vec<f32>,
     mag2: Vec<f32>,
     long_ok: bool,
+    drums: Option<crate::drums::Drums>,
+    bass_long: bool,
+    /// The last 16 short frames' per-band (drum energy, total energy), newest first.
+    dring: Vec<[[f32; 48]; 2]>,
 }
 
 pub struct FrameOut {
@@ -197,7 +210,13 @@ pub struct FrameOut {
     pub found: Vec<Found>,
     pub cen: Vec<f32>,
     pub gain: Vec<f32>,
+    /// Drum hits found in the short frame that ends with this window: (GM note, velocity); its
+    /// centre is DRUM_LEAD_S after this frame's centre.
+    pub hits: Vec<(u8, u8)>,
 }
+
+/// The drum frame's centre relative to the analysis frame's centre.
+pub const DRUM_LEAD_S: f64 = (N / 2 - crate::drums::SN / 2) as f64 / RATE as f64;
 
 impl Default for Analyzer {
     fn default() -> Self {
@@ -224,6 +243,9 @@ impl Analyzer {
             im2: vec![0.0; LONG],
             mag2: vec![0.0; LONG / 8],
             long_ok: false,
+            drums: if env_on("MIXER_PIANO_DRUMS", false) { Some(crate::drums::Drums::new()) } else { None },
+            bass_long: env_on("MIXER_PIANO_BASSWIN", true),
+            dring: vec![[[0.0; 48]; 2]; 16],
         }
     }
 
@@ -259,6 +281,69 @@ impl Analyzer {
             xr[k] = 0.5 * (ar + br);
             xi[k] = 0.5 * (ai + bi);
             self.mag[k] = (xr[k] * xr[k] + xi[k] * xi[k]).sqrt();
+        }
+        // drums: a short frame ending where this window ends, fitted with the drum templates; the
+        // drum share of each band over this window (Hann-weighted over the last 16 short frames)
+        // is taken out of every bin that is not a spectral peak, before whitening and the pursuit
+        let mut hits = Vec::new();
+        if let Some(d) = self.drums.as_mut() {
+            let off = (N - crate::drums::SN) as isize;
+            let df = d.frame(
+                |i| {
+                    let (a, b) = get(off + i as isize);
+                    if stereo { 0.5 * (a + b) } else { a }
+                },
+                None,
+            );
+            hits = df.hits.clone();
+            self.dring.rotate_right(1);
+            let mut e = [[0f32; 48]; 2];
+            for b in 0..48 {
+                let dm = df.band_frac[b] * df.band_mag[b];
+                e[0][b] = dm * dm;
+                e[1][b] = df.band_mag[b] * df.band_mag[b];
+            }
+            self.dring[0] = e;
+            let lead = ((N / 2 - crate::drums::SN / 2) / HOP) as isize;
+            let mut phi = [0f32; 48];
+            let (mut ed, mut et) = ([0f32; 48], [0f32; 48]);
+            for (age, e) in self.dring.iter().enumerate() {
+                let pos = N as isize / 2 + (lead - age as isize) * HOP as isize;
+                if pos <= 0 || pos >= N as isize {
+                    continue;
+                }
+                let w = self.win[pos as usize];
+                let w2 = w * w;
+                for b in 0..48 {
+                    ed[b] += w2 * e[0][b];
+                    et[b] += w2 * e[1][b];
+                }
+            }
+            for b in 0..48 {
+                phi[b] = if et[b] > 0.0 { (ed[b] / et[b]).sqrt().clamp(0.0, 1.0) } else { 0.0 };
+            }
+            let mut pre = vec![0f32; KMAX + 1];
+            for k in 0..KMAX {
+                pre[k + 1] = pre[k] + self.mag[k];
+            }
+            let lnr = (11000.0f32 / 30.0).ln();
+            for k in 1..KMAX {
+                let f = k as f32 * self.df;
+                if f < 30.0 {
+                    continue;
+                }
+                let b = ((48.0 * (f / 30.0).ln() / lnr) as usize).min(47);
+                if phi[b] <= 0.0 {
+                    continue;
+                }
+                let (lo, hi) = (k.saturating_sub(8), (k + 9).min(KMAX));
+                let local = (pre[hi] - pre[lo]) / (hi - lo) as f32;
+                let peak = ((self.mag[k] / local.max(1e-12) - 1.0) / 3.0).clamp(0.0, 1.0);
+                let m = (1.0 - phi[b] * (1.0 - peak)).max(0.05);
+                xr[k] *= m;
+                xi[k] *= m;
+                self.mag[k] *= m;
+            }
         }
         whiten(&self.mag, &mut self.g);
         for k in 0..KMAX {
@@ -331,7 +416,7 @@ impl Analyzer {
                 k = kr as usize;
             }
             // bass: decide between the semitone neighbours on the long window (2.7 Hz bins)
-            if key_hz(k) < 110.0 {
+            if self.bass_long && key_hz(k) < 110.0 {
                 if !self.long_ok {
                     let off = N as isize - LONG as isize;
                     for i in 0..LONG {
@@ -419,7 +504,7 @@ impl Analyzer {
             act[k] = amp;
             found.push(Found { key: (LOW_KEY as usize + k) as u8, f0, amp, partials: parts });
         }
-        FrameOut { act, raw, found, cen, gain: self.g.clone() }
+        FrameOut { act, raw, found, cen, gain: self.g.clone(), hits }
     }
 }
 
