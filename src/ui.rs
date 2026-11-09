@@ -5,7 +5,7 @@ mod stems_view;
 mod piano_view;
 use crate::config::{self, db_to_vol, fmt_db, names, Bus, BusKind, Config, Input, InputKind, Route, FX_PRESETS};
 use crate::engine::bus_fader_node;
-use crate::dash::{db_to_pos, hex_rgb, Hit, pos_to_db, screw_row, Analyzer, Fft, GrMeter, Knob, Lamp, LedMeter, Patch, PatchBay, Spectrum, Vu};
+use crate::dash::{db_to_pos, hex_rgb, Hit, pos_to_db, screw_row, Analyzer, Fft, GrMeter, Knob, Lamp, LedMeter, Patch, PatchBay, Vu};
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use crate::pw::{self, Graph, Side};
@@ -2259,18 +2259,14 @@ pub fn activate(app: &adw::Application) {
 
     // RGB spectrum analyser across the bottom, tapping a chosen bus
     let spec_buses: Vec<(String, String)> = Config::load().buses.iter().map(|b| (names::bus(&b.id), b.name.clone())).collect();
-    // #23: one combined analyser: bars tinted Bass (< 250 Hz) / Mid (250 Hz-4 kHz) / High (> 4 kHz)
-    // in the piano lane colours, with the live piano notes overlaid (same bus tap, no extra FFT)
+    // #23: one super graph: a scrolling spectrogram of the chosen bus with the zones marked, a
+    // keyboard on the left, the live piano notes drawn on top, and the current spectrum at the right
     let first_bus = spec_buses.first().map(|b| b.0.as_str()).unwrap_or("bus_a1").to_string();
-    let lanes: Vec<Rc<Spectrum>> = {
-        let s = Spectrum::new(&first_bus);
+    let scope = crate::scope::NoteScope::new(&first_bus);
+    {
         let c = |i: usize| crate::dash::hex_rgb(piano_view::LANE_COLORS[i]);
-        s.set_zones(vec![(0.0, "BASS".into(), c(0)), (250.0, "MID".into(), c(1)), (4000.0, "HIGH".into(), c(2))]);
-        s.area.set_content_height(220);
-        s.area.update_property(&[gtk::accessible::Property::Label("Spectrum with Bass, Mid and High bands and piano notes")]);
-        vec![s]
-    };
-    let spectrum = lanes[0].clone();
+        scope.set_zones(vec![(0.0, "BASS".into(), c(0)), (250.0, "MID".into(), c(1)), (4000.0, "HIGH".into(), c(2))]);
+    }
     let spec_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
     spec_box.set_margin_start(12);
     spec_box.set_margin_end(12);
@@ -2284,12 +2280,10 @@ pub fn activate(app: &adw::Application) {
     let dd = gtk::DropDown::from_strings(&names_);
     dd.set_tooltip_text(Some("Which output to analyse"));
     {
-        let (lanes2, sb) = (lanes.clone(), spec_buses.clone());
+        let (sc2, sb) = (scope.clone(), spec_buses.clone());
         dd.connect_selected_notify(move |d| {
             if let Some(b) = sb.get(d.selected() as usize) {
-                for l in lanes2.iter() {
-                    l.set_target(&b.0);
-                }
+                sc2.set_target(&b.0);
             }
         });
     }
@@ -2297,9 +2291,7 @@ pub fn activate(app: &adw::Application) {
     let stack = gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).build();
     let spec_panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
     spec_panel.add_css_class("spectrum");
-    for l in lanes.iter() {
-        spec_panel.append(&l.area);
-    }
+    spec_panel.append(&scope.area);
     let patch_panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
     patch_panel.add_css_class("spectrum");
     patch_panel.append(&patch.area);
@@ -2565,7 +2557,7 @@ pub fn activate(app: &adw::Application) {
         std::thread::sleep(Duration::from_millis(500));
     });
     // animate needles and spectrum on the frame clock (never starves redraws, pauses when hidden)
-    let (st3, sp3, lanes3) = (st.clone(), spectrum.clone(), lanes.clone());
+    let (st3, sc3) = (st.clone(), scope.clone());
     let last_frame = Cell::new(0i64);
     // meters and the spectrum animate at 30 Hz, not at the refresh rate
     let cap = crate::dash::FrameCap::new();
@@ -2588,26 +2580,28 @@ pub fn activate(app: &adw::Application) {
             t(dt);
         }
         // the bottom spectrum reads the bus tap's bands (no pw-record of its own)
-        let src = st3.spectra.borrow().get(&format!("bus:{}", sp3.target())).cloned();
-        // MIDI overlay (#23): sounding piano notes, plus notes that ended in the last 0.4 s fading out
-        let marks: Vec<(f64, f64, (f64, f64, f64))> = if st3.piano.session.borrow().is_some() {
-            let g = st3.piano.shared.get();
-            let hz = |p: u8| 440.0 * 2f64.powf((p as f64 - 69.0) / 12.0);
-            let col = |p: u8| crate::dash::hex_rgb(piano_view::LANE_COLORS[crate::piano::lane(p).index()]);
-            let mut m: Vec<_> = g.open.iter().map(|&(_, p, v, _)| (hz(p), 0.55 + v as f64 / 280.0, col(p))).collect();
-            for n in g.roll.iter() {
-                let ago = g.now - (n.t + n.dur);
-                if (0.0..0.4).contains(&ago) {
-                    m.push((hz(n.pitch), 0.6 * (1.0 - ago / 0.4), col(n.pitch)));
-                }
-            }
-            m
-        } else {
-            Vec::new()
-        };
-        for l in lanes3.iter() {
-            l.step(dt, src.as_ref());
-            l.set_marks(marks.clone());
+        let src = st3.spectra.borrow().get(&format!("bus:{}", sc3.target())).cloned();
+        if sc3.area.is_mapped() {
+            let bands = src.as_ref().map(|a| a.lock().unwrap().clone()).unwrap_or_default();
+            sc3.push_bands(&bands);
+            // live piano notes as ages relative to the take clock (sounding notes end at "now")
+            let marks: Vec<crate::scope::Mark> = if st3.piano.session.borrow().is_some() {
+                let g = st3.piano.shared.get();
+                let col = |p: u8| crate::dash::hex_rgb(piano_view::LANE_COLORS[crate::piano::lane(p).index()]);
+                let from = g.now - crate::scope::SPAN_S;
+                let mut m: Vec<_> = g
+                    .roll
+                    .iter()
+                    .filter(|n| n.t + n.dur >= from)
+                    .map(|n| crate::scope::Mark { ago_start: g.now - n.t, ago_end: g.now - (n.t + n.dur), pitch: n.pitch, rgb: col(n.pitch), vel: n.vel })
+                    .collect();
+                m.extend(g.open.iter().map(|&(t, p, v, _)| crate::scope::Mark { ago_start: g.now - t, ago_end: 0.0, pitch: p, rgb: col(p), vel: v }));
+                m
+            } else {
+                Vec::new()
+            };
+            sc3.set_notes(marks);
+            sc3.redraw();
         }
         stems_view::step(&st3, dt);
         piano_view::step(&st3, dt);

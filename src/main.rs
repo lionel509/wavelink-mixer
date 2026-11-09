@@ -4,6 +4,7 @@
 //!   wavelink-mixer piano     song -> piano MIDI (offline --wav, live --source, --bench)
 mod config;
 mod dash;
+mod scope;
 mod dsp;
 mod models;
 mod notes;
