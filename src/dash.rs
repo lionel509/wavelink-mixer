@@ -678,6 +678,8 @@ pub struct Spectrum {
     range: std::cell::Cell<(usize, usize)>,
     /// lane name drawn top-left (empty: none)
     title: std::cell::RefCell<String>,
+    /// MIDI notes overlaid on the bars: (frequency Hz, opacity 0..1, colour)
+    marks: std::cell::RefCell<Vec<(f64, f64, (f64, f64, f64))>>,
 }
 
 /// Band index (0..=BANDS) whose lower edge is nearest to `f` Hz on the analyser's log axis.
@@ -705,6 +707,7 @@ impl Spectrum {
             compact: std::cell::Cell::new(false),
             range: std::cell::Cell::new((0, BANDS)),
             title: std::cell::RefCell::new(String::new()),
+            marks: std::cell::RefCell::new(Vec::new()),
         });
         let w = Rc::downgrade(&s);
         area.set_draw_func(move |_, cr, wd, ht| {
@@ -726,6 +729,14 @@ impl Spectrum {
         let lo = lo.min(hi.saturating_sub(1));
         self.range.set((lo, hi));
         self.area.queue_draw();
+    }
+
+    /// Notes to overlay as glowing lines at their fundamental (redraws only when they change).
+    pub fn set_marks(&self, m: Vec<(f64, f64, (f64, f64, f64))>) {
+        if *self.marks.borrow() != m {
+            *self.marks.borrow_mut() = m;
+            self.area.queue_draw();
+        }
     }
 
     /// Lane name drawn in the top-left corner.
@@ -804,6 +815,22 @@ impl Spectrum {
             let _ = cr.fill();
         }
         drop((sh, pk));
+        // MIDI overlay: one line per note at its fundamental, in its lane colour, fading after note-off
+        let (flo, fhi) = (band_edge(lo), band_edge(hi));
+        for &(f, a, (r, g, b)) in self.marks.borrow().iter() {
+            if f < flo || f >= fhi || a <= 0.0 {
+                continue;
+            }
+            let x = lx + lw * (f / flo).ln() / (fhi / flo).ln();
+            cr.set_source_rgba(r, g, b, 0.25 * a);
+            cr.rectangle(x - 3.0, ly, 6.0, lh);
+            let _ = cr.fill();
+            cr.set_source_rgba(r, g, b, 0.95 * a);
+            cr.rectangle(x - 1.0, ly, 2.0, lh);
+            let _ = cr.fill();
+            cr.arc(x, ly + 3.0, 3.0, 0.0, 2.0 * PI);
+            let _ = cr.fill();
+        }
         let title = self.title.borrow();
         if !title.is_empty() {
             cr.set_font_size(11.0);

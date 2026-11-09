@@ -62,7 +62,7 @@ pub(super) fn save_to(c: &PianoCfg, p: &Path) {
 
 pub(super) struct State {
     pub(super) shared: Shared,
-    session: RefCell<Option<Session>>,
+    pub(super) session: RefCell<Option<Session>>,
     /// The "Wavelink Piano" client: opened when Live MIDI port is ticked, kept for the app's life
     /// across sessions and source changes, emptied (all-notes-off) when unticked or at shutdown.
     port: Port,

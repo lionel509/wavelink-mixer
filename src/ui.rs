@@ -2593,8 +2593,25 @@ pub fn activate(app: &adw::Application) {
         }
         // the bottom spectrum reads the bus tap's bands (no pw-record of its own)
         let src = st3.spectra.borrow().get(&format!("bus:{}", sp3.target())).cloned();
+        // MIDI overlay (#23): sounding piano notes, plus notes that ended in the last 0.4 s fading out
+        let marks: Vec<(f64, f64, (f64, f64, f64))> = if st3.piano.session.borrow().is_some() {
+            let g = st3.piano.shared.get();
+            let hz = |p: u8| 440.0 * 2f64.powf((p as f64 - 69.0) / 12.0);
+            let col = |p: u8| crate::dash::hex_rgb(piano_view::LANE_COLORS[crate::piano::lane(p).index()]);
+            let mut m: Vec<_> = g.open.iter().map(|&(_, p, v, _)| (hz(p), 0.55 + v as f64 / 280.0, col(p))).collect();
+            for n in g.roll.iter() {
+                let ago = g.now - (n.t + n.dur);
+                if (0.0..0.4).contains(&ago) {
+                    m.push((hz(n.pitch), 0.6 * (1.0 - ago / 0.4), col(n.pitch)));
+                }
+            }
+            m
+        } else {
+            Vec::new()
+        };
         for l in lanes3.iter() {
             l.step(dt, src.as_ref());
+            l.set_marks(marks.clone());
         }
         stems_view::step(&st3, dt);
         piano_view::step(&st3, dt);
