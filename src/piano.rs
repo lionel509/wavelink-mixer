@@ -1840,13 +1840,64 @@ pub fn note_f1(est: &[Note], gt: &[Note], tol: f64) -> (f64, f64, f64) {
     (p, r, f)
 }
 
-/// Test renders go to ~/.cache/<name>/run-<pid>: unique per test process, so two worktrees or
-/// sessions running the FluidSynth tests at once never overwrite each other's files mid-read.
+/// Test renders go to ~/.cache/<name>/run-<pid>/<n>: unique per test process and per call, so two
+/// worktrees or sessions running the FluidSynth tests at once never overwrite each other's files
+/// mid-read. The returned guard deletes its directory when dropped (the render has been read by
+/// then); the first call of a process also prunes run-* directories whose process is gone or that
+/// are older than an hour (a killed run leaves its files behind).
 #[cfg(test)]
-pub(crate) fn test_render_dir(name: &str) -> std::path::PathBuf {
-    let d = crate::config::glib_home().join(".cache").join(name).join(format!("run-{}", std::process::id()));
+pub(crate) struct RenderDir(std::path::PathBuf);
+
+#[cfg(test)]
+impl std::ops::Deref for RenderDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl AsRef<std::path::Path> for RenderDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for RenderDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_render_dir(name: &str) -> RenderDir {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    static PRUNED: std::sync::Once = std::sync::Once::new();
+    let root = crate::config::glib_home().join(".cache").join(name);
+    PRUNED.call_once(|| prune_render_dirs(&root));
+    let d = root.join(format!("run-{}", std::process::id())).join(N.fetch_add(1, Ordering::Relaxed).to_string());
     std::fs::create_dir_all(&d).unwrap();
-    d
+    RenderDir(d)
+}
+
+/// Removes `root/run-<pid>` directories whose process no longer runs or that are older than 1 h.
+#[cfg(test)]
+pub(crate) fn prune_render_dirs(root: &std::path::Path) {
+    let Ok(rd) = std::fs::read_dir(root) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(pid) = name.strip_prefix("run-").and_then(|p| p.parse::<u32>().ok()) else { continue };
+        if pid == std::process::id() {
+            continue;
+        }
+        let alive = std::path::Path::new(&format!("/proc/{pid}")).exists();
+        let old = e.metadata().and_then(|m| m.modified()).map(|t| t.elapsed().map(|d| d.as_secs() > 3600).unwrap_or(false)).unwrap_or(false);
+        if !alive || old {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
 }
 
 #[cfg(test)]

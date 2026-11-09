@@ -226,20 +226,44 @@ fn brk2_deep_tremolo_stays_one_note() {
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
-/// RED (R2-F4). Wide (operatic) vibrato, ±100 cents at 6 Hz: D3 gives 19 notes (the key once, then
-/// 51 flickering and 61, the octave of the low extreme, re-struck every cycle), E4 gives 95 notes
-/// (61/62/63 chopped at the vibrato rate), D5 3 notes none on the key. Round 1 gave one note on
-/// each. Vibrato with its natural amplitude wobble (±40 c + 30 % AM) and round 1's ±30..50 c pass.
+/// R2-F4, split per review round 3 (R3-1). Vibrato in the realistic vocal/string range must stay one
+/// note on the key: ±60 cents at 5 and 6.5 Hz, and ±40 cents with its natural amplitude wobble
+/// (±30..50 c pass too). The reviewer's sweep put the cliff between ±60 c (30/30 pass) and ±75 c
+/// (6/10 fail); ±100 c is in `brk2_wide_vibrato_100c_needs_pitch_tracker` below (#31).
 #[test]
 fn brk2_wide_vibrato_stays_one_note() {
     use std::f64::consts::TAU;
     let mut bad = Vec::new();
     for midi in [50.0f64, 62.0, 74.0] {
-        if let Err(e) = modulated(midi, move |t| midi + (TAU * 6.0 * t).sin(), |_| 1.0) {
-            bad.push(format!("vibrato ±100c, {e}"));
+        for hz in [5.0f64, 6.5] {
+            if let Err(e) = modulated(midi, move |t| midi + 0.6 * (TAU * hz * t).sin(), |_| 1.0) {
+                bad.push(format!("vibrato ±60c at {hz} Hz, {e}"));
+            }
         }
         if let Err(e) = modulated(midi, move |t| midi + 0.4 * (TAU * 5.5 * t).sin(), |t| 0.85 + 0.15 * (TAU * 5.5 * t + 1.0).sin()) {
             bad.push(format!("vibrato ±40c + AM, {e}"));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// RED, KNOWN GAP #31 (moved out of CI by review round 3, R3-1). Wide (operatic) vibrato, ±100
+/// cents at 6 Hz. Measured at 464b0c4: D3 8 notes (the key once, then 51 flickering and 61, the
+/// octave of the low extreme, re-struck), E4 22 notes (61/63 chopped at the vibrato rate), D5 3
+/// notes, none on the key. A per-frame key picker cannot hold a tone that spends most of each cycle
+/// a semitone off its key; it needs a pitch-trajectory tracker.
+#[test]
+#[ignore = "#31: needs a pitch-trajectory tracker; ±100 c chatters (measured)"]
+fn brk2_wide_vibrato_100c_needs_pitch_tracker() {
+    use std::f64::consts::TAU;
+    let mut bad = Vec::new();
+    for midi in [50.0f64, 62.0, 74.0] {
+        match modulated(midi, move |t| midi + (TAU * 6.0 * t).sin(), |_| 1.0) {
+            Ok(()) => eprintln!("METRIC r3 vibrato ±100c midi {midi}: one note"),
+            Err(e) => {
+                eprintln!("METRIC r3 vibrato ±100c {e}");
+                bad.push(format!("vibrato ±100c, {e}"));
+            }
         }
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
