@@ -27,7 +27,7 @@ for o in json.load(sys.stdin):
 state(){ pw-dump | python3 -I -c "
 import json,sys,math
 cfg=json.load(open(sys.argv[1])); want=[float(x) for x in sys.argv[2:]]
-g={b['kind'].get('target'):(b['id'],b['gain_db'],b['mute']) for b in cfg['buses'] if b['kind']['type']=='hardware'}
+g={b['kind'].get('target'):(b['id'],min(b['gain_db'],b.get('max_db',12.0)),b['mute']) for b in cfg['buses'] if b['kind']['type']=='hardware'}
 dev={}
 for o in json.load(sys.stdin):
   if o.get('type')!='PipeWire:Interface:Node': continue
@@ -73,6 +73,16 @@ stop_daemon; rm -rf "$D/state/wireplumber"; start_daemon; echo "  restarted: $(s
 echo "== E: GUI running, deliberate external change a2 -> 0.5 (-18.1 dB), held"
 setv test_hw_a2 0.5; check 5 -4.2 -18.1 -37.3
 stop_gui
+echo "== G: a3 saved at 0 dB with a -30 dB ceiling (max_db), device at 100 %, GUI start: pushed at the ceiling"
+python3 -I - "$CFG" <<'P2'
+import json,sys
+p=sys.argv[1]; c=json.load(open(p))
+for b in c['buses']:
+  if b['id']=='a3': b['gain_db']=0.0; b['max_db']=-30.0
+json.dump(c,open(p,'w'),indent=1)
+P2
+setv test_hw_a3 1.0; sleep 0.5; echo "  before: $(state)"
+start_gui; check 4 -4.2 -18.1 -30.0; stop_gui
 echo "== GUI log"; grep '^wavelink' "$D/gui.log" || true
 [ $FAIL = 0 ] && echo "PASS" || echo "FAIL"
 exit $FAIL
