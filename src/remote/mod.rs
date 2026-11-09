@@ -93,6 +93,9 @@ fn lan_ips(out: &str) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[path = "breaker36.rs"]
+mod breaker36;
 
 #[cfg(test)]
 #[test]
