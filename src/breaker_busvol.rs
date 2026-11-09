@@ -461,3 +461,94 @@ fn r2_probe_volume_mute_cmds_are_safe() {
         }
     }
 }
+
+// ================================================================ Round 3 (a445190 + b2647b1)
+
+use crate::busvol::snap_back;
+use crate::pw::props_say_raop;
+
+/// snap_back over every slider position and several ceilings (incl. taper knots and off-grid values):
+/// it fires exactly when the position is above the ceiling, always lands at or below it, and a
+/// keyboard Up step is never undone anywhere below the ceiling.
+#[test]
+fn r3_probe_snap_back_edges() {
+    for ceil in [MIN_DB, -40.0, -37.3, -20.05, RAOP_MAX_DB, -0.1, 0.0, 0.2, 6.0, MAX_DB] {
+        for k in 0..=1000 {
+            let pos = k as f64 / 1000.0;
+            let db = write_db(pos_to_db(pos), ceil);
+            match snap_back(pos, db, ceil) {
+                Some(p) => {
+                    assert!(pos_to_db(pos) > ceil, "ceil {ceil} pos {pos}: snapped while not above");
+                    assert!(pos_to_db(p) <= ceil + 1e-9, "ceil {ceil} pos {pos}: snapped to {} dB", pos_to_db(p));
+                    assert!(p <= pos, "snap moved the slider up");
+                }
+                None => assert!(pos_to_db(pos) <= ceil + 1e-6, "ceil {ceil} pos {pos}: left above the ceiling"),
+            }
+        }
+        // a NaN position reads as +12 in pos_to_db: if it snaps, it snaps to the (capped) written level
+        if let Some(p) = snap_back(f64::NAN, write_db(pos_to_db(f64::NAN), ceil), ceil) {
+            assert!(pos_to_db(p) <= ceil + 1e-9);
+        }
+        // keyboard Up from every 0.5 dB step below the ceiling (minus one step) moves
+        let mut start = MIN_DB + 0.5;
+        while start < ceil - 1.0 {
+            let mut pos = db_to_pos(start);
+            for _ in 0..40 {
+                let v = pos + 0.001;
+                let db = write_db(pos_to_db(v), ceil);
+                pos = snap_back(v, db, ceil).unwrap_or(v);
+            }
+            assert!(pos_to_db(pos) > start, "ceil {ceil}: Up stuck at {start}");
+            assert!(write_db(pos_to_db(pos), ceil) <= ceil);
+            start += 0.5;
+        }
+    }
+}
+
+/// RAOP detection from props. True negatives for his real Scarlett/HDMI style nodes; the real
+/// module-raop-sink keys (raop.*) are detected under any node.name.
+#[test]
+fn r3_probe_raop_detection_true_cases() {
+    let j = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+    // module-raop-sink as discovered, renamed by his rule
+    assert!(props_say_raop(&j(r#"{"node.name":"sonos_lionels_room","media.class":"Audio/Sink","raop.ip":"192.168.1.64","raop.port":"7000","raop.hostname":"Sonos-7828CAB27EEC.local"}"#)));
+    for p in [
+        r#"{"node.name":"alsa_output.usb-Focusrite_Scarlett_Solo_USB-00.HiFi__Line1__sink","media.class":"Audio/Sink","factory.name":"api.alsa.pcm.sink","device.api":"alsa","node.driver":"true"}"#,
+        r#"{"node.name":"alsa_output.pci-0000_03_00.1.hdmi-stereo","media.class":"Audio/Sink","device.api":"alsa","node.nick":"LG TV"}"#,
+        r#"{"node.name":"bluez_output.AA_BB.1","media.class":"Audio/Sink","device.api":"bluez5"}"#,
+    ] {
+        assert!(!props_say_raop(&j(p)), "{p}");
+    }
+}
+
+/// RAOP false positives (documented; low): any "raop"/"airplay" substring in media.name or node.group
+/// marks a node as AirPlay. media.name is a *stream/content* title, not a device identity. On a
+/// hardware sink the effect is a −20 dB ceiling that the GUI then *persists* into max_db, so it
+/// stays after the condition goes away. Safe direction (quieter) but sticky and silent.
+#[test]
+fn r3_probe_raop_false_positives_are_persisted() {
+    let j = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+    let scarlett = r#"{"node.name":"alsa_output.usb-Focusrite","media.class":"Audio/Sink","device.api":"alsa","media.name":"AirPlay Mirroring Test"}"#;
+    assert!(props_say_raop(&j(scarlett)), "media.name substring is treated as AirPlay");
+    assert!(props_say_raop(&j(r#"{"node.name":"alsa_output.hdmi","node.group":"group.raopish"}"#)));
+    let mut b = sonos_bus("alsa_output.usb-Focusrite", -4.2, None);
+    assert!(b.persist_raop_ceiling(props_say_raop(&j(scarlett))));
+    assert_eq!(b.max_db, Some(RAOP_MAX_DB));
+    // the headphones bus is now pushed at -20 instead of his -4.2, permanently
+    assert_eq!(b.effective_db(), RAOP_MAX_DB);
+}
+
+/// Persistence is keyed on the bus id, not the destination: retargeting the Sonos bus to the Scarlett
+/// (bus settings → Apply, ui.rs) keeps max_db −20 on the headphones. Safe direction; documented.
+/// The opposite retarget (Scarlett bus → AirPlay sink) is capped by name/props before any push.
+#[test]
+fn r3_probe_persisted_ceiling_follows_the_bus_not_the_destination() {
+    let mut b = sonos_bus("raop_sonos_lionels_room", -36.1, None);
+    assert!(b.persist_raop_ceiling(true));
+    b.kind = BusKind::Hardware { target: "alsa_output.usb-Focusrite".into() };
+    assert_eq!(b.ceiling_db(), RAOP_MAX_DB, "stale AirPlay ceiling on the headphones");
+    let mut a1 = sonos_bus("alsa_output.usb-Focusrite", -4.2, None);
+    a1.kind = BusKind::Hardware { target: "sonos_room".into() };
+    assert_eq!(a1.ceiling_for(true), RAOP_MAX_DB);
+    assert_eq!(a1.gain_db.min(a1.ceiling_for(true)), RAOP_MAX_DB, "engine push after retarget");
+}
