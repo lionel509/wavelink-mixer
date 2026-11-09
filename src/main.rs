@@ -11,6 +11,7 @@ mod notes;
 mod piano;
 mod piano_live;
 mod pianist;
+mod arrange;
 mod sep;
 mod stemcfg;
 mod stems;

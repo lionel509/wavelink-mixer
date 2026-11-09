@@ -605,6 +605,7 @@ fn name(p: u8) -> String {
 pub fn cli(args: Vec<String>) -> i32 {
     let (mut wav, mut out, mut reference, mut source) = (None::<String>, None::<String>, None::<String>, None::<String>);
     let (mut merged, mut port, mut bench, mut seconds) = (false, false, false, None::<f64>);
+    let mut arrange = None::<bool>;
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -616,11 +617,16 @@ pub fn cli(args: Vec<String>) -> i32 {
             "--merged" => merged = true,
             "--port" => port = true,
             "--bench" => bench = true,
+            "--arrange" => arrange = Some(false),
+            "--piano-only" => arrange = Some(true),
             other => return usage(&format!("unknown argument {other}")),
         }
     }
     if bench {
         return run_bench();
+    }
+    if let (Some(w), Some(po)) = (&wav, arrange) {
+        return arrange_cli(w, out.as_deref(), po);
     }
     if let Some(w) = wav {
         return offline(&w, out.as_deref(), merged, reference.as_deref());
@@ -633,6 +639,44 @@ pub fn cli(args: Vec<String>) -> i32 {
 
 fn write_midi(path: &str, notes: &[Note], merged: bool, origin: Option<f64>) -> Result<(), String> {
     std::fs::write(path, crate::notes::piano_midi(notes, !merged, origin)).map_err(|e| format!("{path}: {e}"))
+}
+
+/// `piano --wav X --arrange|--piano-only [--out f.mid]`: tempo, key, chords, and the arranged parts.
+fn arrange_cli(wav: &str, out: Option<&str>, piano_only: bool) -> i32 {
+    let (pcm, rate) = match std::fs::read(wav).map_err(|e| e.to_string()).and_then(|b| piano::read_wav(&b)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{wav}: {e}");
+            return 1;
+        }
+    };
+    let t = Instant::now();
+    let a = crate::arrange::analyze(&pcm, rate);
+    let parts = crate::arrange::arrange(&a, piano_only);
+    println!("analysed {:.1} s in {:.2} s: tempo {:.1} BPM, key {}, {} beats", pcm.len() as f64 / rate as f64, t.elapsed().as_secs_f64(), a.bpm, a.key_name(), a.beats.len());
+    let mut line = String::new();
+    let mut last = String::new();
+    for (i, c) in a.chords.iter().enumerate() {
+        let n = c.name();
+        if n != last {
+            line += &format!("{:.1}s {n}  ", a.beats[i]);
+            last = n;
+        }
+    }
+    println!("chords: {line}");
+    let mel: Vec<String> = a.melody.iter().take(40).map(|n| format!("{}{}", crate::arrange::NAMES[(n.pitch % 12) as usize], n.pitch / 12 - 1)).collect();
+    println!("melody (first 40): {}", mel.join(" "));
+    for p in &parts {
+        println!("part {} (ch {}, GM {}): {} notes", p.name, p.ch + 1, p.prog, p.notes.len());
+    }
+    if let Some(path) = out {
+        if let Err(e) = std::fs::write(path, crate::arrange::midi(&parts)) {
+            eprintln!("{path}: {e}");
+            return 1;
+        }
+        println!("wrote {path}");
+    }
+    0
 }
 
 fn offline(wav: &str, out: Option<&str>, merged: bool, reference: Option<&str>) -> i32 {
