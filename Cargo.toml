@@ -13,8 +13,13 @@ ureq = { version = "2", features = ["json"] }
 sha2 = "0.10"
 base64 = "0.22"
 ort = "=2.0.0-rc.10"
+wavelink-proto = { path = "proto" }
+tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 strip = true
+
+[workspace]
+members = [".", "proto", "client"]

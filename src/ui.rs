@@ -160,6 +160,10 @@ struct Fader {
     busy: Cell<u32>,
     /// true while auto-normalize moves the slider (its moves are not his, so they are not saved at once)
     auto: Cell<bool>,
+    /// Some(bus id) for a physical output bus: it shows the saved gain, never the device's (#33)
+    bus: RefCell<Option<String>>,
+    /// the loudest this fader may set (bus ceiling, #33; MAX_DB elsewhere)
+    max_db: Cell<f64>,
 }
 
 impl Fader {
@@ -170,12 +174,35 @@ impl Fader {
         self.auto.set(false);
     }
 
+    /// Show a saved level (physical buses: the config, not the device).
+    fn show(&self, db: f64, mute: bool) {
+        self.updating.set(true);
+        self.scale.set_value(db_to_pos(db));
+        self.label.set_label(&fmt_db(db));
+        if let Some(m) = &self.mute {
+            m.set_active(mute);
+        }
+        self.updating.set(false);
+    }
+
+    /// Saved gain on the slider, the node's mute on M.
+    fn sync_saved(&self, g: &Graph, db: f64) {
+        if self.busy.get() > 0 {
+            self.busy.set(self.busy.get() - 1);
+            return;
+        }
+        let mute = g.node(&self.node.borrow()).filter(|n| n.has_vol).map(|n| n.mute);
+        let m_now = self.mute.as_ref().map(|m| m.is_active()).unwrap_or(false);
+        self.show(db, mute.unwrap_or(m_now));
+    }
+
     fn sync(&self, g: &Graph) {
         if self.busy.get() > 0 {
             self.busy.set(self.busy.get() - 1);
             return;
         }
-        if let Some(n) = g.node(&self.node.borrow()) {
+        // a node whose Props are not enumerated yet has no volume to show (it is not 0 dB)
+        if let Some(n) = g.node(&self.node.borrow()).filter(|n| n.has_vol) {
             self.updating.set(true);
             let db = config::vol_to_db(n.vol);
             self.scale.set_value(db_to_pos(db));
@@ -323,8 +350,21 @@ fn meter(name: &str, target: Option<(&str, bool)>, led: Option<Rc<LedMeter>>, vu
     Some(Meter { child, level, led, vu, out: Rc::new(Cell::new((-90.0, -90.0))), last: [Cell::new(-90.0), Cell::new(-90.0)], rms, last_rms: Cell::new(-90.0), bands, node, side })
 }
 
+/// Failed merges in a row before the window parks its config and follows the file (B36-9).
+const MERGE_TRIES: u32 = 5;
+
 pub struct App {
     cfg: RefCell<Config>,
+    /// config.json as this window last read or wrote it: the base of the 3-way merge that keeps the
+    /// engine's remote-control writes (#26) and this window's edits from overwriting each other
+    synced: RefCell<Config>,
+    /// N (auto-normalize) buttons by input id, so a remote toggle shows up here
+    norm_btns: RefCell<HashMap<String, gtk::ToggleButton>>,
+    /// inputs whose in-memory gain was last moved by auto-normalize, not by him (B36-8): on a merge, a gain
+    /// another writer saved beats those moves
+    auto_gain: RefCell<std::collections::HashSet<String>>,
+    /// consecutive failed merges on save (see save_cfg)
+    merge_fails: Cell<u32>,
     graph: RefCell<Graph>,
     dirty: Cell<bool>,
     content: gtk::Box,
@@ -335,6 +375,8 @@ pub struct App {
     /// system gauges, shown under the output strips
     sys_panel: gtk::Box,
     faders: RefCell<Vec<Rc<Fader>>>,
+    /// #33: per physical bus, adopt-vs-re-apply state across graph polls (survives rebuilds)
+    bus_guard: RefCell<HashMap<String, crate::busvol::Tracker>>,
     routes: RefCell<Vec<(String, gtk::ToggleButton, Rc<Cell<bool>>)>>,
     meters: RefCell<Vec<Meter>>,
     /// rack-page only: input-level taps, gauge animations, and whether the page is showing
@@ -842,6 +884,7 @@ impl App {
     fn fader_manual(&self, node: &str, db: f64) {
         let id = self.cfg.borrow().inputs.iter().find(|i| names::strip_in(&i.id) == node).map(|i| i.id.clone());
         if let Some(id) = id {
+            self.auto_gain.borrow_mut().remove(&id);
             let hit = self.norm.borrow_mut().get_mut(&id).map(|c| c.manual(db)).is_some();
             if hit {
                 self.norm_store(&id);
@@ -1025,12 +1068,251 @@ impl App {
     fn mark_dirty(&self) {
         self.dirty.set(true);
     }
+
+    /// Save without clobbering newer on-disk edits (the engine's remote server writes config.json too, #26):
+    /// fields this window changed since it last synced win, everything else comes from the file; except
+    /// that auto-normalize gain moves are not his edits, so a remote gain beats them (B36-8). A failed
+    /// merge writes nothing.
+    fn save_cfg(self: &Rc<Self>) {
+        let before = self.cfg.borrow().clone();
+        let auto = self.auto_gain.borrow().clone();
+        let won = RefCell::new(vec![]);
+        let prefer = |b: &Config, d: &Config, m: &mut Config| *won.borrow_mut() = config::their_gains_win(b, d, m, &auto);
+        let r = {
+            let (mut c, mut b) = (self.cfg.borrow_mut(), self.synced.borrow_mut());
+            c.save_merged_with(&mut b, &Config::path(), &prefer)
+        };
+        match r {
+            Ok(changed) => {
+                self.merge_fails.set(0);
+                if changed {
+                    self.apply_external(&before, &won.into_inner());
+                }
+            }
+            Err(e) => {
+                self.dirty.set(true); // a save retries (merging again) on a later tick
+                self.merge_failed(&before, &e);
+            }
+        }
+    }
+
+    /// A merge (save or pull) failed. Retry on later ticks; after MERGE_TRIES in a row never spin
+    /// silently and never overwrite the newer file: park this window's config in a timestamped
+    /// config.json.wavelink-failed-<time>, warn, and follow config.json from then on.
+    fn merge_failed(self: &Rc<Self>, mine: &Config, e: &str) {
+        let n = self.merge_fails.get() + 1;
+        self.merge_fails.set(n);
+        if n < MERGE_TRIES {
+            eprintln!("wavelink: {e} (try {n}/{MERGE_TRIES})");
+            return;
+        }
+        self.merge_fails.set(0);
+        let parked = config::parked_path(&Config::path(), std::time::SystemTime::now());
+        let ok = mine.save_to(&parked);
+        eprintln!(
+            "wavelink: WARNING: config.json could not be merged {MERGE_TRIES} times in a row; {} ({e}). The window now follows config.json.",
+            if ok { format!("this window's settings were saved to {}", parked.display()) } else { format!("saving them to {} failed too", parked.display()) }
+        );
+        if let Some(d) = Config::peek(&Config::path()) {
+            *self.cfg.borrow_mut() = d.clone();
+            *self.synced.borrow_mut() = d;
+            self.dirty.set(false);
+            self.apply_external(mine, &[]);
+        }
+    }
+
+    /// Pick up edits another writer saved since this window last synced; this window's unsaved edits
+    /// stay (auto-normalize moves excepted, as in save_cfg).
+    fn pull_cfg(self: &Rc<Self>) {
+        let before = self.cfg.borrow().clone();
+        let auto = self.auto_gain.borrow().clone();
+        let won = RefCell::new(vec![]);
+        let prefer = |b: &Config, d: &Config, m: &mut Config| *won.borrow_mut() = config::their_gains_win(b, d, m, &auto);
+        let disk = {
+            let (mut c, mut b) = (self.cfg.borrow_mut(), self.synced.borrow_mut());
+            c.pull_merged_with(&mut b, &Config::path(), &prefer)
+        };
+        match disk {
+            Ok(Some(_)) => {
+                self.merge_fails.set(0);
+                self.apply_external(&before, &won.into_inner());
+            }
+            Ok(None) => {}
+            // counted like a failed save: parked after MERGE_TRIES in a row, even when nothing is dirty
+            Err(e) => self.merge_failed(&before, &e),
+        }
+    }
+
+    /// Show what changed in `self.cfg` relative to `before` after a merge. Levels update in place (input
+    /// gains are pushed to their strips again, bus faders show the new saved gain and #35's tracker is told
+    /// it was just written, so it never pushes the old value back); anything beyond levels (EQ, rack,
+    /// names, colours, channels) rebuilds the window. `won` = inputs where another writer's gain beat
+    /// an auto-normalize move.
+    fn apply_external(self: &Rc<Self>, before: &Config, won: &[String]) {
+        for id in won {
+            self.auto_gain.borrow_mut().remove(id);
+        }
+        let now = self.cfg.borrow().clone();
+        if now == *before {
+            return;
+        }
+        // levels-only? copy the remote-controllable fields back and compare the rest
+        let mut masked = now.clone();
+        for (m, b) in masked.inputs.iter_mut().zip(&before.inputs) {
+            if m.id == b.id {
+                m.gain_db = b.gain_db;
+                m.mute = b.mute;
+                m.routes = b.routes.clone();
+                m.normalize = b.normalize;
+                m.norm_base = b.norm_base;
+                m.norm_out = b.norm_out;
+            }
+        }
+        for (m, b) in masked.buses.iter_mut().zip(&before.buses) {
+            if m.id == b.id {
+                m.gain_db = b.gain_db;
+                m.mute = b.mute;
+                m.max_db = b.max_db;
+            }
+        }
+        if masked != *before || now.inputs.len() != before.inputs.len() || now.buses.len() != before.buses.len() {
+            let app = self.clone();
+            glib::timeout_add_local_once(Duration::from_millis(50), move || app.rebuild());
+            return;
+        }
+        for (n, b) in now.inputs.iter().zip(&before.inputs) {
+            if n.gain_db != b.gain_db {
+                // a remote fader move is his move for auto-normalize too; and it is what the strip plays
+                self.fader_manual(&names::strip_in(&n.id), n.gain_db);
+                if let Some(id) = self.node_id(&names::strip_in(&n.id)) {
+                    pw::set_volume(id, db_to_vol(n.gain_db));
+                }
+            } else if n.norm_out != b.norm_out {
+                if let (Some(o), Some(c)) = (n.norm_out, self.norm.borrow_mut().get_mut(&n.id)) {
+                    c.out = o;
+                    c.pending = false;
+                }
+            }
+            if n.normalize != b.normalize {
+                let btn = self.norm_btns.borrow().get(&n.id).cloned();
+                if let Some(btn) = btn {
+                    btn.set_active(n.normalize); // its handler records the same value and pauses auto when off
+                }
+            }
+            for (bus, r) in &n.routes {
+                if b.route(bus).level_db != r.level_db {
+                    if let Some(k) = self.send_knobs.borrow().get(&(n.id.clone(), bus.clone())) {
+                        k.set_value(db_to_pos(r.level_db));
+                    }
+                }
+            }
+        }
+        // bus faders show the config (#35): refresh the ones that changed and tell the tracker the new
+        // saved gain is what the device was just given (the writer applied it), so drift right after is
+        // re-applied as the NEW value and the old one is never pushed back
+        let t = glib::monotonic_time() as f64 / 1e6;
+        for (n, b) in now.buses.iter().zip(&before.buses) {
+            if n.gain_db == b.gain_db && n.mute == b.mute && n.max_db == b.max_db {
+                continue;
+            }
+            if let Some(tr) = self.bus_guard.borrow_mut().get_mut(&n.id) {
+                tr.wrote(t);
+            }
+            for f in self.faders.borrow().iter() {
+                if f.bus.borrow().as_deref() == Some(n.id.as_str()) {
+                    f.max_db.set(n.ceiling_db());
+                    f.show(n.effective_db(), n.mute);
+                }
+            }
+        }
+    }
+
+    /// The saved gain behind an input strip or virtual bus fader node.
+    fn saved_gain(&self, node: &str) -> Option<f64> {
+        let c = self.cfg.borrow();
+        c.inputs.iter().find(|i| names::strip_in(&i.id) == node).map(|i| i.gain_db)
+            .or_else(|| c.buses.iter().find(|b| matches!(b.kind, BusKind::Virtual { .. }) && bus_fader_node(b) == node).map(|b| b.effective_db()))
+    }
+
+    /// A hardware bus fader's saved gain, capped at its ceiling (None for other faders).
+    fn bus_effective_db(&self, f: &Fader) -> Option<f64> {
+        let id = f.bus.borrow().clone()?;
+        self.cfg.borrow().buses.iter().find(|b| b.id == id).map(|b| b.effective_db())
+    }
+
+    /// His fader / mute move on a physical bus just went to the device: it is settling, not drifting.
+    fn bus_wrote(&self, f: &Fader) {
+        if let Some(id) = f.bus.borrow().as_ref() {
+            if let Some(t) = self.bus_guard.borrow_mut().get_mut(id) {
+                t.wrote(glib::monotonic_time() as f64 / 1e6);
+            }
+        }
+    }
+
+    /// One graph poll for a physical bus fader (#33): the saved gain is the truth. Re-apply it when the
+    /// device (re)appears or drifts right after; take a device value only when it is a deliberate
+    /// external change (crate::busvol::decide). The fader always shows the config.
+    fn sync_bus(&self, f: &Fader, g: &Graph, id: &str) {
+        let Some(mut b) = self.cfg.borrow().buses.iter().find(|b| b.id == id).cloned() else { return };
+        let node = g.node(&bus_fader_node(&b));
+        // an AirPlay destination (by name or node props) gets its ceiling written into the config once
+        if b.persist_raop_ceiling(node.map_or(false, |n| n.raop)) {
+            if let Some(bu) = self.cfg.borrow_mut().buses.iter_mut().find(|x| x.id == id) {
+                bu.max_db = b.max_db;
+            }
+            self.mark_dirty();
+            eprintln!("wavelink: bus {id}: AirPlay destination, ceiling {} saved", fmt_db(b.ceiling_db()));
+            f.max_db.set(b.ceiling_db());
+            f.scale.add_mark(db_to_pos(b.ceiling_db()), gtk::PositionType::Right, Some("max"));
+        }
+        let seen = node.map(|n| (g.instance(n), n.has_vol.then_some(crate::busvol::Reading { vol: n.vol, mute: n.mute })));
+        let now = glib::monotonic_time() as f64 / 1e6;
+        let ceil = b.ceiling_db();
+        let saved = b.effective_db();
+        let step = {
+            let mut guards = self.bus_guard.borrow_mut();
+            let t = guards.entry(id.to_string()).or_default();
+            t.set_ceiling(ceil);
+            t.observe(now, seen, saved, b.mute)
+        };
+        match step {
+            crate::busvol::Step::Nothing => {}
+            crate::busvol::Step::Push => {
+                if let Some(n) = node {
+                    if n.has_vol && (n.mute != b.mute || (config::vol_to_db(n.vol) - saved).abs() > crate::busvol::TOL_DB) {
+                        eprintln!("wavelink: bus {id}: device {} reads {}{}, re-applying saved {}{}", n.name, fmt_db(config::vol_to_db(n.vol)),
+                                  if n.mute { " muted" } else { "" }, fmt_db(saved), if b.mute { " muted" } else { "" });
+                    }
+                    pw::set_volume_mute(n.id, db_to_vol(saved), b.mute);
+                }
+            }
+            crate::busvol::Step::Adopt { gain_db, mute } => {
+                eprintln!("wavelink: bus {id}: external change kept: gain {:?} mute {:?} (was {} {})", gain_db, mute, fmt_db(b.gain_db), b.mute);
+                if let Some(bu) = self.cfg.borrow_mut().buses.iter_mut().find(|x| x.id == id) {
+                    if let Some(d) = gain_db {
+                        bu.gain_db = bu.clamp_db(d);
+                    }
+                    if let Some(m) = mute {
+                        bu.mute = m;
+                    }
+                }
+                self.mark_dirty();
+            }
+        }
+        if f.busy.get() > 0 {
+            // his drag is in flight: leave the slider alone
+            f.busy.set(f.busy.get() - 1);
+            return;
+        }
+        let (db, mute) = self.cfg.borrow().buses.iter().find(|x| x.id == id).map(|x| (x.effective_db(), x.mute)).unwrap_or((saved, b.mute));
+        f.show(db, mute);
+    }
     fn node_id(&self, name: &str) -> Option<u64> {
         self.graph.borrow().node(name).map(|n| n.id)
     }
     /// Save + rebuild after a structural change (engine picks the file up within a second).
     fn structural(self: &Rc<Self>) {
-        self.cfg.borrow().save();
+        self.save_cfg();
         self.dirty.set(false);
         let app = self.clone();
         glib::timeout_add_local_once(Duration::from_millis(50), move || app.rebuild());
@@ -1070,7 +1352,7 @@ impl App {
         if let Some(m) = &mute {
             btns.append(m);
         }
-        let f = Rc::new(Fader { node: RefCell::new(node), scale, label: lab, mute, btns, updating: Cell::new(false), busy: Cell::new(0), auto: Cell::new(false) });
+        let f = Rc::new(Fader { node: RefCell::new(node), scale, label: lab, mute, btns, updating: Cell::new(false), busy: Cell::new(0), auto: Cell::new(false), bus: RefCell::new(None), max_db: Cell::new(config::MAX_DB) });
         // double-click the dB label area resets to 0 dB
         let gest = gtk::GestureClick::new();
         let fw = Rc::downgrade(&f);
@@ -1099,11 +1381,17 @@ impl App {
         let (fw, app) = (Rc::downgrade(&f), self.clone());
         f.scale.connect_value_changed(move |s| {
             let Some(f) = fw.upgrade() else { return };
-            let db = pos_to_db(s.value());
-            let db = if db.abs() < 0.25 { 0.0 } else { (db * 10.0).round() / 10.0 }; // snap to unity
+            // snap to unity, then the bus ceiling (#33: drag, scroll, double-click 0 dB and the SL MkIII all land here)
+            let db = crate::busvol::write_db(pos_to_db(s.value()), f.max_db.get());
             f.label.set_label(&fmt_db(db));
             if f.updating.get() {
                 return;
+            }
+            if let Some(p) = crate::busvol::snap_back(s.value(), db, f.max_db.get()) {
+                // above the ceiling: the cap stops at it (rounding / the unity snap never move it back)
+                f.updating.set(true);
+                s.set_value(p);
+                f.updating.set(false);
             }
             f.busy.set(6);
             apply(&app, db);
@@ -1111,6 +1399,9 @@ impl App {
             if f.auto.get() {
                 // auto moves are not his: saved at most once a minute (W8)
                 app.norm_moved.set(true);
+                if let Some(i) = app.cfg.borrow().inputs.iter().find(|i| names::strip_in(&i.id) == node) {
+                    app.auto_gain.borrow_mut().insert(i.id.clone());
+                }
             } else {
                 app.mark_dirty();
                 app.fader_manual(&node, db);
@@ -1118,6 +1409,7 @@ impl App {
             if let Some(id) = app.node_id(&node) {
                 pw::set_volume(id, db_to_vol(db));
             }
+            app.bus_wrote(&f);
         });
         if let Some(m) = &f.mute {
             let (fw, app) = (Rc::downgrade(&f), self.clone());
@@ -1131,8 +1423,13 @@ impl App {
                 app.mark_dirty();
                 let node = f.node.borrow().clone();
                 if let Some(id) = app.node_id(&node) {
-                    pw::set_mute(id, b.is_active());
+                    match app.bus_effective_db(&f) {
+                        // hardware bus: the saved (capped) volume goes in before the unmute (#33)
+                        Some(db) => pw::set_volume_mute(id, db_to_vol(db), b.is_active()),
+                        None => pw::set_mute(id, b.is_active()),
+                    }
                 }
+                app.bus_wrote(&f);
             });
         }
         self.faders.borrow_mut().push(f.clone());
@@ -1184,7 +1481,7 @@ impl App {
             dd.connect_selected_notify(move |d| {
                 if let Some((_, prog)) = config::INSTRUMENTS.get(d.selected() as usize) {
                     app.cfg.borrow_mut().piano.program = *prog;
-                    app.cfg.borrow().save(); // the engine picks it up within a second
+                    app.save_cfg(); // the engine picks it up within a second
                 }
             });
             row.append(&dd);
@@ -1491,6 +1788,7 @@ impl App {
                     }
                 });
             }
+            self.norm_btns.borrow_mut().insert(id.clone(), n_btn.clone());
             fader_rc.btns.append(&n_btn);
         }
         strip.append(&screw_row());
@@ -1630,13 +1928,23 @@ impl App {
             self.meters.borrow_mut().push(m);
         }
         let (b1, b2) = (bus.id.clone(), bus.id.clone());
-        let (fb, _) = self.fader(
+        let (fb, bus_fader) = self.fader(
             bus_fader_node(&bus),
             220,
             true,
             move |a, db| a.cfg.borrow_mut().buses.iter_mut().find(|b| b.id == b1).unwrap().gain_db = db,
             move |a, m| a.cfg.borrow_mut().buses.iter_mut().find(|b| b.id == b2).unwrap().mute = m,
         );
+        if matches!(bus.kind, BusKind::Hardware { .. }) {
+            // the fader is the device volume: config is the source of truth (#33)
+            *bus_fader.bus.borrow_mut() = Some(bus.id.clone());
+        }
+        let ceil = bus.ceiling_db();
+        bus_fader.max_db.set(ceil);
+        if ceil < config::MAX_DB {
+            bus_fader.scale.add_mark(db_to_pos(ceil), gtk::PositionType::Right, Some("max"));
+            bus_fader.scale.set_tooltip_text(Some(&format!("Ceiling {} (this output never goes louder)", fmt_db(ceil))));
+        }
         row.append(&fb);
         // meter sits beside the fader slot (clear of the dB readout + mute below it)
         led.area.set_margin_top(8);
@@ -1837,7 +2145,7 @@ impl App {
                 } else {
                     BusKind::Virtual { node: format!("wavelink_{id}"), description: name.clone() }
                 };
-                c.buses.push(Bus { id, name, color: if hw { "#64d2ff".into() } else { "#ffd60a".into() }, kind, gain_db: 0.0, mute: false });
+                c.buses.push(Bus::new(id, name, if hw { "#64d2ff".into() } else { "#ffd60a".into() }, kind));
                 c.buses.sort_by(|a, b| a.id.cmp(&b.id));
             }
             entry.set_text("");
@@ -1858,6 +2166,7 @@ impl App {
         self.keep.borrow_mut().clear();
         self.solo_btns.borrow_mut().clear();
         self.send_knobs.borrow_mut().clear();
+        self.norm_btns.borrow_mut().clear();
         self.levels.borrow_mut().clear();
         self.spectra.borrow_mut().clear();
         self.console_ticks.borrow_mut().clear();
@@ -2009,7 +2318,19 @@ impl App {
 
     fn sync(&self, g: &Graph) {
         for f in self.faders.borrow().iter() {
-            f.sync(g);
+            let bus = f.bus.borrow().clone();
+            match bus {
+                Some(id) => self.sync_bus(f, g, &id),
+                None => {
+                    // inputs and virtual buses: the slider shows the saved gain too, so a click/scroll never
+                    // saves a device artefact (#33); mute still shows the node's (solo / stems mute it)
+                    let saved = self.saved_gain(&f.node.borrow());
+                    match saved {
+                        Some(db) => f.sync_saved(g, db),
+                        None => f.sync(g),
+                    }
+                }
+            }
         }
         for (node, t, guard) in self.routes.borrow().iter() {
             if let Some(n) = g.node(node) {
@@ -2140,7 +2461,7 @@ impl App {
 /// window so meters reconnect to the fresh graph.
 fn restart_audio(st: &Rc<App>, btn: &adw::SplitButton, full: bool) {
     if st.dirty.get() {
-        st.cfg.borrow().save();
+        st.save_cfg();
         st.dirty.set(false);
     }
     // Engine restart; if PipeWire itself is unresponsive, escalate to a full restart.
@@ -2395,6 +2716,10 @@ pub fn activate(app: &adw::Application) {
 
     let st = Rc::new(App {
         cfg: RefCell::new(Config::load()),
+        synced: RefCell::new(Config::default_config()), // set to the loaded config right below (one load, B36-9)
+        norm_btns: RefCell::new(HashMap::new()),
+        auto_gain: RefCell::new(Default::default()),
+        merge_fails: Cell::new(0),
         graph: RefCell::new(Graph::read().unwrap_or_default()),
         dirty: Cell::new(false),
         content,
@@ -2402,6 +2727,7 @@ pub fn activate(app: &adw::Application) {
         rack_page: rack_page.clone(),
         sys_panel: sys_panel.clone(),
         faders: RefCell::new(vec![]),
+        bus_guard: RefCell::new(HashMap::new()),
         routes: RefCell::new(vec![]),
         meters: RefCell::new(vec![]),
         rack_meters: RefCell::new(vec![]),
@@ -2432,6 +2758,7 @@ pub fn activate(app: &adw::Application) {
         css: dynamic,
         stems: stems_view::State::new(),
     });
+    *st.synced.borrow_mut() = st.cfg.borrow().clone();
     stems_view::wire(&st, stems_v.clone());
 
     let add_in = gtk::MenuButton::builder().label("+ Input").popover(&st.add_input_popover()).build();
@@ -2590,13 +2917,15 @@ pub fn activate(app: &adw::Application) {
                 st2.dirty.set(true);
             }
             if st2.dirty.get() {
-                st2.cfg.borrow().save();
+                st2.save_cfg();
             }
             return glib::ControlFlow::Break;
         }
         // stems housekeeping runs here, not in the frame tick: the tick stops while the display sleeps
         let mut remute = false;
         if let Some(g) = rx.try_iter().last() {
+            // fresh config first: #35's bus tracker must never re-apply a gain the remote just replaced
+            st2.pull_cfg();
             st2.sync(&g);
             *st2.graph.borrow_mut() = g;
             remute = true;
@@ -2604,8 +2933,11 @@ pub fn activate(app: &adw::Application) {
         save_tick += 1;
         stems_view::housekeep(&st2, remute, save_tick % 10 == 0);
         if save_tick % 5 == 0 && st2.dirty.get() {
-            st2.cfg.borrow().save();
+            st2.save_cfg();
             st2.dirty.set(false);
+        } else if save_tick % 10 == 0 {
+            // edits the engine's remote server (or another writer) saved: merge them in (#26)
+            st2.pull_cfg();
         }
         glib::ControlFlow::Continue
     });

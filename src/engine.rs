@@ -248,8 +248,9 @@ pub fn apply_levels(cfg: &Config, g: &Graph) {
     }
     for b in &cfg.buses {
         if let Some(n) = g.node(&bus_fader_node(b)) {
-            pw::set_volume(n.id, db_to_vol(b.gain_db));
-            pw::set_mute(n.id, b.mute);
+            // never above the bus ceiling (a3 Sonos), volume before any unmute (#33)
+            let db = b.gain_db.min(b.ceiling_for(n.raop));
+            pw::set_volume_mute(n.id, db_to_vol(if db.is_nan() { crate::config::MIN_DB } else { db }), b.mute);
         }
     }
 }
@@ -330,6 +331,7 @@ pub fn run() {
     let mut piano_sent: Option<crate::config::PianoCfg> = None;
     let mut last_quantum: Option<u32> = None;
     eprintln!("wavelink engine: config {}", Config::path().display());
+    crate::remote::start(); // LAN control server on its own threads (#26)
 
     loop {
         // reload config on change

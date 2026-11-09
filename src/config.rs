@@ -201,6 +201,60 @@ pub struct Bus {
     pub kind: BusKind,
     pub gain_db: f64,
     pub mute: bool,
+    /// Loudest this bus may ever be set (#33). None = the default for its destination:
+    /// RAOP_MAX_DB for an AirPlay speaker (`raop_*`, where 0 dB is the speaker at 100 %), else MAX_DB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_db: Option<f64>,
+}
+
+/// Default ceiling of a bus that drives an AirPlay (RAOP) speaker's own volume.
+pub const RAOP_MAX_DB: f64 = -20.0;
+
+/// A node name that is an AirPlay/RAOP sink ("raop" or "airplay" anywhere, any case).
+pub fn is_raop_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("raop") || n.contains("airplay")
+}
+
+impl Bus {
+    /// A new bus: unity gain, or its ceiling when that is lower (a new Sonos bus never starts at 100 %).
+    pub fn new(id: String, name: String, color: String, kind: BusKind) -> Bus {
+        let mut b = Bus { id, name, color, kind, gain_db: 0.0, mute: false, max_db: None };
+        b.gain_db = b.clamp_db(0.0);
+        b
+    }
+    /// The ceiling every write to this bus is clamped to (destination detected by name only).
+    pub fn ceiling_db(&self) -> f64 {
+        self.ceiling_for(false)
+    }
+    /// Ceiling when the graph says whether the destination node is an AirPlay/RAOP sink (its props).
+    pub fn ceiling_for(&self, node_is_raop: bool) -> f64 {
+        match self.max_db {
+            Some(m) if m.is_finite() => m.clamp(MIN_DB, MAX_DB),
+            _ if self.is_raop(node_is_raop) => RAOP_MAX_DB,
+            _ => MAX_DB,
+        }
+    }
+    /// A hardware bus whose destination is an AirPlay speaker, by name (case-insensitive) or node props.
+    pub fn is_raop(&self, node_is_raop: bool) -> bool {
+        matches!(&self.kind, BusKind::Hardware { target } if node_is_raop || is_raop_name(target))
+    }
+    /// An AirPlay bus without an explicit ceiling gets RAOP_MAX_DB written into its config once, so it
+    /// survives a rename of the node. Returns whether it changed.
+    pub fn persist_raop_ceiling(&mut self, node_is_raop: bool) -> bool {
+        if self.max_db.map_or(true, |m| !m.is_finite()) && self.is_raop(node_is_raop) {
+            self.max_db = Some(RAOP_MAX_DB);
+            return true;
+        }
+        false
+    }
+    pub fn clamp_db(&self, db: f64) -> f64 {
+        if db.is_nan() { MIN_DB } else { db.min(self.ceiling_db()) }
+    }
+    /// The gain to push to the device: the saved one, never above the ceiling.
+    pub fn effective_db(&self) -> f64 {
+        self.clamp_db(self.gain_db)
+    }
 }
 
 /// Piano synth settings (FluidSynth playing your MIDI keyboard into the Piano channel).
@@ -271,11 +325,14 @@ fn lenient_quantum<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Err
     Ok(normalize_quantum(&v))
 }
 
+/// dB <-> wpctl volume, the one mapping used in both directions (#33).
+/// wpctl volumes are cubic: v = 10^(dB/60) and dB = 60·log10(v); the node's linear channelVolume
+/// is v³, so dB = 20·log10(channelVolume). Both ends clamp to [MIN_DB, MAX_DB]; MIN_DB is -∞ (v = 0).
 pub fn db_to_vol(db: f64) -> f64 {
-    if db <= MIN_DB { 0.0 } else { 10f64.powf(db / 60.0) } // wpctl volumes are cubic
+    if db.is_nan() || db <= MIN_DB { 0.0 } else { 10f64.powf(db.min(MAX_DB) / 60.0) }
 }
 pub fn vol_to_db(v: f64) -> f64 {
-    if v <= 0.0 { MIN_DB } else { (60.0 * v.log10()).clamp(MIN_DB, MAX_DB) }
+    if v.is_nan() || v <= 0.0 { MIN_DB } else { (60.0 * v.log10()).clamp(MIN_DB, MAX_DB) }
 }
 pub fn fmt_db(db: f64) -> String {
     if db <= MIN_DB { "-∞".into() } else { format!("{:+.1} dB", db) }
@@ -305,10 +362,15 @@ impl Config {
     }
 
     pub fn load() -> Config {
-        let path = Self::path();
+        Self::load_from(&Self::path())
+    }
+
+    /// `load` for an explicit path (the remote server's tests use a temp dir).
+    pub fn load_from(path: &std::path::Path) -> Config {
+        let path = path.to_path_buf();
         let fresh = || {
             let c = Config::default_config();
-            c.save();
+            c.save_to(&path);
             c
         };
         let Ok(bytes) = std::fs::read(&path) else {
@@ -343,12 +405,87 @@ impl Config {
     }
 
     pub fn save(&self) {
-        let p = Self::path();
+        self.save_to(&Self::path());
+    }
+
+    /// Atomic write: a per-process temp file renamed over `p` (two writers never share a temp name).
+    pub fn save_to(&self, p: &std::path::Path) -> bool {
         let _ = std::fs::create_dir_all(p.parent().unwrap());
-        let tmp = p.with_extension("json.tmp");
-        if std::fs::write(&tmp, serde_json::to_vec_pretty(self).unwrap()).is_ok() {
-            let _ = std::fs::rename(tmp, p);
+        let tmp = p.with_extension(format!("json.tmp.{}", std::process::id()));
+        if std::fs::write(&tmp, serde_json::to_vec_pretty(self).unwrap()).is_ok() && std::fs::rename(&tmp, p).is_ok() {
+            return true;
         }
+        let _ = std::fs::remove_file(&tmp);
+        false
+    }
+
+    /// Read the file as it is now without the load() side effects (no defaults written, no backup); None if missing or unparsable.
+    pub fn peek(p: &std::path::Path) -> Option<Config> {
+        serde_json::from_slice(&std::fs::read(p).ok()?).ok()
+    }
+
+    /// Save without clobbering another writer (the engine's remote server, #26): under the config lock,
+    /// if the file changed since `base` (what this process last read or wrote), merge field by field
+    /// (our edits since `base` win, everything else comes from the file) before writing.
+    /// `self` becomes the merged config and `base` the written one. True when the file changed under us.
+    #[allow(dead_code)] // the window uses save_merged_with; kept as the plain API (tests, tools)
+    pub fn save_merged(&mut self, base: &mut Config, p: &std::path::Path) -> bool {
+        match self.save_merged_with(base, p, &|_, _, _| {}) {
+            Ok(changed) => changed,
+            Err(e) => {
+                eprintln!("wavelink: {e}");
+                true
+            }
+        }
+    }
+
+    /// `save_merged` with a hook that runs under the lock before the merge: `prefer(base, file, mine)` may
+    /// adjust `mine` (the window lets a remote gain beat an auto-normalize move, B36-8).
+    /// Err = the merge failed: NOTHING is written (never overwrite without merging) and `base` is kept.
+    pub fn save_merged_with(&mut self, base: &mut Config, p: &std::path::Path, prefer: &dyn Fn(&Config, &Config, &mut Config)) -> Result<bool, String> {
+        let _lock = lock_config(p);
+        let disk = Config::peek(p);
+        let mut changed = false;
+        if let Some(d) = disk.filter(|d| d != base) {
+            let mut mine = self.clone();
+            prefer(base, &d, &mut mine);
+            match merge3(base, &mine, &d) {
+                Some(m) => *self = m,
+                None => return Err(format!("{}: merge with the newer file failed; not saving over it", p.display())),
+            }
+            changed = true;
+        }
+        if self.save_to(p) {
+            *base = self.clone();
+        }
+        Ok(changed)
+    }
+
+    /// Pull in edits another writer saved since `base`; our unsaved edits since `base` stay.
+    /// Returns the file's config when it differed from `base` (`self` is then merged, `base` = file).
+    #[allow(dead_code)]
+    pub fn pull_merged(&mut self, base: &mut Config, p: &std::path::Path) -> Option<Config> {
+        self.pull_merged_with(base, p, &|_, _, _| {}).unwrap_or_else(|e| {
+            eprintln!("wavelink: {e}");
+            None
+        })
+    }
+
+    /// `pull_merged` with the same `prefer` hook as `save_merged_with`. Err = the merge failed: nothing
+    /// changes (`base` stays, so the next save still merges instead of overwriting).
+    pub fn pull_merged_with(&mut self, base: &mut Config, p: &std::path::Path, prefer: &dyn Fn(&Config, &Config, &mut Config)) -> Result<Option<Config>, String> {
+        let Some(d) = Config::peek(p) else { return Ok(None) };
+        if &d == base {
+            return Ok(None);
+        }
+        let mut mine = self.clone();
+        prefer(base, &d, &mut mine);
+        match merge3(base, &mine, &d) {
+            Some(m) => *self = m,
+            None => return Err(format!("{}: merge with the newer file failed; keeping the window's config", p.display())),
+        }
+        *base = d.clone();
+        Ok(Some(d))
     }
 
     /// Everything that needs the engine to rebuild the graph (not levels/mutes/EQ).
@@ -400,18 +537,136 @@ impl Config {
             ],
             buses: vec![
                 Bus { id: "a1".into(), name: "Headphones".into(), color: "#64d2ff".into(),
-                      kind: BusKind::Hardware { target: SCARLETT.into() }, gain_db: -4.2, mute: false },
+                      kind: BusKind::Hardware { target: SCARLETT.into() }, gain_db: -4.2, mute: false, max_db: None },
                 Bus { id: "a2".into(), name: "Monitor".into(), color: "#30d158".into(),
-                      kind: BusKind::Hardware { target: HDMI.into() }, gain_db: -23.9, mute: false },
+                      kind: BusKind::Hardware { target: HDMI.into() }, gain_db: -23.9, mute: false, max_db: None },
                 Bus { id: "b1".into(), name: "Stream".into(), color: "#ff453a".into(),
                       kind: BusKind::Virtual { node: "mix_recording.src".into(), description: "Recording Mix".into() },
-                      gain_db: 0.0, mute: false },
+                      gain_db: 0.0, mute: false, max_db: None },
                 Bus { id: "b2".into(), name: "Voice Chat".into(), color: "#ffd60a".into(),
                       kind: BusKind::Virtual { node: "voice_chat_mix".into(), description: "Voice Chat Mix".into() },
-                      gain_db: 0.0, mute: false },
+                      gain_db: 0.0, mute: false, max_db: None },
             ],
         }
     }
+}
+
+/// Where the window parks its config when merging keeps failing: next to config.json, timestamped so a
+/// second park never overwrites the first (config.json.wavelink-failed-<unix seconds>).
+pub fn parked_path(p: &std::path::Path, now: std::time::SystemTime) -> PathBuf {
+    let secs = now.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let mut q = p.with_extension(format!("json.wavelink-failed-{secs}"));
+    let mut n = 1;
+    while q.exists() {
+        q = p.with_extension(format!("json.wavelink-failed-{secs}-{n}"));
+        n += 1;
+    }
+    q
+}
+
+/// For inputs whose in-memory gain moved only by auto-normalize (`auto`), a gain another writer saved
+/// since `base` wins over the auto move: auto moves are not user edits (B36-8). Returns those input ids.
+pub fn their_gains_win(base: &Config, disk: &Config, mine: &mut Config, auto: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut won = vec![];
+    for i in mine.inputs.iter_mut().filter(|i| auto.contains(&i.id)) {
+        let (b, d) = (base.inputs.iter().find(|x| x.id == i.id), disk.inputs.iter().find(|x| x.id == i.id));
+        if let (Some(b), Some(d)) = (b, d) {
+            if b.gain_db != d.gain_db {
+                i.gain_db = d.gain_db;
+                won.push(i.id.clone());
+            }
+        }
+    }
+    won
+}
+
+/// Exclusive advisory lock on `<config dir>/config.lock` for a read-modify-write of `p`; released on drop.
+/// Best effort: if the lock file can't be opened the write goes ahead unlocked.
+pub fn lock_config(p: &std::path::Path) -> Option<std::fs::File> {
+    let lp = p.with_extension("lock");
+    let _ = std::fs::create_dir_all(lp.parent()?);
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(lp).ok()?;
+    f.lock().ok()?;
+    Some(f)
+}
+
+/// Three-way merge of JSON-serialised configs: for each leaf, `mine` wins where it differs from
+/// `base`, otherwise `theirs`. Arrays of objects with an "id" (inputs, buses) merge per id; other arrays
+/// (EQ bands) are leaves. None if the merge doesn't deserialize back (then the caller keeps `mine`).
+pub fn merge3(base: &Config, mine: &Config, theirs: &Config) -> Option<Config> {
+    use serde_json::Value;
+    fn ids(v: &Value) -> Option<Vec<String>> {
+        v.as_array()?.iter().map(|x| x.get("id").and_then(|i| i.as_str()).map(String::from)).collect()
+    }
+    fn m(base: &Value, mine: &Value, theirs: &Value) -> Value {
+        if mine == base {
+            return theirs.clone();
+        }
+        if theirs == base || theirs == mine {
+            return mine.clone();
+        }
+        match (base, mine, theirs) {
+            (Value::Object(b), Value::Object(mi), Value::Object(th)) => {
+                let mut out = serde_json::Map::new();
+                let keys: std::collections::BTreeSet<&String> = b.keys().chain(mi.keys()).chain(th.keys()).collect();
+                for k in keys {
+                    match (b.get(k), mi.get(k), th.get(k)) {
+                        (_, Some(x), Some(y)) => {
+                            out.insert(k.clone(), m(b.get(k).unwrap_or(&Value::Null), x, y));
+                        }
+                        // removed on one side: keep the removal unless the other side edited it
+                        (Some(bv), Some(x), None) => {
+                            if x != bv {
+                                out.insert(k.clone(), x.clone());
+                            }
+                        }
+                        (Some(bv), None, Some(y)) => {
+                            if y != bv {
+                                out.insert(k.clone(), y.clone());
+                            }
+                        }
+                        (None, Some(x), None) => {
+                            out.insert(k.clone(), x.clone());
+                        }
+                        (None, None, Some(y)) => {
+                            out.insert(k.clone(), y.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                Value::Object(out)
+            }
+            (Value::Array(b), Value::Array(mi), Value::Array(th)) => match (ids(base), ids(mine), ids(theirs)) {
+                (Some(bi), Some(mii), Some(thi)) => {
+                    // order: mine's order if mine reordered/added/removed, else theirs'; per-id merge
+                    let order = if mii != bi { mii.clone() } else { thi.clone() };
+                    let get = |arr: &Vec<Value>, idv: &Vec<String>, id: &str| idv.iter().position(|x| x == id).map(|i| arr[i].clone());
+                    let mut out = vec![];
+                    let mut seen = std::collections::HashSet::new();
+                    for id in order.iter().chain(thi.iter()).chain(mii.iter()) {
+                        if !seen.insert(id.clone()) {
+                            continue;
+                        }
+                        let (bv, mv, tv) = (get(b, &bi, id), get(mi, &mii, id), get(th, &thi, id));
+                        match (bv, mv, tv) {
+                            (bv, Some(x), Some(y)) => out.push(m(&bv.unwrap_or(Value::Null), &x, &y)),
+                            (Some(bv), Some(x), None) if x != bv => out.push(x),
+                            (Some(bv), None, Some(y)) if y != bv => out.push(y),
+                            (None, Some(x), None) => out.push(x),
+                            (None, None, Some(y)) => out.push(y),
+                            _ => {}
+                        }
+                    }
+                    Value::Array(out)
+                }
+                _ => mine.clone(),
+            },
+            // both sides changed the same leaf: ours wins (the caller's in-memory edit is the newest intent here)
+            _ => mine.clone(),
+        }
+    }
+    let (b, mi, th) = (serde_json::to_value(base).ok()?, serde_json::to_value(mine).ok()?, serde_json::to_value(theirs).ok()?);
+    serde_json::from_value(m(&b, &mi, &th)).ok()
 }
 
 pub fn glib_home() -> PathBuf {
@@ -421,6 +676,112 @@ pub fn glib_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn db_vol_round_trip() {
+        // every 0.1 dB fader step, through the exact value and through what wpctl is given (6 decimals)
+        let mut db = MIN_DB + 0.1;
+        while db <= MAX_DB + 1e-9 {
+            let v = db_to_vol(db);
+            assert!((vol_to_db(v) - db).abs() < 1e-9, "exact {db}");
+            let sent: f64 = format!("{v:.6}").parse().unwrap();
+            assert!((vol_to_db(sent) - db).abs() < 0.01, "6 decimals {db}: {}", vol_to_db(sent));
+            db += 0.1;
+        }
+        // and back: wpctl volume -> dB -> volume
+        for v in [0.1001, 0.15, 0.24, 0.25, 0.5, 0.75, 1.0, 1.25, 10f64.powf(MAX_DB / 60.0)] {
+            assert!((db_to_vol(vol_to_db(v)) - v).abs() < 1e-12, "vol {v}");
+        }
+        // the formula: v = 10^(dB/60), linear channelVolume v³ = 10^(dB/20)
+        assert!((db_to_vol(-37.3) - 0.238964).abs() < 1e-5);
+        assert!((db_to_vol(-36.1) - 0.25).abs() < 1e-3);
+        assert!((db_to_vol(-6.0).powi(3) - 10f64.powf(-6.0 / 20.0)).abs() < 1e-12);
+        assert_eq!(db_to_vol(0.0), 1.0);
+        assert_eq!(vol_to_db(1.0), 0.0);
+    }
+
+    #[test]
+    fn bus_ceiling_defaults_and_clamps() {
+        let hw = |t: &str| BusKind::Hardware { target: t.into() };
+        // new-bus creation: an AirPlay bus starts at its ceiling, never 0 dB (= the speaker at 100 %)
+        let sonos = Bus::new("a3".into(), "Sonos".into(), "#fff".into(), hw("raop_sonos_lionels_room"));
+        assert_eq!(sonos.ceiling_db(), RAOP_MAX_DB);
+        assert_eq!(sonos.gain_db, RAOP_MAX_DB);
+        let scarlett = Bus::new("a1".into(), "Headphones".into(), "#fff".into(), hw(SCARLETT));
+        assert_eq!(scarlett.ceiling_db(), MAX_DB);
+        assert_eq!(scarlett.gain_db, 0.0);
+        let virt = Bus::new("b3".into(), "V".into(), "#fff".into(), BusKind::Virtual { node: "v".into(), description: "V".into() });
+        assert_eq!(virt.ceiling_db(), MAX_DB);
+        // a saved gain above the ceiling is pushed (engine initial push, GUI re-apply) at the ceiling
+        let mut b = sonos.clone();
+        b.gain_db = 0.0;
+        assert_eq!(b.effective_db(), RAOP_MAX_DB);
+        b.gain_db = -37.3;
+        assert_eq!(b.effective_db(), -37.3);
+        assert_eq!(b.clamp_db(f64::NAN), MIN_DB);
+        // explicit max_db wins (clamped to the fader range); missing field = destination default
+        b.max_db = Some(-30.0);
+        assert_eq!(b.ceiling_db(), -30.0);
+        assert_eq!(b.effective_db(), -37.3);
+        b.max_db = Some(40.0);
+        assert_eq!(b.ceiling_db(), MAX_DB);
+        let j = r##"{"id":"a3","name":"Sonos","color":"#fff","kind":{"type":"hardware","target":"raop_x"},"gain_db":0.0,"mute":false}"##;
+        let old: Bus = serde_json::from_str(j).unwrap();
+        assert_eq!(old.max_db, None);
+        assert_eq!(old.effective_db(), RAOP_MAX_DB);
+        // round trip without a max_db does not write one
+        assert!(!serde_json::to_string(&old).unwrap().contains("max_db"));
+    }
+
+    #[test]
+    fn raop_detection_and_persisted_ceiling() {
+        let hw = |t: &str| Bus::new("a3".into(), "S".into(), "#fff".into(), BusKind::Hardware { target: t.into() });
+        for t in ["raop_sonos_lionels_room", "RAOP_sonos", "my.Raop.sink", "AirPlay_kitchen", "raop_sink.Sonos-7828CAB27EEC.local.192.168.1.64.7000"] {
+            assert_eq!(hw(t).ceiling_db(), RAOP_MAX_DB, "{t}");
+        }
+        assert_eq!(hw("alsa_output.usb-Focusrite").ceiling_db(), MAX_DB);
+        // renamed AirPlay sink: only its props tell
+        let mut b = hw("sonos_room");
+        b.gain_db = 0.0;
+        assert_eq!(b.ceiling_db(), MAX_DB);
+        assert_eq!(b.ceiling_for(true), RAOP_MAX_DB);
+        assert!(b.persist_raop_ceiling(true));
+        assert_eq!(b.max_db, Some(RAOP_MAX_DB));
+        assert!(!b.persist_raop_ceiling(true), "written once");
+        // survives a later rename to a name with nothing AirPlay in it
+        b.kind = BusKind::Hardware { target: "living_room".into() };
+        assert_eq!(b.ceiling_db(), RAOP_MAX_DB);
+        assert_eq!(b.effective_db(), RAOP_MAX_DB);
+        // an explicit ceiling is never overwritten
+        let mut c = hw("raop_x");
+        c.max_db = Some(-30.0);
+        assert!(!c.persist_raop_ceiling(true));
+        assert_eq!(c.max_db, Some(-30.0));
+        // by name alone it is persisted too
+        let mut d = hw("raop_y");
+        assert!(d.persist_raop_ceiling(false));
+        assert_eq!(d.max_db, Some(RAOP_MAX_DB));
+        // not AirPlay, or a virtual bus: nothing written
+        let mut e = hw("alsa_output.hdmi");
+        assert!(!e.persist_raop_ceiling(false));
+        let mut v = Bus::new("b3".into(), "V".into(), "#fff".into(), BusKind::Virtual { node: "raop_like".into(), description: "V".into() });
+        assert!(!v.persist_raop_ceiling(true));
+        assert_eq!(v.max_db, None);
+    }
+
+    #[test]
+    fn db_vol_edges() {
+        assert_eq!(db_to_vol(MIN_DB), 0.0);
+        assert_eq!(db_to_vol(-200.0), 0.0);
+        assert_eq!(db_to_vol(f64::NAN), 0.0);
+        assert_eq!(vol_to_db(0.0), MIN_DB);
+        assert_eq!(vol_to_db(-1.0), MIN_DB);
+        assert_eq!(vol_to_db(f64::NAN), MIN_DB);
+        assert_eq!(vol_to_db(db_to_vol(MIN_DB)), MIN_DB);
+        // both ends clamp to MAX_DB
+        assert_eq!(vol_to_db(10.0), MAX_DB);
+        assert!((db_to_vol(40.0) - db_to_vol(MAX_DB)).abs() < 1e-12);
+    }
 
     #[test]
     fn config_quantum_defaults_to_256() {
@@ -483,6 +844,143 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         assert_eq!(bad.unwrap(), truncated);
         assert_eq!(bad1.unwrap(), second);
+    }
+
+    #[test]
+    fn merge3_keeps_both_sides_edits() {
+        let base = Config::default_config();
+        let mut mine = base.clone();
+        let mut theirs = base.clone();
+        mine.inputs[0].gain_db = -7.0; // GUI moved System
+        mine.inputs[1].eq[3] = 4.0;
+        theirs.inputs[1].gain_db = -11.0; // remote moved Spotify
+        theirs.buses[0].mute = true;
+        theirs.inputs[2].routes.get_mut("a1").unwrap().on = false;
+        let m = merge3(&base, &mine, &theirs).unwrap();
+        assert_eq!(m.inputs[0].gain_db, -7.0);
+        assert_eq!(m.inputs[1].eq[3], 4.0);
+        assert_eq!(m.inputs[1].gain_db, -11.0);
+        assert!(m.buses[0].mute);
+        assert!(!m.inputs[2].routes["a1"].on);
+        // same leaf on both sides: ours
+        theirs.inputs[0].gain_db = -30.0;
+        assert_eq!(merge3(&base, &mine, &theirs).unwrap().inputs[0].gain_db, -7.0);
+        // an input added on their side, one removed on ours
+        let mut theirs2 = base.clone();
+        let mut extra = base.inputs[0].clone();
+        extra.id = "new".into();
+        theirs2.inputs.push(extra);
+        let mut mine2 = base.clone();
+        mine2.inputs.retain(|i| i.id != "game");
+        let m = merge3(&base, &mine2, &theirs2).unwrap();
+        let ids: Vec<_> = m.inputs.iter().map(|i| i.id.as_str()).collect();
+        assert!(ids.contains(&"new") && !ids.contains(&"game"), "{ids:?}");
+    }
+
+    #[test]
+    fn auto_normalize_gain_never_beats_a_remote_gain_on_save() {
+        let dir = std::env::temp_dir().join(format!("wavelink-auto-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("config.json");
+        let mut base = Config::default_config();
+        base.inputs[1].normalize = true;
+        assert!(base.save_to(&p));
+        let mut gui = base.clone();
+        gui.inputs[1].gain_db = -8.0; // auto-normalize moved it
+        gui.inputs[2].gain_db = -5.0; // he moved this one himself
+        gui.inputs[0].eq[2] = 3.0;
+        let mut remote = Config::peek(&p).unwrap();
+        remote.inputs[1].gain_db = -30.0;
+        remote.inputs[2].gain_db = -40.0;
+        assert!(remote.save_to(&p));
+        let auto: std::collections::HashSet<String> = [gui.inputs[1].id.clone()].into();
+        let won = std::cell::RefCell::new(vec![]);
+        let prefer = |b: &Config, d: &Config, m: &mut Config| *won.borrow_mut() = their_gains_win(b, d, m, &auto);
+        assert_eq!(gui.save_merged_with(&mut base, &p, &prefer), Ok(true));
+        let disk = Config::peek(&p).unwrap();
+        assert_eq!(disk.inputs[1].gain_db, -30.0, "the remote's move beats the auto move");
+        assert_eq!(disk.inputs[2].gain_db, -5.0, "his own move still wins");
+        assert_eq!(disk.inputs[0].eq[2], 3.0);
+        assert_eq!(won.borrow().as_slice(), &[gui.inputs[1].id.clone()]);
+        // the pull path applies the same rule
+        let mut remote = disk.clone();
+        remote.inputs[1].gain_db = -33.0;
+        remote.save_to(&p);
+        gui.inputs[1].gain_db = -9.0;
+        assert!(gui.pull_merged_with(&mut base, &p, &prefer).unwrap().is_some());
+        assert_eq!(gui.inputs[1].gain_db, -33.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parked_files_never_overwrite_each_other() {
+        let dir = std::env::temp_dir().join(format!("wavelink-park-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let a = parked_path(&p, t);
+        assert_eq!(a.file_name().unwrap(), "config.json.wavelink-failed-1800000000");
+        std::fs::write(&a, b"x").unwrap();
+        let b = parked_path(&p, t);
+        assert_ne!(a, b);
+        assert!(b.to_string_lossy().ends_with("-1800000000-1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_merge_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("wavelink-merge-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("config.json");
+        let mut base = Config::default_config();
+        assert!(base.save_to(&p));
+        let mut other = base.clone();
+        other.buses[0].gain_db = -33.0;
+        other.save_to(&p);
+        let mut gui = base.clone();
+        gui.inputs[0].mute = true;
+        // a merge input that can't round-trip (NaN serialises as null, which an EQ band can't load back)
+        let bad = |_: &Config, _: &Config, m: &mut Config| m.inputs[0].eq = vec![f64::NAN; 12];
+        let before = std::fs::read(&p).unwrap();
+        let r = gui.save_merged_with(&mut base, &p, &bad);
+        assert!(r.is_err(), "{r:?}");
+        assert_eq!(std::fs::read(&p).unwrap(), before, "nothing written");
+        assert_eq!(base, Config::default_config(), "base kept: the next save merges again");
+        let mut g2 = Config::default_config();
+        let mut b2 = Config::default_config();
+        assert!(g2.pull_merged_with(&mut b2, &p, &bad).is_err());
+        assert_eq!(b2, Config::default_config());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_merged_never_writes_stale_state_over_newer_file() {
+        let dir = std::env::temp_dir().join(format!("wavelink-merge-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("config.json");
+        let mut base = Config::default_config();
+        assert!(base.save_to(&p));
+        let mut gui = base.clone();
+        // another writer (the remote server) changes the file
+        let mut other = Config::peek(&p).unwrap();
+        other.buses[1].gain_db = -40.0;
+        other.save_to(&p);
+        // the GUI saves its own, unrelated edit
+        gui.inputs[0].mute = true;
+        assert!(gui.save_merged(&mut base, &p));
+        let disk = Config::peek(&p).unwrap();
+        assert_eq!(disk.buses[1].gain_db, -40.0, "the other writer's edit survived");
+        assert!(disk.inputs[0].mute, "the GUI's edit landed");
+        assert_eq!(base, disk);
+        // pull: the file changes again, the GUI picks it up
+        let mut other = disk.clone();
+        other.inputs[3].gain_db = -2.5;
+        other.save_to(&p);
+        assert!(gui.pull_merged(&mut base, &p).is_some());
+        assert_eq!(gui.inputs[3].gain_db, -2.5);
+        assert!(gui.pull_merged(&mut base, &p).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

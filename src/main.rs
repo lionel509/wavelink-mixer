@@ -1,6 +1,7 @@
 //! wavelink-mixer: a Voicemeeter-style mixer for PipeWire.
 //!   wavelink-mixer           open the mixer window
-//!   wavelink-mixer engine    run the routing engine (systemd user service)
+//!   wavelink-mixer engine    run the routing engine (systemd user service) + LAN control server
+//!   wavelink-mixer remote-token [--rotate]   print the host/port/token a remote client needs (new token with --rotate)
 mod config;
 mod dash;
 mod dsp;
@@ -21,10 +22,15 @@ mod player;
 mod spotify;
 mod sysmon;
 mod pw;
+mod remote;
+mod busvol;
 mod ui;
 #[cfg(test)]
 #[path = "breaker_front.rs"]
 mod breaker_front;
+#[cfg(test)]
+#[path = "breaker_busvol.rs"]
+mod breaker_busvol;
 
 use adw::prelude::*;
 use gtk::glib;
@@ -34,6 +40,8 @@ fn main() -> glib::ExitCode {
     if std::env::args().nth(1).as_deref() == Some("preset") {
         let a: Vec<String> = std::env::args().collect();
         let (id, eq, rack) = (a.get(2).cloned().unwrap_or_default(), a.get(3).cloned().unwrap_or("-".into()), a.get(4).cloned().unwrap_or("-".into()));
+        // read-modify-write under config.lock: the engine's remote server and the window write too (#26)
+        let lock = config::lock_config(&config::Config::path());
         let mut cfg = config::Config::load();
         let Some(inp) = cfg.inputs.iter_mut().find(|i| i.id == id) else {
             eprintln!("no input '{id}'");
@@ -55,6 +63,7 @@ fn main() -> glib::ExitCode {
         }
         let (eqv, rk) = (inp.eq.clone(), inp.rack.clone());
         cfg.save();
+        drop(lock);
         if let Some(n) = pw::Graph::read().and_then(|g| g.node(&config::names::strip_in(&id)).map(|n| n.id)) {
             pw::set_eq(n, &eqv);
             pw::set_rack(n, &rk);
@@ -66,6 +75,9 @@ fn main() -> glib::ExitCode {
     if std::env::args().nth(1).as_deref() == Some("engine-conf") {
         print!("{}", engine::dump_conf());
         return glib::ExitCode::SUCCESS;
+    }
+    if std::env::args().nth(1).as_deref() == Some("remote-token") {
+        std::process::exit(remote::print_info(&std::env::args().skip(2).collect::<Vec<_>>()));
     }
     if std::env::args().nth(1).as_deref() == Some("engine") {
         engine::run();
