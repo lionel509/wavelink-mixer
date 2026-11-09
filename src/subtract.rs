@@ -25,6 +25,12 @@ pub const LONG: usize = 8192;
 const KMAX: usize = 1000; // ~5.4 kHz
 const MAX_NOTES: usize = 14;
 
+/// The precision defaults (pursuit stops at 30 % of the first score or when a note would explain
+/// < 10 % of the residual, 6 voices in the pianist); MIXER_PIANO_PRECISION=0 restores 2e48eb7's.
+pub fn precision() -> bool {
+    env_on("MIXER_PIANO_PRECISION", true)
+}
+
 /// Runtime A/B switches for the live path: "0"/"1" (unset: the default).
 pub fn env_on(name: &str, def: bool) -> bool {
     match std::env::var(name).as_deref() {
@@ -236,7 +242,7 @@ impl Analyzer {
             mag: vec![0.0; KMAX],
             g: vec![0.0; KMAX],
             df: RATE as f32 / N as f32,
-            stop_rel: tun("STOP_REL", 0.22),
+            stop_rel: tun("STOP_REL", if precision() { 0.3 } else { 0.22 }),
             fft2: Fft::new(LONG),
             win2: hann(LONG),
             re2: vec![0.0; LONG],
@@ -357,7 +363,27 @@ impl Analyzer {
         let mut first = 0f32;
         let mut taken = [false; KEYS];
         let mut got = [false; KEYS];
-        for _ in 0..MAX_NOTES {
+        // precision: at most (distinct peaks below 1 kHz) + 1 notes (PEAKCAP=1), and stop when the
+        // next note would explain less than EXPL of the residual energy (EXPL > 0)
+        let mut cap = MAX_NOTES;
+        if tun("PEAKCAP", 0.0) > 0.0 {
+            let k1 = (1000.0 / self.df) as usize;
+            let mx = self.mag[2..k1].iter().fold(0f32, |m, &v| m.max(v));
+            let mut n = 0;
+            for k in 3..k1 {
+                let m = self.mag[k];
+                if m > 0.03 * mx && m >= self.mag[k - 1] && m >= self.mag[k + 1] && m >= self.mag[k - 2] && m >= self.mag[k + 2] {
+                    let (lo, hi) = (k.saturating_sub(12), (k + 13).min(KMAX));
+                    let mean = self.mag[lo..hi].iter().sum::<f32>() / (hi - lo) as f32;
+                    if m > 2.0 * mean {
+                        n += 1;
+                    }
+                }
+            }
+            cap = (n + 1).min(MAX_NOTES);
+        }
+        let expl = tun("EXPL", if precision() { 0.1 } else { 0.0 });
+        for _ in 0..cap {
             let mut best = (0f32, usize::MAX);
             for k in 0..KEYS {
                 if taken[k] || key_hz(k) > 2100.0 {
@@ -501,6 +527,14 @@ impl Analyzer {
                 }
             }
             let amp = parts.iter().map(|p| p.re * p.re + p.im * p.im).sum::<f32>().sqrt();
+            if expl > 0.0 && !found.is_empty() {
+                // residual energy before this note's subtraction = after + its own share
+                let rest: f32 = self.mag[10..KMAX].iter().map(|v| v * v).sum::<f32>();
+                let mine = amp * amp * 1.5;
+                if mine < expl * (rest + mine) {
+                    break;
+                }
+            }
             act[k] = amp;
             found.push(Found { key: (LOW_KEY as usize + k) as u8, f0, amp, partials: parts });
         }

@@ -32,6 +32,9 @@ struct Held {
 }
 
 pub struct Pianist {
+    /// Pedal hold after the tracker's off (MIXER_PIANO_HOLD, seconds) and the voice cap (MIXER_PIANO_VOICES).
+    hold: f64,
+    voices: usize,
     held: Vec<Held>,
     /// The tracker's on for this key was dropped or merged: swallow its off.
     swallow: [u8; 128],
@@ -49,7 +52,10 @@ impl Default for Pianist {
 
 impl Pianist {
     pub fn new() -> Pianist {
-        Pianist { held: Vec::with_capacity(16), swallow: [0; 128], recent_ons: Vec::with_capacity(16), vel_avg: [0.0; 3], bass: None }
+        Pianist {
+            hold: std::env::var("MIXER_PIANO_HOLD").ok().and_then(|v| v.parse().ok()).unwrap_or(HOLD_S),
+            voices: std::env::var("MIXER_PIANO_VOICES").ok().and_then(|v| v.parse().ok()).unwrap_or(if crate::subtract::precision() { 6 } else { MAX_VOICES }),
+            held: Vec::with_capacity(16), swallow: [0; 128], recent_ons: Vec::with_capacity(16), vel_avg: [0.0; 3], bass: None }
     }
 
     fn release_where(&mut self, t: f64, out: &mut Vec<Ev>, f: impl Fn(&Held) -> bool) {
@@ -71,7 +77,8 @@ impl Pianist {
                 Ev::Off { t, pitch } => self.off(t, pitch, out),
             }
         }
-        self.release_where(now, out, |h| h.released.is_some_and(|r| now - r > HOLD_S));
+        let hold = self.hold;
+        self.release_where(now, out, |h| h.released.is_some_and(|r| now - r > hold));
     }
 
     fn on(&mut self, t: f64, pitch: u8, vel: u8, out: &mut Vec<Ev>) {
@@ -104,7 +111,7 @@ impl Pianist {
                     if iv != 0 && iv != 7 {
                         new_bass = true;
                         self.bass = Some((pitch, t));
-                    } else if pitch <= bp || t - bt > HOLD_S {
+                    } else if pitch <= bp || t - bt > self.hold {
                         self.bass = Some((pitch, t));
                     } else if iv == 0 {
                         self.bass = Some((bp, t));
@@ -116,7 +123,7 @@ impl Pianist {
         self.release_where(t, out, |h| {
             h.pitch == pitch || (h.released.is_some() && (new_bass || (h.pitch as i32 - pitch as i32).abs() <= 2))
         });
-        while self.held.len() >= MAX_VOICES {
+        while self.held.len() >= self.voices {
             let i = self.held.iter().position(|h| h.released.is_some()).unwrap_or(0);
             let h = self.held.remove(i);
             out.push(Ev::Off { t: t.max(h.t_on), pitch: h.pitch });

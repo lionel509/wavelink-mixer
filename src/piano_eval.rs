@@ -176,6 +176,9 @@ pub fn live_notes(mono: &[f32]) -> (Vec<Note>, f64) {
 
 pub fn eval(mono: &[f32], sections: &[(String, f64, f64)]) -> String {
     let (notes, ms) = live_notes(mono);
+    if let Ok(p) = std::env::var("PIANO_EVAL_MID") {
+        let _ = std::fs::write(p, crate::notes::piano_midi(&notes, false, Some(0.0)));
+    }
     let secs = mono.len() as f64 / RATE as f64;
     let (ca, peaks) = chroma_audio(mono);
     let mut sounding: Vec<Vec<u8>> = vec![Vec::new(); ca.len()];
