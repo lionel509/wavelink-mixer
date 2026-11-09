@@ -214,6 +214,7 @@ fn r4_pure_noise_recall_grid() {
             let mut noise_notes = 0usize;
             let mut recall = 0usize;
             let mut old_recall = 0usize;
+            let mut old_noise = 0usize;
             for seed in 1..=10u64 {
                 let mut x = seed * 7919;
                 let (mut note, mut onset) = grids0();
@@ -228,6 +229,7 @@ fn r4_pure_noise_recall_grid() {
                 }
                 onset[100][10] = omax;
                 noise_notes += frames_to_notes(&note, &onset).len();
+                old_noise += old_frames_to_notes(&note, &onset).len();
                 // soft real note at pitch 50 inside the same noise
                 let (mut n2, mut o2) = (note.clone(), onset.clone());
                 for f in 60..90 {
@@ -242,7 +244,7 @@ fn r4_pure_noise_recall_grid() {
                     old_recall += 1;
                 }
             }
-            println!("{ceil:.2} {omax:.1} | {noise_notes} | new {recall}/10 old {old_recall}/10");
+            println!("{ceil:.2} {omax:.1} | noise notes new {noise_notes} old {old_noise} | soft recall new {recall}/10 old {old_recall}/10");
             if ceil <= 0.35 && omax <= 0.6 && noise_notes > 0 {
                 b1_bad.push((ceil, omax, noise_notes));
             }
