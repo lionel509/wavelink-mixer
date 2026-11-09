@@ -204,8 +204,9 @@ impl State {
                 .is_some(),
             Delta::BusGain { bus, db } => self.bus_mut(bus).map(|b| b.gain_db = *db).is_some(),
             Delta::BusMute { bus, mute } => self.bus_mut(bus).map(|b| b.mute = *mute).is_some(),
-            // scaffold (U1 todo): host deltas are not applied yet
-            Delta::HostVolume { .. } | Delta::HostMute { .. } | Delta::HostOnline { .. } => false,
+            Delta::HostVolume { host, volume } => self.host_mut(host).map(|h| h.volume = (*volume).min(100)).is_some(),
+            Delta::HostMute { host, mute } => self.host_mut(host).map(|h| h.mute = *mute).is_some(),
+            Delta::HostOnline { host, online } => self.host_mut(host).map(|h| h.online = *online).is_some(),
         }
     }
 
@@ -213,7 +214,8 @@ impl State {
     pub fn same_structure(&self, o: &State) -> bool {
         let ins = |s: &State| s.inputs.iter().map(|i| (i.id.clone(), i.name.clone(), i.color.clone(), i.source.clone())).collect::<Vec<_>>();
         let bus = |s: &State| s.buses.iter().map(|b| (b.id.clone(), b.name.clone(), b.color.clone(), b.kind, b.outputs.clone(), b.max_db, b.ceiling_db)).collect::<Vec<_>>();
-        ins(self) == ins(o) && bus(self) == bus(o) && self.zones == o.zones && self.server == o.server
+        let hosts = |s: &State| s.hosts.iter().map(|h| (h.id.clone(), h.label.clone())).collect::<Vec<_>>();
+        ins(self) == ins(o) && bus(self) == bus(o) && self.zones == o.zones && self.server == o.server && hosts(self) == hosts(o)
     }
 
     /// Deltas that turn `self` into `new`; None when the structure changed (send a full State instead).
@@ -246,6 +248,17 @@ impl State {
             }
             if a.mute != b.mute {
                 v.push(Delta::BusMute { bus: b.id.clone(), mute: b.mute });
+            }
+        }
+        for (a, b) in self.hosts.iter().zip(&new.hosts) {
+            if a.volume != b.volume {
+                v.push(Delta::HostVolume { host: b.id.clone(), volume: b.volume });
+            }
+            if a.mute != b.mute {
+                v.push(Delta::HostMute { host: b.id.clone(), mute: b.mute });
+            }
+            if a.online != b.online {
+                v.push(Delta::HostOnline { host: b.id.clone(), online: b.online });
             }
         }
         Some(v)
@@ -516,6 +529,11 @@ pub mod safety {
     pub fn check(cmd: &Command, state: &State, unlocked: &dyn Fn(&str) -> bool) -> Result<Checked, Reject> {
         let input = |id: &str| state.input(id).ok_or_else(|| Reject::UnknownInput(id.into()));
         let bus = |id: &str| state.bus(id).ok_or_else(|| Reject::UnknownBus(id.into()));
+        let host = |id: &str| match state.host(id) {
+            None => Err(Reject::UnknownHost(id.into())),
+            Some(h) if !h.online => Err(Reject::HostOffline(id.into())),
+            Some(h) => Ok(h),
+        };
         let mut note = None;
         let cmds = match cmd {
             Command::SetInputGain { input: i, db } => {
@@ -588,8 +606,20 @@ pub mod safety {
                 v.push(Command::SetBusMute { bus: b.clone(), mute: *mute });
                 v
             }
-            // scaffold (U1 todo): host rules are not enforced yet
-            Command::SetHostVolume { .. } | Command::SetHostMute { .. } => vec![cmd.clone()],
+            Command::SetHostVolume { host: h, volume } => {
+                let hs = host(h)?;
+                let mut got = (*volume).min(100);
+                let ceil = hs.volume.saturating_add(MAX_HOST_STEP).min(100);
+                if got > hs.volume && got > ceil {
+                    got = ceil;
+                    note = Some(format!("raised at most {MAX_HOST_STEP} per step"));
+                }
+                vec![Command::SetHostVolume { host: h.clone(), volume: got }]
+            }
+            Command::SetHostMute { host: h, mute } => {
+                host(h)?;
+                vec![Command::SetHostMute { host: h.clone(), mute: *mute }]
+            }
         };
         Ok(Checked { cmds, note })
     }
