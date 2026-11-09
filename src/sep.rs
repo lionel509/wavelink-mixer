@@ -228,10 +228,15 @@ pub const FRAME_THRESH: f32 = 0.3;
 pub const MIN_NOTE_FRAMES: usize = 11;
 pub const ENERGY_TOL: usize = 11;
 
-/// True when the window is silence for the transcriber (whole-window RMS below about -60 dBFS).
+/// Silence is judged per block, so a short quiet note in an otherwise silent window is not averaged away.
+pub const SILENCE_BLOCK: usize = 2048;
+pub const SILENCE_RMS: f64 = 1e-3;
+
+/// True when every 46 ms block is below about -60 dBFS RMS. Whole-window RMS would drop a quiet 300 ms note.
 pub fn is_silent(mono44: &[f32]) -> bool {
-    let rms = (mono44.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / mono44.len().max(1) as f64).sqrt();
-    rms < 1e-3
+    mono44
+        .chunks_exact(SILENCE_BLOCK)
+        .all(|b| (b.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / SILENCE_BLOCK as f64).sqrt() < SILENCE_RMS)
 }
 
 pub struct Transcriber {
