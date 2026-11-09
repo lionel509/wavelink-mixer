@@ -374,6 +374,12 @@ pub struct App {
     rack_page: gtk::Box,
     /// system gauges, shown under the output strips
     sys_panel: gtk::Box,
+    /// #37: the loopback link to this engine (None when remote control is off), and the MacBook-style host strips
+    link: RefCell<Option<crate::link::Conn>>,
+    /// host strips at the end of the OUTPUTS row (re-homed on every rebuild, rebuilt only when the host list changes)
+    hosts_box: gtk::Box,
+    last_hosts: RefCell<Vec<wavelink_proto::Host>>,
+    host_strips: RefCell<Vec<(String, crate::console::HostStrip)>>,
     faders: RefCell<Vec<Rc<Fader>>>,
     /// #33: per physical bus, adopt-vs-re-apply state across graph polls (survives rebuilds)
     bus_guard: RefCell<HashMap<String, crate::busvol::Tracker>>,
@@ -2155,6 +2161,79 @@ impl App {
         pop
     }
 
+    /// Send a host command over the loopback link; no-op without a link (remote control off).
+    fn send_host_cmd(&self, cmd: wavelink_proto::Command) {
+        if let Some(c) = self.link.borrow().as_ref() {
+            let id = HOST_CMD_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            c.send(wavelink_proto::ClientMsg::Command { id, cmd });
+        }
+    }
+
+    /// Rebuild the host strips from the engine's host list (structure changed: a State arrived).
+    fn rebuild_hosts(self: &Rc<Self>) {
+        while let Some(c) = self.hosts_box.first_child() {
+            self.hosts_box.remove(&c);
+        }
+        let hosts = self.last_hosts.borrow().clone();
+        let mut strips = Vec::new();
+        for h in &hosts {
+            let id = h.id.clone();
+            let w = Rc::downgrade(self);
+            let on_edit: Rc<dyn Fn(crate::console::HostEdit)> = Rc::new(move |e| {
+                let Some(app) = w.upgrade() else { return };
+                let cmd = match e {
+                    crate::console::HostEdit::Volume(volume) => wavelink_proto::Command::SetHostVolume { host: id.clone(), volume },
+                    crate::console::HostEdit::Mute(mute) => wavelink_proto::Command::SetHostMute { host: id.clone(), mute },
+                };
+                app.send_host_cmd(cmd);
+            });
+            let strip = crate::console::host_strip(h, on_edit);
+            self.hosts_box.append(&strip.root);
+            strips.push((h.id.clone(), strip));
+        }
+        self.hosts_box.set_visible(!hosts.is_empty());
+        *self.host_strips.borrow_mut() = strips;
+    }
+
+    /// Apply one engine delta to the host list and its strip, without rebuilding the strips (a drag stays alive).
+    fn apply_host_delta(&self, d: &wavelink_proto::Delta) {
+        use wavelink_proto::Delta;
+        let id = match d {
+            Delta::HostVolume { host, .. } | Delta::HostMute { host, .. } | Delta::HostOnline { host, .. } => host.clone(),
+            _ => return,
+        };
+        let snapshot = {
+            let mut hosts = self.last_hosts.borrow_mut();
+            let Some(h) = hosts.iter_mut().find(|h| h.id == id) else { return };
+            match d {
+                Delta::HostVolume { volume, .. } => h.volume = *volume,
+                Delta::HostMute { mute, .. } => h.mute = *mute,
+                Delta::HostOnline { online, .. } => h.online = *online,
+                _ => {}
+            }
+            h.clone()
+        };
+        if let Some((_, s)) = self.host_strips.borrow().iter().find(|(i, _)| *i == id) {
+            s.set(&snapshot);
+        }
+    }
+
+    /// One message from the engine link: State rebuilds the host strips, Delta updates them in place.
+    fn on_link_event(self: &Rc<Self>, e: crate::link::Event) {
+        match e {
+            crate::link::Event::Msg(wavelink_proto::ServerMsg::State { state }) => {
+                *self.last_hosts.borrow_mut() = state.hosts;
+                self.rebuild_hosts();
+            }
+            crate::link::Event::Msg(wavelink_proto::ServerMsg::Delta { changes, .. }) => {
+                for d in &changes {
+                    self.apply_host_delta(d);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn rebuild(self: &Rc<Self>) {
         while let Some(c) = self.content.first_child() {
             self.content.remove(&c);
@@ -2239,6 +2318,13 @@ impl App {
         for i in 0..n_b {
             row2.append(&self.bus_strip(i, &mut css));
         }
+        // host strips (#37) trail the bus strips; re-home the box so the rebuilt row owns it
+        if let Some(parent) = self.hosts_box.parent() {
+            if let Ok(b) = parent.downcast::<gtk::Box>() {
+                b.remove(&self.hosts_box);
+            }
+        }
+        row2.append(&self.hosts_box);
         outs.append(&row2);
         // system gauges under the output strips (one panel, re-homed on every rebuild)
         if let Some(parent) = self.sys_panel.parent() {
@@ -2714,6 +2800,16 @@ pub fn activate(app: &adw::Application) {
     });
     win.set_content(Some(&outer));
 
+    // #37: the window's own loopback link to the engine, so the MacBook strip shows here too
+    let hosts_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let link = match crate::remote::settings::load_or_create(&crate::remote::settings::path()) {
+        Ok(rc) => host_link_addr(&rc).map(|addr| crate::link::connect(addr, rc.token.clone(), false, None, || {})),
+        Err(e) => {
+            eprintln!("remote link: {e}");
+            None
+        }
+    };
+    let has_link = link.is_some();
     let st = Rc::new(App {
         cfg: RefCell::new(Config::load()),
         synced: RefCell::new(Config::default_config()), // set to the loaded config right below (one load, B36-9)
@@ -2726,6 +2822,10 @@ pub fn activate(app: &adw::Application) {
         _player: player.clone(),
         rack_page: rack_page.clone(),
         sys_panel: sys_panel.clone(),
+        link: RefCell::new(link),
+        hosts_box: hosts_box.clone(),
+        last_hosts: RefCell::new(vec![]),
+        host_strips: RefCell::new(vec![]),
         faders: RefCell::new(vec![]),
         bus_guard: RefCell::new(HashMap::new()),
         routes: RefCell::new(vec![]),
@@ -2885,6 +2985,22 @@ pub fn activate(app: &adw::Application) {
         stems_view::step(&st3, dt);
         glib::ControlFlow::Continue
     });
+    if has_link {
+        let w = Rc::downgrade(&st);
+        glib::timeout_add_local(Duration::from_millis(100), move || {
+            let Some(app) = w.upgrade() else { return glib::ControlFlow::Break };
+            let mut evs = Vec::new();
+            if let Some(conn) = app.link.borrow().as_ref() {
+                while let Ok(e) = conn.rx.try_recv() {
+                    evs.push(e);
+                }
+            }
+            for e in evs {
+                app.on_link_event(e);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
     let (st2, ww) = (st.clone(), win.downgrade());
     let mut save_tick = 0u32;
     glib::timeout_add_local(Duration::from_millis(100), move || {
@@ -3047,9 +3163,12 @@ mod serial_tests {
 }
 
 /// The loopback address the window's own link dials: the engine's port on 127.0.0.1, None when remote control is off (#37).
-pub(crate) fn host_link_addr(_rc: &crate::remote::settings::RemoteCfg) -> Option<String> {
-    todo!("U5: host_link_addr")
+pub(crate) fn host_link_addr(rc: &crate::remote::settings::RemoteCfg) -> Option<String> {
+    rc.enabled.then(|| format!("127.0.0.1:{}", rc.port))
 }
+
+/// Send one host command (SetHostVolume / SetHostMute) to the engine over the window's loopback link (#37).
+static HOST_CMD_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[cfg(test)]
 mod host_link_tests {
