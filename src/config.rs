@@ -428,31 +428,61 @@ impl Config {
     /// if the file changed since `base` (what this process last read or wrote), merge field by field
     /// (our edits since `base` win, everything else comes from the file) before writing.
     /// `self` becomes the merged config and `base` the written one. True when the file changed under us.
+    #[allow(dead_code)] // the window uses save_merged_with; kept as the plain API (tests, tools)
     pub fn save_merged(&mut self, base: &mut Config, p: &std::path::Path) -> bool {
+        match self.save_merged_with(base, p, &|_, _, _| {}) {
+            Ok(changed) => changed,
+            Err(e) => {
+                eprintln!("wavelink: {e}");
+                true
+            }
+        }
+    }
+
+    /// `save_merged` with a hook that runs under the lock before the merge: `prefer(base, file, mine)` may
+    /// adjust `mine` (the window lets a remote gain beat an auto-normalize move, B36-8).
+    /// Err = the merge failed: NOTHING is written (never overwrite without merging) and `base` is kept.
+    pub fn save_merged_with(&mut self, base: &mut Config, p: &std::path::Path, prefer: &dyn Fn(&Config, &Config, &mut Config)) -> Result<bool, String> {
         let _lock = lock_config(p);
         let disk = Config::peek(p);
         let mut changed = false;
         if let Some(d) = disk.filter(|d| d != base) {
-            if let Some(m) = merge3(base, self, &d) {
-                *self = m;
+            let mut mine = self.clone();
+            prefer(base, &d, &mut mine);
+            match merge3(base, &mine, &d) {
+                Some(m) => *self = m,
+                None => return Err(format!("{}: merge with the newer file failed; not saving over it", p.display())),
             }
             changed = true;
         }
         if self.save_to(p) {
             *base = self.clone();
         }
-        changed
+        Ok(changed)
     }
 
     /// Pull in edits another writer saved since `base`; our unsaved edits since `base` stay.
     /// Returns the file's config when it differed from `base` (`self` is then merged, `base` = file).
+    #[allow(dead_code)]
     pub fn pull_merged(&mut self, base: &mut Config, p: &std::path::Path) -> Option<Config> {
+        self.pull_merged_with(base, p, &|_, _, _| {})
+    }
+
+    /// `pull_merged` with the same `prefer` hook as `save_merged_with`. A failed merge changes nothing
+    /// (`base` stays, so the next save still merges instead of overwriting) and is logged.
+    pub fn pull_merged_with(&mut self, base: &mut Config, p: &std::path::Path, prefer: &dyn Fn(&Config, &Config, &mut Config)) -> Option<Config> {
         let d = Config::peek(p)?;
         if &d == base {
             return None;
         }
-        if let Some(m) = merge3(base, self, &d) {
-            *self = m;
+        let mut mine = self.clone();
+        prefer(base, &d, &mut mine);
+        match merge3(base, &mine, &d) {
+            Some(m) => *self = m,
+            None => {
+                eprintln!("wavelink: {}: merge with the newer file failed; keeping the window's config", p.display());
+                return None;
+            }
         }
         *base = d.clone();
         Some(d)
@@ -519,6 +549,22 @@ impl Config {
             ],
         }
     }
+}
+
+/// For inputs whose in-memory gain moved only by auto-normalize (`auto`), a gain another writer saved
+/// since `base` wins over the auto move: auto moves are not user edits (B36-8). Returns those input ids.
+pub fn their_gains_win(base: &Config, disk: &Config, mine: &mut Config, auto: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut won = vec![];
+    for i in mine.inputs.iter_mut().filter(|i| auto.contains(&i.id)) {
+        let (b, d) = (base.inputs.iter().find(|x| x.id == i.id), disk.inputs.iter().find(|x| x.id == i.id));
+        if let (Some(b), Some(d)) = (b, d) {
+            if b.gain_db != d.gain_db {
+                i.gain_db = d.gain_db;
+                won.push(i.id.clone());
+            }
+        }
+    }
+    won
 }
 
 /// Exclusive advisory lock on `<config dir>/config.lock` for a read-modify-write of `p`; released on drop.
@@ -816,6 +862,67 @@ mod tests {
         let m = merge3(&base, &mine2, &theirs2).unwrap();
         let ids: Vec<_> = m.inputs.iter().map(|i| i.id.as_str()).collect();
         assert!(ids.contains(&"new") && !ids.contains(&"game"), "{ids:?}");
+    }
+
+    #[test]
+    fn auto_normalize_gain_never_beats_a_remote_gain_on_save() {
+        let dir = std::env::temp_dir().join(format!("wavelink-auto-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("config.json");
+        let mut base = Config::default_config();
+        base.inputs[1].normalize = true;
+        assert!(base.save_to(&p));
+        let mut gui = base.clone();
+        gui.inputs[1].gain_db = -8.0; // auto-normalize moved it
+        gui.inputs[2].gain_db = -5.0; // he moved this one himself
+        gui.inputs[0].eq[2] = 3.0;
+        let mut remote = Config::peek(&p).unwrap();
+        remote.inputs[1].gain_db = -30.0;
+        remote.inputs[2].gain_db = -40.0;
+        assert!(remote.save_to(&p));
+        let auto: std::collections::HashSet<String> = [gui.inputs[1].id.clone()].into();
+        let won = std::cell::RefCell::new(vec![]);
+        let prefer = |b: &Config, d: &Config, m: &mut Config| *won.borrow_mut() = their_gains_win(b, d, m, &auto);
+        assert_eq!(gui.save_merged_with(&mut base, &p, &prefer), Ok(true));
+        let disk = Config::peek(&p).unwrap();
+        assert_eq!(disk.inputs[1].gain_db, -30.0, "the remote's move beats the auto move");
+        assert_eq!(disk.inputs[2].gain_db, -5.0, "his own move still wins");
+        assert_eq!(disk.inputs[0].eq[2], 3.0);
+        assert_eq!(won.borrow().as_slice(), &[gui.inputs[1].id.clone()]);
+        // the pull path applies the same rule
+        let mut remote = disk.clone();
+        remote.inputs[1].gain_db = -33.0;
+        remote.save_to(&p);
+        gui.inputs[1].gain_db = -9.0;
+        assert!(gui.pull_merged_with(&mut base, &p, &prefer).is_some());
+        assert_eq!(gui.inputs[1].gain_db, -33.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_merge_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("wavelink-merge-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("config.json");
+        let mut base = Config::default_config();
+        assert!(base.save_to(&p));
+        let mut other = base.clone();
+        other.buses[0].gain_db = -33.0;
+        other.save_to(&p);
+        let mut gui = base.clone();
+        gui.inputs[0].mute = true;
+        // a merge input that can't round-trip (NaN serialises as null, which an EQ band can't load back)
+        let bad = |_: &Config, _: &Config, m: &mut Config| m.inputs[0].eq = vec![f64::NAN; 12];
+        let before = std::fs::read(&p).unwrap();
+        let r = gui.save_merged_with(&mut base, &p, &bad);
+        assert!(r.is_err(), "{r:?}");
+        assert_eq!(std::fs::read(&p).unwrap(), before, "nothing written");
+        assert_eq!(base, Config::default_config(), "base kept: the next save merges again");
+        let mut g2 = Config::default_config();
+        let mut b2 = Config::default_config();
+        assert!(g2.pull_merged_with(&mut b2, &p, &bad).is_none());
+        assert_eq!(b2, Config::default_config());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

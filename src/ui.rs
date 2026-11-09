@@ -357,6 +357,9 @@ pub struct App {
     synced: RefCell<Config>,
     /// N (auto-normalize) buttons by input id, so a remote toggle shows up here
     norm_btns: RefCell<HashMap<String, gtk::ToggleButton>>,
+    /// inputs whose in-memory gain was last moved by auto-normalize, not by him (B36-8): on a merge, a gain
+    /// another writer saved beats those moves
+    auto_gain: RefCell<std::collections::HashSet<String>>,
     graph: RefCell<Graph>,
     dirty: Cell<bool>,
     content: gtk::Box,
@@ -876,6 +879,7 @@ impl App {
     fn fader_manual(&self, node: &str, db: f64) {
         let id = self.cfg.borrow().inputs.iter().find(|i| names::strip_in(&i.id) == node).map(|i| i.id.clone());
         if let Some(id) = id {
+            self.auto_gain.borrow_mut().remove(&id);
             let hit = self.norm.borrow_mut().get_mut(&id).map(|c| c.manual(db)).is_some();
             if hit {
                 self.norm_store(&id);
@@ -1061,45 +1065,52 @@ impl App {
     }
 
     /// Save without clobbering newer on-disk edits (the engine's remote server writes config.json too, #26):
-    /// fields this window changed since it last synced win, everything else comes from the file.
+    /// fields this window changed since it last synced win, everything else comes from the file; except
+    /// that auto-normalize gain moves are not his edits, so a remote gain beats them (B36-8). A failed
+    /// merge writes nothing.
     fn save_cfg(self: &Rc<Self>) {
         let before = self.cfg.borrow().clone();
-        let merged = {
+        let auto = self.auto_gain.borrow().clone();
+        let won = RefCell::new(vec![]);
+        let prefer = |b: &Config, d: &Config, m: &mut Config| *won.borrow_mut() = config::their_gains_win(b, d, m, &auto);
+        let r = {
             let (mut c, mut b) = (self.cfg.borrow_mut(), self.synced.borrow_mut());
-            c.save_merged(&mut b, &Config::path())
+            c.save_merged_with(&mut b, &Config::path(), &prefer)
         };
-        if merged {
-            self.apply_external(&before, None);
+        match r {
+            Ok(true) => self.apply_external(&before, &won.into_inner()),
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("wavelink: {e}");
+                self.dirty.set(true); // retry on a later tick, merging again
+            }
         }
     }
 
-    /// Pick up edits another writer saved since this window last synced; this window's unsaved edits stay.
+    /// Pick up edits another writer saved since this window last synced; this window's unsaved edits
+    /// stay (auto-normalize moves excepted, as in save_cfg).
     fn pull_cfg(self: &Rc<Self>) {
-        let (before, base) = (self.cfg.borrow().clone(), self.synced.borrow().clone());
+        let before = self.cfg.borrow().clone();
+        let auto = self.auto_gain.borrow().clone();
+        let won = RefCell::new(vec![]);
+        let prefer = |b: &Config, d: &Config, m: &mut Config| *won.borrow_mut() = config::their_gains_win(b, d, m, &auto);
         let disk = {
             let (mut c, mut b) = (self.cfg.borrow_mut(), self.synced.borrow_mut());
-            c.pull_merged(&mut b, &Config::path())
+            c.pull_merged_with(&mut b, &Config::path(), &prefer)
         };
-        if let Some(d) = disk {
-            self.apply_external(&before, Some((&base, &d)));
+        if disk.is_some() {
+            self.apply_external(&before, &won.into_inner());
         }
     }
 
-    /// Show what changed in `self.cfg` relative to `before` after a merge. Faders, mutes and send switches
-    /// already follow the live graph (the engine applied the change there); this updates the rest. Anything
-    /// beyond levels (EQ, rack, names, colours, channels) rebuilds the window.
-    /// `remote` = (old sync base, file): a gain the other writer changed wins over an unsaved auto-normalize move.
-    fn apply_external(self: &Rc<Self>, before: &Config, remote: Option<(&Config, &Config)>) {
-        if let Some((base, disk)) = remote {
-            let mut c = self.cfg.borrow_mut();
-            for i in c.inputs.iter_mut() {
-                let (b, d) = (base.inputs.iter().find(|x| x.id == i.id), disk.inputs.iter().find(|x| x.id == i.id));
-                if let (Some(b), Some(d)) = (b, d) {
-                    if b.gain_db != d.gain_db {
-                        i.gain_db = d.gain_db;
-                    }
-                }
-            }
+    /// Show what changed in `self.cfg` relative to `before` after a merge. Levels update in place (input
+    /// gains are pushed to their strips again, bus faders show the new saved gain and #35's tracker is told
+    /// it was just written, so it never pushes the old value back); anything beyond levels (EQ, rack,
+    /// names, colours, channels) rebuilds the window. `won` = inputs where another writer's gain beat
+    /// an auto-normalize move.
+    fn apply_external(self: &Rc<Self>, before: &Config, won: &[String]) {
+        for id in won {
+            self.auto_gain.borrow_mut().remove(id);
         }
         let now = self.cfg.borrow().clone();
         if now == *before {
@@ -1121,17 +1132,21 @@ impl App {
             if m.id == b.id {
                 m.gain_db = b.gain_db;
                 m.mute = b.mute;
+                m.max_db = b.max_db;
             }
         }
-        if masked != *before {
+        if masked != *before || now.inputs.len() != before.inputs.len() || now.buses.len() != before.buses.len() {
             let app = self.clone();
             glib::timeout_add_local_once(Duration::from_millis(50), move || app.rebuild());
             return;
         }
         for (n, b) in now.inputs.iter().zip(&before.inputs) {
             if n.gain_db != b.gain_db {
-                // a remote fader move is his move for auto-normalize too
+                // a remote fader move is his move for auto-normalize too; and it is what the strip plays
                 self.fader_manual(&names::strip_in(&n.id), n.gain_db);
+                if let Some(id) = self.node_id(&names::strip_in(&n.id)) {
+                    pw::set_volume(id, db_to_vol(n.gain_db));
+                }
             } else if n.norm_out != b.norm_out {
                 if let (Some(o), Some(c)) = (n.norm_out, self.norm.borrow_mut().get_mut(&n.id)) {
                     c.out = o;
@@ -1149,6 +1164,24 @@ impl App {
                     if let Some(k) = self.send_knobs.borrow().get(&(n.id.clone(), bus.clone())) {
                         k.set_value(db_to_pos(r.level_db));
                     }
+                }
+            }
+        }
+        // bus faders show the config (#35): refresh the ones that changed and tell the tracker the new
+        // saved gain is what the device was just given (the writer applied it), so drift right after is
+        // re-applied as the NEW value and the old one is never pushed back
+        let t = glib::monotonic_time() as f64 / 1e6;
+        for (n, b) in now.buses.iter().zip(&before.buses) {
+            if n.gain_db == b.gain_db && n.mute == b.mute && n.max_db == b.max_db {
+                continue;
+            }
+            if let Some(tr) = self.bus_guard.borrow_mut().get_mut(&n.id) {
+                tr.wrote(t);
+            }
+            for f in self.faders.borrow().iter() {
+                if f.bus.borrow().as_deref() == Some(n.id.as_str()) {
+                    f.max_db.set(n.ceiling_db());
+                    f.show(n.effective_db(), n.mute);
                 }
             }
         }
@@ -1326,6 +1359,9 @@ impl App {
             if f.auto.get() {
                 // auto moves are not his: saved at most once a minute (W8)
                 app.norm_moved.set(true);
+                if let Some(i) = app.cfg.borrow().inputs.iter().find(|i| names::strip_in(&i.id) == node) {
+                    app.auto_gain.borrow_mut().insert(i.id.clone());
+                }
             } else {
                 app.mark_dirty();
                 app.fader_manual(&node, db);
@@ -2640,8 +2676,9 @@ pub fn activate(app: &adw::Application) {
 
     let st = Rc::new(App {
         cfg: RefCell::new(Config::load()),
-        synced: RefCell::new(Config::load()),
+        synced: RefCell::new(Config::default_config()), // set to the loaded config right below (one load, B36-9)
         norm_btns: RefCell::new(HashMap::new()),
+        auto_gain: RefCell::new(Default::default()),
         graph: RefCell::new(Graph::read().unwrap_or_default()),
         dirty: Cell::new(false),
         content,
@@ -2680,6 +2717,7 @@ pub fn activate(app: &adw::Application) {
         css: dynamic,
         stems: stems_view::State::new(),
     });
+    *st.synced.borrow_mut() = st.cfg.borrow().clone();
     stems_view::wire(&st, stems_v.clone());
 
     let add_in = gtk::MenuButton::builder().label("+ Input").popover(&st.add_input_popover()).build();
@@ -2845,6 +2883,8 @@ pub fn activate(app: &adw::Application) {
         // stems housekeeping runs here, not in the frame tick: the tick stops while the display sleeps
         let mut remute = false;
         if let Some(g) = rx.try_iter().last() {
+            // fresh config first: #35's bus tracker must never re-apply a gain the remote just replaced
+            st2.pull_cfg();
             st2.sync(&g);
             *st2.graph.borrow_mut() = g;
             remute = true;
