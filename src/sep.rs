@@ -11,6 +11,19 @@ fn e2s<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
+/// Bench only (issue #20): with `--features cuda`, CUDA EP on device 0, error_on_failure so a bad GPU can't fall back to CPU.
+#[cfg(feature = "cuda")]
+fn with_gpu(b: ort::session::builder::SessionBuilder) -> Result<ort::session::builder::SessionBuilder, String> {
+    use ort::execution_providers::{CUDAExecutionProvider, ExecutionProviderDispatch};
+    let ep: ExecutionProviderDispatch = CUDAExecutionProvider::default().with_device_id(0).build().error_on_failure();
+    b.with_execution_providers([ep]).map_err(e2s)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn with_gpu(b: ort::session::builder::SessionBuilder) -> Result<ort::session::builder::SessionBuilder, String> {
+    Ok(b)
+}
+
 /// Deterministic uniform [0, 1) from an LCG (no `rand` crate).
 fn noise_lcg(s: &mut u64) -> f32 {
     *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -71,7 +84,7 @@ pub struct Streamer {
 impl Streamer {
     /// Intra threads 1; parallel: parallel execution with 3 inter threads, else 1 inter thread. File S_FILES[0].
     pub fn load(m: &ModelSet, parallel: bool) -> Result<Streamer, String> {
-        let b = Session::builder().map_err(e2s)?.with_intra_threads(1).map_err(e2s)?;
+        let b = with_gpu(Session::builder().map_err(e2s)?)?.with_intra_threads(1).map_err(e2s)?;
         let b = if parallel {
             b.with_parallel_execution(true).map_err(e2s)?.with_inter_threads(3).map_err(e2s)?
         } else {
@@ -161,8 +174,7 @@ impl Separator {
     pub fn load(m: &ModelSet) -> Result<Separator, String> {
         let mut sessions = Vec::with_capacity(4);
         for name in &U_FILES[0..4] {
-            let s = Session::builder()
-                .map_err(e2s)?
+            let s = with_gpu(Session::builder().map_err(e2s)?)?
                 .with_intra_threads(2)
                 .map_err(e2s)?
                 .commit_from_file(m.path(name))
@@ -235,7 +247,7 @@ pub struct Transcriber {
 impl Transcriber {
     /// File "basic-pitch-nmp.onnx".
     pub fn load(m: &ModelSet) -> Result<Transcriber, String> {
-        let session = Session::builder().map_err(e2s)?.commit_from_file(m.path("basic-pitch-nmp.onnx")).map_err(e2s)?;
+        let session = with_gpu(Session::builder().map_err(e2s)?)?.commit_from_file(m.path("basic-pitch-nmp.onnx")).map_err(e2s)?;
         Ok(Transcriber { session })
     }
 

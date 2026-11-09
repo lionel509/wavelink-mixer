@@ -25,6 +25,8 @@ mod ui;
 #[cfg(test)]
 #[path = "breaker_front.rs"]
 mod breaker_front;
+#[cfg(test)]
+mod bench20;
 
 use adw::prelude::*;
 use gtk::glib;
