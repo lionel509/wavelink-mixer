@@ -104,9 +104,14 @@ pub struct Bus {
     /// Where the bus plays. Usually one entry today; a list so a bus can later feed several speakers.
     #[serde(default)]
     pub outputs: Vec<Output>,
-    /// Safety cap: the server refuses to raise the gain above this without `unlock`.
+    /// Soft safety cap: the server refuses to raise the gain above this unless this connection holds
+    /// an unlock for the bus (`ClientMsg::Unlock`, 60 s). Never above `ceiling_db`.
     #[serde(default)]
     pub max_db: Option<f64>,
+    /// Hard ceiling (the mixer's own per-bus `max_db`, e.g. -20 dB for an AirPlay speaker): no writer,
+    /// unlocked or not, ever sets the bus louder. None = the fader's top (MAX_DB).
+    #[serde(default)]
+    pub ceiling_db: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,7 +179,7 @@ impl State {
     /// Same channels and buses (ids, names, colours, kinds, caps, outputs, zones): only levels differ.
     pub fn same_structure(&self, o: &State) -> bool {
         let ins = |s: &State| s.inputs.iter().map(|i| (i.id.clone(), i.name.clone(), i.color.clone(), i.source.clone())).collect::<Vec<_>>();
-        let bus = |s: &State| s.buses.iter().map(|b| (b.id.clone(), b.name.clone(), b.color.clone(), b.kind, b.outputs.clone(), b.max_db)).collect::<Vec<_>>();
+        let bus = |s: &State| s.buses.iter().map(|b| (b.id.clone(), b.name.clone(), b.color.clone(), b.kind, b.outputs.clone(), b.max_db, b.ceiling_db)).collect::<Vec<_>>();
         ins(self) == ins(o) && bus(self) == bus(o) && self.zones == o.zones && self.server == o.server
     }
 
@@ -262,7 +267,8 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_db: Option<f64>,
     },
-    /// `unlock` lifts the bus's `max_db` cap for this command (the per-command step limit still applies).
+    /// `unlock` is IGNORED by the server (a per-command flag any client could set; breaker #36 B36-1).
+    /// Unlocking is per connection and time-limited: send `ClientMsg::Unlock`. Kept for wire compatibility.
     SetBusGain {
         bus: String,
         db: f64,
@@ -309,6 +315,9 @@ pub enum ClientMsg {
     Command { id: u64, cmd: Command },
     Subscribe { meters: bool },
     Ping { t: u64 },
+    /// Lift (`on`) or restore a bus's soft cap for THIS connection only. The server expires it after
+    /// `safety::UNLOCK_S` seconds and on disconnect, and logs it. The hard ceiling always stays.
+    Unlock { bus: String, on: bool },
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -344,6 +353,8 @@ pub enum ServerMsg {
     },
     Meters { meters: Meters },
     Pong { t: u64 },
+    /// This connection's unlock state for a bus changed: `seconds` left (0 = locked again).
+    Unlock { bus: String, seconds: u32 },
 }
 
 impl ClientMsg {
@@ -372,8 +383,38 @@ pub mod safety {
 
     /// A physical bus's gain may rise at most this much per command. Lowering is never limited.
     pub const MAX_STEP_DB: f64 = 6.0;
-    /// Default cap for network speakers (Sonos/AirPlay: their sink volume IS the speaker volume).
+    /// ... and at most this much within any RAISE_WINDOW_S seconds, across all commands and clients
+    /// (enforced by the server, which owns the clock; see `RaiseLimiter`).
+    pub const MAX_RAISE_PER_WINDOW_DB: f64 = 12.0;
+    pub const RAISE_WINDOW_S: f64 = 1.0;
+    /// Default soft cap for network speakers (Sonos/AirPlay: their sink volume IS the speaker volume).
     pub const SPEAKER_CAP_DB: f64 = -20.0;
+    /// How long a `ClientMsg::Unlock` lasts.
+    pub const UNLOCK_S: u64 = 60;
+
+    /// Time-based raise limit for one physical bus: the gain may never be more than
+    /// MAX_RAISE_PER_WINDOW_DB above the lowest level it had within the last RAISE_WINDOW_S seconds.
+    /// Decreases are never limited. Time is passed in (seconds, monotonic) so it can be tested.
+    #[derive(Debug, Clone, Default)]
+    pub struct RaiseLimiter {
+        /// (time, level before, level after) of recent changes
+        hist: Vec<(f64, f64, f64)>,
+    }
+
+    impl RaiseLimiter {
+        /// Highest gain allowed now for a bus currently at `cur`.
+        pub fn allowed(&mut self, now: f64, cur: f64) -> f64 {
+            self.hist.retain(|(t, _, _)| now - t < RAISE_WINDOW_S);
+            let floor = self.hist.iter().flat_map(|(_, a, b)| [*a, *b]).fold(cur, f64::min);
+            floor + MAX_RAISE_PER_WINDOW_DB
+        }
+        /// Record a change that was applied.
+        pub fn record(&mut self, now: f64, before: f64, after: f64) {
+            if before != after {
+                self.hist.push((now, before, after));
+            }
+        }
+    }
 
     #[derive(Debug, Clone, PartialEq)]
     pub enum Reject {
@@ -415,10 +456,14 @@ pub mod safety {
 
     /// Validate `cmd` against `state` and clamp it to the safety rules:
     /// - every dB value must be finite; faders clamp to MIN_DB..=MAX_DB, normalize targets to their range;
-    /// - a bus with `max_db` is never raised above it unless the command sets `unlock`;
-    /// - a physical bus rises at most MAX_STEP_DB per command (from its current gain);
-    /// - unmuting a capped bus whose gain is above its cap also brings the gain down to the cap.
-    pub fn check(cmd: &Command, state: &State) -> Result<Checked, Reject> {
+    /// - a bus is never set above its hard `ceiling_db`, by anyone;
+    /// - a bus with `max_db` is never raised above it unless `unlocked(bus)` (the server's per-connection,
+    ///   time-limited unlock; the command's own `unlock` field is ignored);
+    /// - a physical bus rises at most MAX_STEP_DB per command (from its current gain); the server adds
+    ///   the time-based `RaiseLimiter` on top;
+    /// - unmuting a capped bus whose gain is above its (effective) cap also brings the gain down to it.
+    /// Emitted commands always carry `unlock: false`.
+    pub fn check(cmd: &Command, state: &State, unlocked: &dyn Fn(&str) -> bool) -> Result<Checked, Reject> {
         let input = |id: &str| state.input(id).ok_or_else(|| Reject::UnknownInput(id.into()));
         let bus = |id: &str| state.bus(id).ok_or_else(|| Reject::UnknownBus(id.into()));
         let mut note = None;
@@ -454,7 +499,7 @@ pub mod safety {
                 };
                 vec![Command::SetNormalize { input: i.clone(), on: *on, target_db }]
             }
-            Command::SetBusGain { bus: b, db, unlock } => {
+            Command::SetBusGain { bus: b, db, .. } => {
                 let bs = bus(b)?;
                 let want = fader(finite(*db)?);
                 let mut got = want;
@@ -462,18 +507,29 @@ pub mod safety {
                     got = (bs.gain_db + MAX_STEP_DB).min(MAX_DB);
                     note = Some(format!("raised at most {MAX_STEP_DB} dB per step"));
                 }
-                if let (Some(cap), false) = (bs.max_db, *unlock) {
+                if let Some(cap) = bs.max_db.filter(|_| !unlocked(b)) {
                     if got > cap {
                         got = cap;
-                        note = Some(format!("capped at {cap} dB (send unlock to go higher)"));
+                        note = Some(format!("capped at {cap} dB (unlock the bus to go higher)"));
                     }
                 }
-                vec![Command::SetBusGain { bus: b.clone(), db: got, unlock: *unlock }]
+                if let Some(ceil) = bs.ceiling_db {
+                    if got > ceil {
+                        got = ceil;
+                        note = Some(format!("at the bus ceiling {ceil} dB (never louder)"));
+                    }
+                }
+                vec![Command::SetBusGain { bus: b.clone(), db: got, unlock: false }]
             }
             Command::SetBusMute { bus: b, mute } => {
                 let bs = bus(b)?;
                 let mut v = vec![];
-                if let Some(cap) = bs.max_db {
+                let soft = bs.max_db.filter(|_| !unlocked(b));
+                let cap = match (soft, bs.ceiling_db) {
+                    (Some(a), Some(c)) => Some(a.min(c)),
+                    (a, c) => a.or(c),
+                };
+                if let Some(cap) = cap {
                     if !*mute && bs.mute && bs.gain_db > cap {
                         v.push(Command::SetBusGain { bus: b.clone(), db: cap, unlock: false });
                         note = Some(format!("gain brought down to the {cap} dB cap before unmuting"));

@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
-use wavelink_proto::safety::{check, Reject, MAX_STEP_DB};
+use wavelink_proto::safety::{Reject, RaiseLimiter, MAX_RAISE_PER_WINDOW_DB, MAX_STEP_DB, RAISE_WINDOW_S};
 use wavelink_proto::*;
+
+fn check(c: &Command, s: &State) -> Result<wavelink_proto::safety::Checked, Reject> {
+    wavelink_proto::safety::check(c, s, &|_| false)
+}
 
 fn state() -> State {
     let mut routes = BTreeMap::new();
@@ -42,6 +46,7 @@ fn state() -> State {
                 mute: false,
                 outputs: vec![Output { node: "alsa_output.x".into(), label: "Scarlett".into(), host: None }],
                 max_db: None,
+                ceiling_db: None,
             },
             Bus {
                 id: "a3".into(),
@@ -52,6 +57,7 @@ fn state() -> State {
                 mute: false,
                 outputs: vec![Output { node: "raop_sonos".into(), label: "Sonos".into(), host: None }],
                 max_db: Some(-20.0),
+                ceiling_db: Some(-10.0),
             },
             Bus {
                 id: "b1".into(),
@@ -62,6 +68,7 @@ fn state() -> State {
                 mute: false,
                 outputs: vec![],
                 max_db: None,
+                ceiling_db: None,
             },
         ],
         zones: vec![],
@@ -194,8 +201,10 @@ fn check_rejects_unknown_and_nan() {
     assert_eq!(check(&Command::SetNormalize { input: "mic".into(), on: None, target_db: None }, &s), Err(Reject::Empty));
 }
 
+/// `unlock` = this connection holds an unlock for the bus (the command's own flag is ignored).
 fn bus_gain(s: &State, bus: &str, db: f64, unlock: bool) -> f64 {
-    let c = check(&Command::SetBusGain { bus: bus.into(), db, unlock }, s).unwrap();
+    let b = bus.to_string();
+    let c = wavelink_proto::safety::check(&Command::SetBusGain { bus: bus.into(), db, unlock: true }, s, &move |x| unlock && x == b).unwrap();
     match c.cmds.as_slice() {
         [Command::SetBusGain { db, .. }] => *db,
         x => panic!("{x:?}"),
@@ -223,7 +232,7 @@ fn physical_bus_rises_at_most_one_step() {
     assert_eq!(bus_gain(&s, "a1", -7.0, false), -7.0);
     // lowering is never limited
     assert_eq!(bus_gain(&s, "a1", -60.0, false), -60.0);
-    let c = check(&Command::SetBusGain { bus: "a1".into(), db: 12.0, unlock: true }, &s).unwrap();
+    let c = wavelink_proto::safety::check(&Command::SetBusGain { bus: "a1".into(), db: 12.0, unlock: true }, &s, &|_| true).unwrap();
     assert!(c.note.unwrap().contains("per step"));
 }
 
@@ -235,11 +244,17 @@ fn speaker_cap_needs_unlock() {
     assert_eq!(bus_gain(&s, "a3", 0.0, false), -24.0);
     s.buses[1].gain_db = -22.0;
     assert_eq!(bus_gain(&s, "a3", 0.0, false), -20.0);
-    let c = check(&Command::SetBusGain { bus: "a3".into(), db: -10.0, unlock: false }, &s).unwrap();
+    // the command's own unlock flag is ignored: still capped
+    let c = check(&Command::SetBusGain { bus: "a3".into(), db: -10.0, unlock: true }, &s).unwrap();
     assert!(c.note.unwrap().contains("capped at -20"));
-    // unlock lifts the cap, the step still applies
+    assert_eq!(c.cmds, vec![Command::SetBusGain { bus: "a3".into(), db: -20.0, unlock: false }]);
+    // a server-side unlock lifts the soft cap, the step still applies
     assert_eq!(bus_gain(&s, "a3", 0.0, true), -16.0);
     assert_eq!(bus_gain(&s, "a3", -18.0, true), -18.0);
+    // ... but never past the hard ceiling (-10 here)
+    s.buses[1].gain_db = -14.0;
+    assert_eq!(bus_gain(&s, "a3", 0.0, true), -10.0);
+    s.buses[1].gain_db = -22.0;
     // already above the cap (set locally): any locked command brings it to the cap or lower
     s.buses[1].gain_db = -5.0;
     assert_eq!(bus_gain(&s, "a3", -8.0, false), -20.0);
@@ -256,8 +271,42 @@ fn unmuting_a_loud_capped_bus_lowers_it_first() {
         c.cmds,
         vec![Command::SetBusGain { bus: "a3".into(), db: -20.0, unlock: false }, Command::SetBusMute { bus: "a3".into(), mute: false }]
     );
+    // unlocked: the soft cap no longer applies, the hard ceiling (-10) still does
+    let c = wavelink_proto::safety::check(&Command::SetBusMute { bus: "a3".into(), mute: false }, &s, &|_| true).unwrap();
+    assert_eq!(c.cmds[0], Command::SetBusGain { bus: "a3".into(), db: -10.0, unlock: false });
     // under the cap: plain unmute
     s.buses[1].gain_db = -30.0;
     let c = check(&Command::SetBusMute { bus: "a3".into(), mute: false }, &s).unwrap();
     assert_eq!(c.cmds, vec![Command::SetBusMute { bus: "a3".into(), mute: false }]);
+}
+
+#[test]
+fn ceiling_applies_without_any_soft_cap() {
+    let mut s = state();
+    s.buses[0].ceiling_db = Some(-8.0); // a1 at -10, no soft cap
+    assert_eq!(bus_gain(&s, "a1", 12.0, true), -8.0);
+    s.buses[2].ceiling_db = Some(-3.0); // virtual b1
+    assert_eq!(bus_gain(&s, "b1", 12.0, false), -3.0);
+}
+
+#[test]
+fn raise_limiter_is_time_based() {
+    let mut l = RaiseLimiter::default();
+    // from -60: the first second allows up to -48 in total, however many commands
+    assert_eq!(l.allowed(0.0, -60.0), -60.0 + MAX_RAISE_PER_WINDOW_DB);
+    l.record(0.0, -60.0, -54.0);
+    l.record(0.01, -54.0, -48.0);
+    assert_eq!(l.allowed(0.02, -48.0), -48.0, "budget spent within the window");
+    // decreases are never refused, and the lowest level in the window sets the floor
+    l.record(0.03, -48.0, -58.0);
+    assert_eq!(l.allowed(0.04, -58.0), -48.0);
+    // once the window has passed, the floor is the current level again
+    assert_eq!(l.allowed(0.04 + RAISE_WINDOW_S, -58.0), -58.0 + MAX_RAISE_PER_WINDOW_DB);
+    assert!(MAX_STEP_DB <= MAX_RAISE_PER_WINDOW_DB);
+}
+
+#[test]
+fn unlock_messages_round_trip() {
+    rt_client(ClientMsg::Unlock { bus: "a3".into(), on: true });
+    rt_server(ServerMsg::Unlock { bus: "a3".into(), seconds: 60 });
 }
