@@ -23,7 +23,6 @@ pub(super) struct State {
     pub(super) replaced: RefCell<Option<String>>,
     session: RefCell<Option<Session>>,
     view: RefCell<Option<Rc<View>>>,
-    replaced_node: Cell<Option<u64>>,
     acc: Cell<f64>,
     srcs: RefCell<Vec<(String, String)>>,
 }
@@ -35,7 +34,6 @@ impl State {
             replaced: RefCell::new(None),
             session: RefCell::new(None),
             view: RefCell::new(None),
-            replaced_node: Cell::new(None),
             acc: Cell::new(0.0),
             srcs: RefCell::new(Vec::new()),
         }
@@ -267,14 +265,14 @@ pub(super) fn step(app: &Rc<App>, dt: f64) {
         let keep = source_id(app, &v).unwrap_or_default();
         fill_sources(app, &v, list, &keep);
     }
-    // an engine graph restart re-applies cfg.mute, un-muting the replaced source: mute it again
+    // the engine's level re-apply, a bus re-spawn or the strip's own mute control can un-mute the
+    // replaced source (same node id): check its actual mute state every second and mute it again
     let rep = app.stems.replaced.borrow().clone();
-    if let Some(id) = rep {
-        let node = app.node_id(&names::strip_in(&id));
-        if node != app.stems.replaced_node.get() {
-            app.apply_solo();
-            app.stems.replaced_node.set(node);
-        }
+    let node = rep.as_ref().and_then(|id| {
+        app.graph.borrow().node(&names::strip_in(id)).map(|n| (n.id, n.mute))
+    });
+    if let Some(id) = stemcfg::remute_target(rep.is_some(), node, None) {
+        crate::pw::set_mute(id, true);
     }
 }
 
@@ -452,7 +450,6 @@ fn start(app: &Rc<App>, replace: bool) {
 /// Drops the session, and if the source was muted live, unmutes it. Touches no widgets.
 fn stop(app: &App) {
     *app.stems.session.borrow_mut() = None;
-    app.stems.replaced_node.set(None);
     let was = app.stems.replaced.borrow_mut().take();
     if was.is_some() {
         set_marker(None);

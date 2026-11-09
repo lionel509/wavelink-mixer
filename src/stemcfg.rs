@@ -153,10 +153,11 @@ pub fn effective_mute(cfg_mute: bool, id: &str, solo: &HashSet<String>, replaced
 }
 
 /// Which node `step` must mute again, if any. `node` is the replaced source's strip node (id, muted).
-/// Current rule (to be replaced): fire only when the node id differs from the last one seen.
-pub fn remute_target(replaced: bool, node: Option<(u64, bool)>, last: Option<u64>) -> Option<u64> {
+/// By state, not by node id: the engine's level re-apply, a bus re-spawn or the strip's own mute
+/// control all un-mute the same node id. `last` is the id muted on the previous check, kept for callers.
+pub fn remute_target(replaced: bool, node: Option<(u64, bool)>, _last: Option<u64>) -> Option<u64> {
     match node {
-        Some((id, _)) if replaced && Some(id) != last => Some(id),
+        Some((id, false)) if replaced => Some(id),
         _ => None,
     }
 }
@@ -346,5 +347,15 @@ mod tests {
     fn remute_fires_when_same_node_is_unmuted() {
         // the engine re-applies cfg.mute=false onto the same node id: must be muted again
         assert_eq!(remute_target(true, Some((42, false)), Some(42)), Some(42));
+    }
+
+    #[test]
+    fn remute_cases() {
+        assert_eq!(remute_target(true, Some((7, false)), None), Some(7)); // new node, unmuted
+        assert_eq!(remute_target(true, Some((7, false)), Some(7)), Some(7)); // same node, unmuted
+        assert_eq!(remute_target(true, Some((7, true)), Some(7)), None); // already muted
+        assert_eq!(remute_target(true, Some((7, true)), None), None);
+        assert_eq!(remute_target(true, None, Some(7)), None); // no node
+        assert_eq!(remute_target(false, Some((7, false)), None), None); // not replaced
     }
 }
