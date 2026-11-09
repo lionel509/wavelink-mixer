@@ -2269,8 +2269,9 @@ pub fn activate(app: &adw::Application) {
         let c = |i: usize| crate::dash::hex_rgb(piano_view::LANE_COLORS[i]);
         scope.set_zones(vec![(0.0, "BASS".into(), c(0)), (250.0, "MID".into(), c(1)), (4000.0, "HIGH".into(), c(2))]);
         spectrum.set_zones(vec![(0.0, "BASS".into(), c(0)), (250.0, "MID".into(), c(1)), (4000.0, "HIGH".into(), c(2))]);
-        spectrum.area.set_content_height(240);
-        scope.area.set_content_height(320);
+        spectrum.area.set_content_height(200);
+        scope.area.set_content_height(180);
+        scope.area.set_vexpand(true);
     }
     let spec_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
     spec_box.set_margin_start(12);
@@ -2297,6 +2298,8 @@ pub fn activate(app: &adw::Application) {
     let stack = gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).build();
     let spec_panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
     spec_panel.add_css_class("spectrum");
+    let piano_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    spec_panel.append(&piano_slot);
     spec_panel.append(&spectrum.area);
     spec_panel.append(&scope.area);
     let patch_panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -2306,7 +2309,8 @@ pub fn activate(app: &adw::Application) {
     // engine shows the #16 Stems panel
     let stems_v = stems_view::View::new();
     let piano_v = piano_view::View::new(&stems_v.root);
-    spec_panel.append(&piano_v.root);
+    // controls on top of the page, above the analyser (no roll: the super graph shows the notes)
+    piano_slot.append(&piano_v.root);
     // the analyser plus the Piano section is taller than the bottom pane often is (S1): it scrolls
     // it must not ask for more height than the pane has (at 1080p it ran 38 px past the window)
     let spec_scroll = gtk::ScrolledWindow::builder()

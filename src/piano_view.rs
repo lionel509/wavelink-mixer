@@ -172,24 +172,16 @@ impl View {
         dsp.append(&row);
         let roll: gtk::DrawingArea = glib::Object::builder().property("accessible-role", gtk::AccessibleRole::Img).build();
         name_it(&roll, "Piano roll");
+        // the roll is no longer shown: the Spectrum page's super graph draws the notes (#23 UI)
         roll.set_content_height(110);
-        roll.set_hexpand(true);
-        roll.set_vexpand(true);
-        dsp.append(&roll);
-        let lanes = gtk::Box::new(Orientation::Horizontal, 12);
-        for (i, l) in ["Bass &lt; C3 · ch 1", "Mid C3–C5 · ch 2", "High &gt; C5 · ch 3"].iter().enumerate() {
-            let lb = gtk::Label::new(None);
-            lb.set_markup(&format!("<span foreground=\"{}\">■</span> {l}", LANE_COLORS[i]));
-            lb.add_css_class("small");
-            lanes.append(&lb);
-        }
-        dsp.append(&lanes);
         stack.add_named(&dsp, Some("dsp"));
         stack.add_named(stems, Some("neural"));
 
-        let root = gtk::Box::new(Orientation::Vertical, 4);
-        root.set_margin_top(6);
+        // one compact control row at the top of the Spectrum page
+        let root = gtk::Box::new(Orientation::Horizontal, 8);
+        root.set_margin_bottom(6);
         root.append(&head);
+        stack.set_hexpand(true);
         root.append(&stack);
         Rc::new(View { root, engine, stack, source, on, port, split, save, clear, status, readout, roll, quiet: Cell::new(false) })
     }
