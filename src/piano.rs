@@ -1252,3 +1252,7 @@ pub fn note_f1(est: &[Note], gt: &[Note], tol: f64) -> (f64, f64, f64) {
 #[cfg(test)]
 #[path = "piano_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "piano_breaker_tests.rs"]
+mod breaker_tests;

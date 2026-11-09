@@ -682,3 +682,7 @@ mod tests {
         assert!(!after.contains(CLIENT_NAME), "client {addr} still listed after drop");
     }
 }
+
+#[cfg(test)]
+#[path = "piano_live_breaker_tests.rs"]
+mod breaker_tests;
