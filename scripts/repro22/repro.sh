@@ -40,7 +40,8 @@ sleep 1
 ( eval "$LIM"; HOME=$D/home exec wireplumber >"$D/wp.log" 2>&1 ) & PIDS+=($!)
 sleep 3
 case $(pw-cli info 0 2>&1) in *"Core/4"*) ;; *) echo "private pipewire not up"; exit 1;; esac
-if pw-cli ls Node 2>/dev/null | grep -q 'api.alsa\|alsa_'; then echo "ABORT: a real ALSA node is visible in the private daemon"; exit 1; fi
+. "$HERE/guard.sh"
+if hw_visible; then echo "ABORT: a real hardware (alsa/bluez/v4l2/raop) node is visible in the private daemon"; exit 1; fi
 # stand-in outputs (names are made up; the monitors above are off so nothing real can match)
 for n in test_hw_a1 test_hw_a2 test_hw_a3; do
   pw-cli create-node adapter "{ factory.name=support.null-audio-sink node.name=$n media.class=Audio/Sink object.linger=true audio.position=[FL,FR] }" >/dev/null
@@ -78,4 +79,5 @@ for sz in "${SIZES[@]}"; do
   ERRS=$(( $(tail -n +$((PWLINES+1)) "$D/pw.log" | grep -c 'Too many open files\|Buffer allocation failed') + $(grep -c 'Too many open files\|Buffer allocation failed' "$E" || true) ))
   echo "$NIN x $NBUS | $(grep -c 'restarting graph' "$E" || true) restarts in ${SECS}s | $ERRS | $maxchild | $(grep -c '^degraded' "$E" || true)"
   kill_tree $EP; wait $EP 2>/dev/null || true; sleep 1
+  unset "PIDS[$(( ${#PIDS[@]} - 1 ))]"  # reaped: never signal this PID again
 done

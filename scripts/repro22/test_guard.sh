@@ -11,6 +11,7 @@ for i in $(seq 1 20000); do echo "		node.name = \"n$i\""; done
 F
 chmod +x "$T/pw-cli"
 export PATH=$T:$PATH
-# exact guard line from repro.sh
-if pw-cli ls Node 2>/dev/null | grep -q 'api.alsa\|alsa_'; then echo "guard OK: caught"; exit 0; fi
+# the real guard, shared with repro.sh
+. "$(dirname "$(readlink -f "$0")")/guard.sh"
+if hw_visible; then echo "guard OK: caught"; exit 0; fi
 echo "guard FAILED OPEN: ALSA node visible but not detected"; exit 1

@@ -34,8 +34,9 @@ pub const MIN_CHILD_AGE: Duration = Duration::from_secs(5);
 pub const ZERO_NODES_AFTER: Duration = Duration::from_secs(10);
 /// Failed restarts that leave the same set missing before the engine stops tearing the graph down.
 pub const SAME_SET_RESTARTS: u32 = 3;
-/// Failed restarts in a row (any missing set) before giving up, too.
-pub const MAX_FAILED_RESTARTS: u32 = 6;
+/// Stuck restarts allowed per rolling hour (any missing set, not cleared by a stable stretch)
+/// before giving up on what is missing: a node that flaps on its own ends up degraded.
+pub const RESTART_BUDGET_PER_HOUR: usize = 6;
 /// While degraded, retry (one restart) only this rarely; a structure change retries at once.
 pub const DEGRADED_RETRY: Duration = Duration::from_secs(60 * 60);
 
@@ -92,7 +93,10 @@ pub struct Supervisor {
     /// consecutive stuck restarts without a stable complete graph (drives the backoff)
     pub stuck_restarts: u32,
     same_set: u32,
-    failed_total: u32,
+    /// times of recent stuck restarts (rolling hour), kept across stable stretches
+    restart_log: Vec<Instant>,
+    /// consecutive "child owns none of its nodes" restarts (drives their capped backoff)
+    zero_restarts: u32,
     last_set: Vec<String>,
     last_restart: Option<Instant>,
     degraded: Option<Vec<String>>,
@@ -107,7 +111,7 @@ impl Supervisor {
     fn forget_failures(&mut self) {
         self.stuck_restarts = 0;
         self.same_set = 0;
-        self.failed_total = 0;
+        self.zero_restarts = 0;
         self.last_set.clear();
         self.degraded = None;
     }
@@ -145,35 +149,58 @@ impl Supervisor {
         if structure_changed {
             // a different graph deserves fresh patience and a clean slate
             self.forget_failures();
+            self.restart_log.clear();
             return old_enough.then_some(Why::Structure);
         }
         if !alive || self.spawned_at.is_none() {
             return old_enough.then_some(Why::Dead);
         }
-        if expected_total > 0 && missing.len() == expected_total && age.map_or(false, |a| a >= ZERO_NODES_AFTER) && old_enough {
-            return Some(Why::ZeroNodes);
+        // `expected_total` counts only nodes whose dependencies exist (the same filter as `missing`)
+        let all_missing = expected_total > 0 && missing.len() == expected_total;
+        if !all_missing {
+            self.zero_restarts = 0;
         }
-        if self.degraded.is_some() {
-            if self.last_restart.map_or(false, |t| now.saturating_duration_since(t) >= DEGRADED_RETRY) {
-                // one more attempt, then back to degraded if it did not help
-                self.degraded = None;
-                self.same_set = SAME_SET_RESTARTS - 1;
-                self.failed_total = MAX_FAILED_RESTARTS - 1;
+        if all_missing && old_enough {
+            // a graph that owns none of its nodes is dead: restart with a capped backoff, never degrade
+            let wait = (ZERO_NODES_AFTER * (1 << self.zero_restarts.min(3))).min(Duration::from_secs(60));
+            if age.map_or(false, |a| a >= wait) {
+                self.zero_restarts += 1;
+                return Some(Why::ZeroNodes);
+            }
+            return None;
+        }
+        if let Some(d) = &self.degraded {
+            if missing.iter().all(|m| d.contains(m)) {
+                if self.last_restart.map_or(false, |t| now.saturating_duration_since(t) >= DEGRADED_RETRY) {
+                    // one more attempt, then back to degraded if it did not help
+                    self.degraded = None;
+                    self.same_set = SAME_SET_RESTARTS - 1;
+                    self.last_set = missing.to_vec();
+                    self.restart_log.clear();
+                } else {
+                    return None;
+                }
             } else {
-                return None;
+                // something new is missing: the normal policy applies to it (the old set stays given up on only while it is all that is missing)
+                self.degraded = None;
+                self.same_set = 0;
+                self.stuck_restarts = 0;
+                self.last_set.clear();
+                self.settle.reset(now);
             }
         }
         let stuck = self.settle.stuck(missing.len(), now, self.patience(expected_total));
         if !stuck || !old_enough {
             return None;
         }
-        if self.same_set >= SAME_SET_RESTARTS || self.failed_total >= MAX_FAILED_RESTARTS {
+        self.restart_log.retain(|t| now.saturating_duration_since(*t) < Duration::from_secs(3600));
+        if self.same_set >= SAME_SET_RESTARTS || self.restart_log.len() >= RESTART_BUDGET_PER_HOUR {
             self.degraded = Some(missing.to_vec());
             return None;
         }
         self.same_set = if missing == self.last_set.as_slice() { self.same_set + 1 } else { 1 };
         self.last_set = missing.to_vec();
-        self.failed_total += 1;
+        self.restart_log.push(now);
         self.stuck_restarts += 1;
         self.last_restart = Some(now);
         Some(Why::Stuck)
@@ -208,7 +235,9 @@ pub fn raise_nofile(cmd: &mut Command) -> Option<u64> {
     let (cur, max) = nofile::get()?;
     let want = max.min(1 << 20);
     if want <= cur {
-        eprintln!("warning: graph child fd limit stays {cur} (hard limit {max}); large graphs (>= 8 inputs x 5 buses) will fail with 'Too many open files'");
+        if cur < 4096 {
+            eprintln!("warning: graph child fd limit stays {cur} (hard limit {max}); large graphs (>= 8 inputs x 5 buses) will fail with 'Too many open files'");
+        }
         return Some(cur);
     }
     if max < 4096 {
@@ -570,6 +599,7 @@ pub fn run() {
     let mut sup = Supervisor::default();
     let mut was_degraded = false;
     let degraded_file = conf_dir.join("engine.degraded");
+    let _ = std::fs::remove_file(&degraded_file); // never keep a stale state from a previous engine
     let mut hw: HashMap<String, (Child, String)> = HashMap::new();
     // piano synth (FluidSynth) feeding the "piano" input channel; stdin kept open = stays alive
     let mut piano: Option<(Child, std::process::ChildStdin)> = None;
@@ -630,7 +660,9 @@ pub fn run() {
             .filter(|(n, dep)| !g.has(n) && dep.as_ref().map(|d| g.has(d)).unwrap_or(true))
             .collect();
         let missing_names: Vec<String> = missing.iter().map(|m| m.0.clone()).collect();
-        let why = sup.tick(Instant::now(), alive, structure != child_structure, &missing_names, expected(&cfg).len());
+        // eligible = dependencies present (same filter as `missing`, without the "is it up" test)
+        let eligible = expected(&cfg).into_iter().filter(|(_, dep)| dep.as_ref().map(|d| g.has(d)).unwrap_or(true)).count();
+        let why = sup.tick(Instant::now(), alive, structure != child_structure, &missing_names, eligible);
         match (sup.degraded(), was_degraded) {
             (Some(d), false) => {
                 eprintln!("degraded: still missing {d:?} after repeated restarts; keeping the partial graph, retrying in {} min or on a config structure change", DEGRADED_RETRY.as_secs() / 60);
@@ -650,7 +682,7 @@ pub fn run() {
                 let _ = c.wait();
             }
             if why == Why::Stuck || why == Why::ZeroNodes {
-                eprintln!("restarting graph ({why:?}, attempt {}, next patience {:?}), missing: {:?}", sup.stuck_restarts, sup.patience(expected(&cfg).len()), missing_names);
+                eprintln!("restarting graph ({why:?}, attempt {}, next patience {:?}), missing: {:?}", sup.stuck_restarts, sup.patience(eligible), missing_names);
             }
             let _ = std::fs::write(&conf_file, child_conf(&cfg));
             child = spawn_graph_child(&conf_file);
@@ -913,6 +945,65 @@ mod supervisor_tests {
         // 3 attempts, then one retry per hour
         assert!((3..=6).contains(&restarts), "{restarts}");
         assert_eq!(sup.degraded(), Some(m.as_slice()));
+    }
+
+    #[test]
+    fn new_loss_while_degraded_gets_normal_path_and_zero_nodes_never_degrades() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut sup = Supervisor::default();
+        sup.spawned(t0);
+        let old = names(2);
+        let mut t = 0;
+        while sup.degraded().is_none() {
+            t += 1;
+            assert!(t < 1000);
+            if sup.tick(at(t), true, false, &old, 50).is_some() { sup.spawned(at(t)); }
+        }
+        // subset keeps holding
+        assert_eq!(sup.tick(at(t + 500), true, false, &old[..1], 50), None);
+        assert!(sup.degraded().is_some());
+        // a new name is missing: leaves degraded, restarts within the fresh patience
+        let mut grown = old.clone();
+        grown.push("n9".into());
+        let mut got = None;
+        for k in 1..=40u64 {
+            if let Some(w) = sup.tick(at(t + 600 + k), true, false, &grown, 50) { got = Some((k, w)); break; }
+        }
+        assert!(matches!(got, Some((k, Why::Stuck)) if k <= 20), "{got:?}");
+        // every eligible node missing: ZeroNodes with growing, capped waits; never degraded
+        let mut sup = Supervisor::default();
+        sup.spawned(t0);
+        let all = names(5);
+        let (mut last, mut gaps) = (0u64, vec![]);
+        for k in 1..2000u64 {
+            if let Some(w) = sup.tick(at(k), true, false, &all, 5) {
+                assert_eq!(w, Why::ZeroNodes);
+                gaps.push(k - last); last = k;
+                sup.spawned(at(k));
+            }
+            assert!(sup.degraded().is_none());
+        }
+        assert!(gaps.windows(2).all(|w| w[1] >= w[0]), "{gaps:?}");
+        assert_eq!(*gaps.last().unwrap(), 60);
+        assert_eq!(sup.stuck_restarts, 0);
+    }
+
+    #[test]
+    fn rolling_hour_budget_degrades_a_flapping_node() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut sup = Supervisor::default();
+        sup.spawned(at(0));
+        let m = names(1);
+        let mut restarts = 0;
+        for t in 1..3500u64 {
+            // gone 40 s, back 40 s, regardless of restarts
+            let miss: &[String] = if (t / 40) % 2 == 1 { &m } else { &[] };
+            if sup.tick(at(t), true, false, miss, 50).is_some() { restarts += 1; sup.spawned(at(t)); }
+        }
+        assert_eq!(restarts, RESTART_BUDGET_PER_HOUR);
+        assert!(sup.degraded().is_some());
     }
 
     #[test]
@@ -1206,7 +1297,7 @@ mod breaker27_r2 {
             .map(|(n, _)| n).collect();
         let total = expected(&cfg).len();
         assert!(missing.len() < total, "precondition: the default config has a Source input");
-        let (ev, deg) = run2(total, 900.0, |_, _, _| missing.clone());
+        let (ev, deg) = run2(missing.len(), 900.0, |_, _, _| missing.clone()); // eligible count, as run() now passes
         let first = ev.first().map(|e| (e.t, e.why));
         assert!(matches!(first, Some((t, Why::ZeroNodes)) if t <= 13.0), "child owns 0 nodes: first restart {first:?}, degraded at {deg:?}");
         assert!(deg.is_empty(), "whole graph missing, engine went degraded at {deg:?} (silent mixer, next retry in 1 h)");
