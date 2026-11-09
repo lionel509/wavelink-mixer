@@ -2259,21 +2259,17 @@ pub fn activate(app: &adw::Application) {
 
     // RGB spectrum analyser across the bottom, tapping a chosen bus
     let spec_buses: Vec<(String, String)> = Config::load().buses.iter().map(|b| (names::bus(&b.id), b.name.clone())).collect();
-    // #23: the analyser is split into four lanes over the same bus tap (no extra FFT): Piano is the
-    // whole range, Bass / Mid / High are its bands below 250 Hz, 250 Hz-4 kHz and above 4 kHz
+    // #23: one combined analyser: bars tinted Bass (< 250 Hz) / Mid (250 Hz-4 kHz) / High (> 4 kHz)
+    // in the piano lane colours, with the live piano notes overlaid (same bus tap, no extra FFT)
     let first_bus = spec_buses.first().map(|b| b.0.as_str()).unwrap_or("bus_a1").to_string();
-    let (b_lo, b_hi) = (crate::dash::band_of(250.0), crate::dash::band_of(4000.0));
-    let lanes: Vec<Rc<Spectrum>> = [("Piano", 0, crate::dash::BANDS, 130), ("Bass  < 250 Hz", 0, b_lo, 80), ("Mid  250 Hz - 4 kHz", b_lo, b_hi, 80), ("High  > 4 kHz", b_hi, crate::dash::BANDS, 80)]
-        .into_iter()
-        .map(|(name, lo, hi, h)| {
-            let s = Spectrum::new(&first_bus);
-            s.set_range(lo, hi);
-            s.set_title(name);
-            s.area.set_content_height(h);
-            s.area.update_property(&[gtk::accessible::Property::Label(&format!("{name} spectrum"))]);
-            s
-        })
-        .collect();
+    let lanes: Vec<Rc<Spectrum>> = {
+        let s = Spectrum::new(&first_bus);
+        let c = |i: usize| crate::dash::hex_rgb(piano_view::LANE_COLORS[i]);
+        s.set_zones(vec![(0.0, "BASS".into(), c(0)), (250.0, "MID".into(), c(1)), (4000.0, "HIGH".into(), c(2))]);
+        s.area.set_content_height(220);
+        s.area.update_property(&[gtk::accessible::Property::Label("Spectrum with Bass, Mid and High bands and piano notes")]);
+        vec![s]
+    };
     let spectrum = lanes[0].clone();
     let spec_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
     spec_box.set_margin_start(12);

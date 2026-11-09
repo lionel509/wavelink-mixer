@@ -680,6 +680,8 @@ pub struct Spectrum {
     title: std::cell::RefCell<String>,
     /// MIDI notes overlaid on the bars: (frequency Hz, opacity 0..1, colour)
     marks: std::cell::RefCell<Vec<(f64, f64, (f64, f64, f64))>>,
+    /// Combined view: bars tinted by band zone, (zone start Hz, name, colour), ascending
+    zones: std::cell::RefCell<Vec<(f64, String, (f64, f64, f64))>>,
 }
 
 /// Band index (0..=BANDS) whose lower edge is nearest to `f` Hz on the analyser's log axis.
@@ -708,6 +710,7 @@ impl Spectrum {
             range: std::cell::Cell::new((0, BANDS)),
             title: std::cell::RefCell::new(String::new()),
             marks: std::cell::RefCell::new(Vec::new()),
+            zones: std::cell::RefCell::new(Vec::new()),
         });
         let w = Rc::downgrade(&s);
         area.set_draw_func(move |_, cr, wd, ht| {
@@ -737,6 +740,12 @@ impl Spectrum {
             *self.marks.borrow_mut() = m;
             self.area.queue_draw();
         }
+    }
+
+    /// Tint the bars by frequency zone and label each zone: one graph showing every band (#23).
+    pub fn set_zones(&self, z: Vec<(f64, String, (f64, f64, f64))>) {
+        *self.zones.borrow_mut() = z;
+        self.area.queue_draw();
     }
 
     /// Lane name drawn in the top-left corner.
@@ -801,8 +810,15 @@ impl Spectrum {
         let (lo, hi) = self.range.get();
         let bw = lw / (hi - lo).max(1) as f64;
         for i in lo..hi {
-            // hue keyed by the absolute band, so a frequency has the same colour in every lane
-            let (r, g, b) = hsv(i as f64 / BANDS as f64 * 300.0 + t * 20.0, 0.75, 0.95);
+            // hue keyed by the absolute band, so a frequency has the same colour in every lane;
+            // in the combined view the band's zone colour wins
+            let zones = self.zones.borrow();
+            let centre = (band_edge(i) * band_edge(i + 1)).sqrt();
+            let (r, g, b) = match zones.iter().rev().find(|z| centre >= z.0) {
+                Some(z) => z.2,
+                None => hsv(i as f64 / BANDS as f64 * 300.0 + t * 20.0, 0.75, 0.95),
+            };
+            drop(zones);
             let x = lx + (i - lo) as f64 * bw;
             let bh = sh[i] * lh;
             cr.set_source_rgba(r, g, b, 0.85);
@@ -815,6 +831,27 @@ impl Spectrum {
             let _ = cr.fill();
         }
         drop((sh, pk));
+        // zone dividers and names (combined view)
+        {
+            let zones = self.zones.borrow();
+            let (flo, fhi) = (band_edge(lo), band_edge(hi));
+            let fx = |f: f64| lx + lw * (f / flo).ln() / (fhi / flo).ln();
+            for (k, z) in zones.iter().enumerate() {
+                let x0 = fx(z.0.max(flo));
+                let x1 = zones.get(k + 1).map(|n| fx(n.0)).unwrap_or(lx + lw);
+                if z.0 > flo {
+                    cr.set_source_rgba(1.0, 1.0, 1.0, 0.18);
+                    cr.set_line_width(1.0);
+                    cr.move_to(x0.round() + 0.5, ly);
+                    cr.line_to(x0.round() + 0.5, ly + lh);
+                    let _ = cr.stroke();
+                }
+                cr.set_font_size(11.0);
+                cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+                cr.set_source_rgba(z.2 .0, z.2 .1, z.2 .2, 0.9);
+                text_centered(cr, (x0 + x1) / 2.0, ly + 14.0, &z.1);
+            }
+        }
         // MIDI overlay: one line per note at its fundamental, in its lane colour, fading after note-off
         let (flo, fhi) = (band_edge(lo), band_edge(hi));
         for &(f, a, (r, g, b)) in self.marks.borrow().iter() {
