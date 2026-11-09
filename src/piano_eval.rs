@@ -162,9 +162,14 @@ pub fn live_notes(mono: &[f32]) -> (Vec<Note>, f64) {
     let mut pn = crate::pianist::Pianist::new();
     let mut evs = Vec::new();
     let t = std::time::Instant::now();
+    let bypass = std::env::var_os("PIANO_EVAL_RAW").is_some();
     for c in mono.chunks(220) {
         let raw = st.push(c);
-        pn.push(&raw, st.now(), &mut evs);
+        if bypass {
+            evs.extend(raw);
+        } else {
+            pn.push(&raw, st.now(), &mut evs);
+        }
     }
     let raw = st.flush();
     let end = st.now();
@@ -176,6 +181,13 @@ pub fn live_notes(mono: &[f32]) -> (Vec<Note>, f64) {
 
 pub fn eval(mono: &[f32], sections: &[(String, f64, f64)]) -> String {
     let (notes, ms) = live_notes(mono);
+    if std::env::var_os("PIANO_EVAL_DEBUG").is_some() {
+        for n in &notes {
+            if let Some(m) = notes.iter().filter(|m| m.pitch == n.pitch && m.t < n.t - 1e-6 && m.t + m.dur >= n.t - 0.3).last() {
+                eprintln!("restrike p{} at {:.2}: prev {:.2}+{:.2} gap {:.3}", n.pitch, n.t, m.t, m.dur, n.t - m.t - m.dur);
+            }
+        }
+    }
     if let Ok(p) = std::env::var("PIANO_EVAL_MID") {
         let _ = std::fs::write(p, crate::notes::piano_midi(&notes, false, Some(0.0)));
     }
@@ -192,7 +204,7 @@ pub fn eval(mono: &[f32], sections: &[(String, f64, f64)]) -> String {
     let synth = piano::synth_piano(&notes, secs, 7);
     let (ma, ms_) = (logmel(mono), logmel(&synth));
     let mut rep = format!("live path: {} notes over {secs:.0} s, {ms:.1} ms CPU per 0.5 s\n", notes.len());
-    rep += "section          notes  len_s  high/s  chroma  meldist  peakcov  extra/s  poly\n";
+    rep += "section          notes  len_s  high/s  chroma  meldist  peakcov  extra/s  poly  restrk/s  oct/s\n";
     let mut all = vec![("all".to_string(), 0.0, secs)];
     all.extend(sections.iter().cloned());
     // frames with sound: audio chroma energy above 1 % of the 95th percentile
@@ -244,7 +256,23 @@ pub fn eval(mono: &[f32], sections: &[(String, f64, f64)]) -> String {
             .count() as f64
             / (b - a).max(1e-9);
         let poly = sounding[fa.min(sounding.len())..fb.min(sounding.len())].iter().map(|v| v.len()).sum::<usize>() as f64 / (fb.saturating_sub(fa)).max(1) as f64;
-        rep += &format!("{name:<16} {:>5}  {len:>5.2}  {high:>6.2}  {chroma:>6.3}  {meld:>7.2}  {:>6.1}%  {extra:>7.2}  {poly:>4.1}\n", ns.len(), cov * 100.0);
+        // re-strikes: a note-on on a key that sounded within the last 300 ms
+        let restrk = ns.iter().filter(|n| notes.iter().any(|m| m.pitch == n.pitch && m.t < n.t - 1e-6 && m.t + m.dur >= n.t - 0.3)).count() as f64 / (b - a).max(1e-9);
+        // octave / 12th / two-octave pairs that start together (within 40 ms) and overlap
+        let mut pairs = 0usize;
+        for (i, x) in ns.iter().enumerate() {
+            for y in ns[i + 1..].iter() {
+                if y.t - x.t > 0.04 {
+                    break;
+                }
+                let d = (x.pitch as i32 - y.pitch as i32).abs();
+                if (d == 12 || d == 19 || d == 24) && (y.t - x.t).abs() <= 0.04 {
+                    pairs += 1;
+                }
+            }
+        }
+        let octs = pairs as f64 / (b - a).max(1e-9);
+        rep += &format!("{name:<16} {:>5}  {len:>5.2}  {high:>6.2}  {chroma:>6.3}  {meld:>7.2}  {:>6.1}%  {extra:>7.2}  {poly:>4.1}  {restrk:>8.2}  {octs:>5.2}\n", ns.len(), cov * 100.0);
     }
     rep
 }

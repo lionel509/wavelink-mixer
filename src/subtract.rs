@@ -957,6 +957,13 @@ pub struct SubTracker {
     gate: bool,
     onset_lock: bool,
     oct: bool,
+    holdkey: bool,
+    dedouble: bool,
+    poly: bool,
+    /// Per key: the start frame of its last note.
+    last_on: Vec<u64>,
+    /// Per key: the frame its last note ended.
+    last_off: Vec<u64>,
     /// Notes refused by the gates (for the harness).
     pub blocked: usize,
 }
@@ -1003,6 +1010,11 @@ impl SubTracker {
             gate: env_on("MIXER_PIANO_GATE", true),
             onset_lock: env_on("MIXER_PIANO_ONSET", true),
             oct: env_on("MIXER_PIANO_OCT", false),
+            holdkey: env_on("MIXER_PIANO_HOLDKEY", false),
+            dedouble: env_on("MIXER_PIANO_DEDOUBLE", false),
+            poly: env_on("MIXER_PIANO_POLY", false),
+            last_on: vec![0; KEYS],
+            last_off: vec![0; KEYS],
             blocked: 0,
         }
     }
@@ -1069,6 +1081,29 @@ impl SubTracker {
         if self.onset_lock && !own_rise {
             let w = tun("ONSET_W", 3.0) as u64;
             if !self.onsets.iter().any(|&o| o + w >= s && o <= s + w) {
+                return false;
+            }
+        }
+        if self.dedouble {
+            // an octave / 12th / two octaves of a note that started within 40 ms and is stronger
+            for d in [12i32, 19, 24, -12, -19, -24] {
+                let j = k as i32 + d;
+                if j < 0 || j >= KEYS as i32 {
+                    continue;
+                }
+                if let KeySeg::On { s: sj, pk: pj, .. } = self.seg[j as usize] {
+                    if sj + 4 >= s && s + 4 >= sj && pj >= pk {
+                        return false;
+                    }
+                }
+            }
+        }
+        if self.poly {
+            let sounding = self.seg.iter().filter(|x| matches!(x, KeySeg::On { .. })).count();
+            let at_onset = self.onsets.iter().any(|&o| o + 3 >= s && o <= s + 3);
+            let cap = if at_onset { tun("POLY_ONSET", 6.0) } else { tun("POLY_HOLD", 4.0) } as usize;
+            let top = (k + 1..KEYS).all(|j| !matches!(self.seg[j], KeySeg::On { .. }));
+            if sounding >= cap && !top {
                 return false;
             }
         }
@@ -1139,7 +1174,10 @@ impl SubTracker {
             let at = i.saturating_sub(1);
             self.seg[k] = match self.seg[k] {
                 KeySeg::Idle => {
-                    if v > on_db && (rise || v3 < on_db) {
+                    // hold: coming back within 300 ms of its own off is the same note decaying,
+                    // not a new strike, unless it is a clear attack
+                    let fresh = !self.holdkey || i.saturating_sub(self.last_off[k]) > 26 || v - v3 >= tun("REBIRTH_DB", 9.0);
+                    if fresh && v > on_db && (rise || v3 < on_db) {
                         KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i, rise: v - v3 }
                     } else {
                         KeySeg::Idle
@@ -1169,6 +1207,7 @@ impl SubTracker {
                             d(x).total_cmp(&d(y))
                         }).unwrap_or(s);
                         if self.allow(k, s, pk, own_rise) {
+                            self.last_on[k] = s;
                             evs.push(Ev::On { t: Self::t(s), pitch, vel });
                             KeySeg::On { s, pk, below: 0 }
                         } else {
@@ -1181,12 +1220,19 @@ impl SubTracker {
                 }
                 KeySeg::On { s, pk, below } => {
                     let pk = pk.max(v);
-                    if rise && at > s + 8 && v > on_db {
+                    let (rs_ok, drop, nbelow) = if self.holdkey {
+                        // hold: a re-strike needs a clear new attack on this key, 250 ms after the last
+                        (v - v3 >= tun("RESTRIKE_DB", 6.0) && at > s + 21, tun("OFF_DROP", 24.0), tun("HOLD_BELOW", 8.0) as u8)
+                    } else {
+                        (rise && at > s + 8, 18.0, 3)
+                    };
+                    if rs_ok && v > on_db {
                         evs.push(Ev::Off { t: Self::t(at.saturating_sub(1)), pitch });
                         KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i, rise: v - v3 }
                     } else {
-                        let below = if v < off_db || v < pk - 18.0 { below + 1 } else { 0 };
-                        if below >= 3 {
+                        let below = if v < off_db || v < pk - drop { below + 1 } else { 0 };
+                        if below >= nbelow {
+                            self.last_off[k] = i;
                             evs.push(Ev::Off { t: Self::t(at.saturating_sub(2)), pitch });
                             KeySeg::Idle
                         } else {
