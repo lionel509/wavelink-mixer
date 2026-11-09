@@ -258,29 +258,28 @@ impl Transcriber {
         let t = Tensor::from_array((vec![1i64, BP_SAMPLES as i64, 1], x)).map_err(e2s)?;
         let out = self.session.run(ort::inputs![in_name.as_str() => t]).map_err(e2s)?;
 
-        // The two [1,172,88] outputs: the larger mean is `note`, the other `onset`. The [1,172,264] contour is unused.
-        let mut grids: Vec<(f32, Vec<f32>)> = Vec::new();
-        for name in &out_names {
-            let (shape, data) = out[name.as_str()].try_extract_tensor::<f32>().map_err(e2s)?;
-            if shape.len() == 3 && shape[1] == 172 && shape[2] == 88 {
-                let mean = data.iter().sum::<f32>() / data.len() as f32;
-                grids.push((mean, data.to_vec()));
+        let (ni, oi) = pick_grids(&out_names)?;
+        let grid = |i: usize| -> Result<Vec<Vec<f32>>, String> {
+            let (shape, data) = out[out_names[i].as_str()].try_extract_tensor::<f32>().map_err(e2s)?;
+            if shape.len() != 3 || shape[1] != 172 || shape[2] != 88 {
+                return Err(format!("unexpected Basic Pitch output {} shape {:?}", out_names[i], shape));
             }
-        }
-        if grids.len() != 2 {
-            return Err(format!("expected 2 note/onset outputs of [1,172,88], found {}", grids.len()));
-        }
-        grids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let to_grid = |d: &[f32]| -> Vec<Vec<f32>> { d.chunks(88).map(|c| c.to_vec()).collect() };
-        let note = to_grid(&grids[0].1);
-        let onset = to_grid(&grids[1].1);
+            Ok(data.chunks(88).map(|c| c.to_vec()).collect())
+        };
+        let note = grid(ni)?;
+        let onset = grid(oi)?;
         Ok(frames_to_notes(&note, &onset))
     }
 }
 
-/// Indices (note, onset) into the model's output names. Stub: positional, to be replaced.
+/// Indices (note, onset) into the model's output names. The outputs are fixed: `StatefulPartitionedCall:0`
+/// is the contour [1,172,264] (unused), `:1` is `note`, `:2` is `onset`. No guessing from the data.
 pub fn pick_grids(names: &[String]) -> Result<(usize, usize), String> {
-    Ok((1, 2))
+    let find = |n: &str| names.iter().position(|x| x == n);
+    match (find("StatefulPartitionedCall:1"), find("StatefulPartitionedCall:2")) {
+        (Some(note), Some(onset)) => Ok((note, onset)),
+        _ => Err(format!("unexpected Basic Pitch outputs: {names:?}")),
+    }
 }
 
 /// note and onset are [frame][pitch] grids (172 x 88).
