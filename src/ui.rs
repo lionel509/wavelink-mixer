@@ -283,8 +283,10 @@ fn meter(name: &str, target: Option<(&str, bool)>, led: Option<Rc<LedMeter>>, vu
     let rv = rms.clone();
     let bands = Arc::new(Mutex::new(vec![0.0f32; crate::dash::BANDS]));
     let bv = bands.clone();
+    let hires = name.starts_with("meter_bus_");
     std::thread::spawn(move || {
-        let mut fft = Fft::new();
+        // the bus taps feed the main spectrum: they get the high-resolution FFT
+        let mut fft = if hires { Fft::hires() } else { Fft::new() };
         let mut buf = vec![0u8; 4 * 2 * 960]; // 20 ms stereo f32
         let mut carry: Vec<u8> = vec![];
         while let Ok(n) = out.read(&mut buf) {

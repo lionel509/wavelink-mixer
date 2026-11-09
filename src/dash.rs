@@ -622,7 +622,9 @@ pub fn screw_row() -> gtk::DrawingArea {
 
 // ---------- RGB spectrum analyser ----------
 
-const FFT_N: usize = 16384;
+/// FFT size for channel/rack analysers; the bus spectrum uses `FFT_HI` (`Fft::hires`).
+const FFT_N: usize = 4096;
+const FFT_HI: usize = 16384;
 pub const BANDS: usize = 432;
 const F_LO: f64 = 25.0;
 const F_HI: f64 = 18000.0;
@@ -1107,6 +1109,7 @@ impl PatchBay {
 /// Rolling FFT over a stereo stream, producing BANDS log bands (0..1 for -72..0 dB).
 /// Fed by the meters' own capture, so analysers never open extra PipeWire streams.
 pub struct Fft {
+    n: usize,
     edges: Vec<f64>,
     window: Vec<f32>,
     ring: Vec<f32>,
@@ -1123,20 +1126,30 @@ impl Fft {
 
     /// Same bands as `new`, for a stream at `rate` Hz.
     pub fn with_rate(rate: f64) -> Fft {
+        Fft::sized(rate, FFT_N)
+    }
+
+    /// The main bus spectrum: a 16384-point FFT, so its BANDS bars carry real detail down low.
+    pub fn hires() -> Fft {
+        Fft::sized(RATE, FFT_HI)
+    }
+
+    fn sized(rate: f64, n: usize) -> Fft {
         Fft {
-            edges: (0..=BANDS).map(|i| F_LO * (F_HI / F_LO).powf(i as f64 / BANDS as f64) * FFT_N as f64 / rate).collect(),
-            window: (0..FFT_N).map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (FFT_N - 1) as f32).cos()).collect(),
-            ring: vec![0.0; FFT_N],
+            n,
+            edges: (0..=BANDS).map(|i| F_LO * (F_HI / F_LO).powf(i as f64 / BANDS as f64) * n as f64 / rate).collect(),
+            window: (0..n).map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (n - 1) as f32).cos()).collect(),
+            ring: vec![0.0; n],
             pos: 0,
             fresh: 0,
-            re: vec![0.0; FFT_N],
-            im: vec![0.0; FFT_N],
+            re: vec![0.0; n],
+            im: vec![0.0; n],
         }
     }
 
     pub fn push(&mut self, l: f32, r: f32) {
         self.ring[self.pos] = 0.5 * (l + r);
-        self.pos = (self.pos + 1) % FFT_N;
+        self.pos = (self.pos + 1) % self.n;
         self.fresh += 1;
     }
 
@@ -1146,17 +1159,17 @@ impl Fft {
             return None;
         }
         self.fresh = 0;
-        for i in 0..FFT_N {
-            self.re[i] = self.ring[(self.pos + i) % FFT_N] * self.window[i];
+        for i in 0..self.n {
+            self.re[i] = self.ring[(self.pos + i) % self.n] * self.window[i];
             self.im[i] = 0.0;
         }
         fft(&mut self.re, &mut self.im);
         let (re, im) = (&self.re, &self.im);
-        let mag = |b: usize| (re[b] * re[b] + im[b] * im[b]).sqrt() * 4.0 / FFT_N as f32;
+        let mag = |b: usize| (re[b] * re[b] + im[b] * im[b]).sqrt() * 4.0 / self.n as f32;
         let mut bands = vec![0.0f32; BANDS];
         for (k, band) in bands.iter_mut().enumerate() {
             let (a, b) = (self.edges[k], self.edges[k + 1]);
-            let (ia, ib) = (a.floor() as usize, (b.ceil() as usize).min(FFT_N / 2 - 1));
+            let (ia, ib) = (a.floor() as usize, (b.ceil() as usize).min(self.n / 2 - 1));
             let m = if ib <= ia + 1 {
                 let c = (a + b) / 2.0;
                 let i0 = c.floor() as usize;
