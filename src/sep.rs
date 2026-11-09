@@ -761,4 +761,53 @@ mod tests {
         assert!(ns.is_empty(), "notes on silence: {ns:?}");
         assert!(nn.is_empty(), "notes on -60 dBFS noise: {nn:?}");
     }
+
+    /// F23: a short quiet note in silence is signal. 110 Hz at 0.0035 over samples 37 485..50 715 (300 ms).
+    #[test]
+    fn is_silent_quiet_note_in_silence_is_signal() {
+        let mut x = vec![0f32; 88200];
+        for i in 37485..50715 {
+            x[i] = ((2.0 * std::f64::consts::PI * 110.0 * i as f64 / 44100.0).sin() as f32) * 0.0035;
+        }
+        assert!(!is_silent(&x), "quiet note in silence treated as silent");
+    }
+
+    /// F23: pins the floor. Zeros and +-0.001 noise are silent, +-0.004 noise is not.
+    #[test]
+    fn is_silent_floor_noise_is_silent() {
+        assert!(is_silent(&vec![0f32; 88200]));
+        let noise = |amp: f32| -> Vec<f32> {
+            let mut s = 777u64;
+            (0..88200).map(|_| (lcg(&mut s) * 2.0 - 1.0) * amp).collect()
+        };
+        assert!(is_silent(&noise(0.001)));
+        assert!(!is_silent(&noise(0.004)));
+    }
+
+    /// F23 (ignored, CPU, model): a real 300 ms A2 at 0.0035 (about -49 dBFS peak) in silence must survive the
+    /// silence gate. Cherry-picked from breaker_r4::r4_model_quiet_short_note_survives_rms_gate (d318a9c),
+    /// simplified to use Transcriber::notes only.
+    #[test]
+    #[ignore]
+    fn r4_model_quiet_short_note_survives_rms_gate() {
+        let m = models::ensure(&["basic-pitch-nmp.onnx"], &|_: String| {}).unwrap();
+        let mut tr = Transcriber::load(&m).unwrap();
+        let f0 = 440.0 * 2f64.powf((45.0 - 69.0) / 12.0);
+        let render = |amp: f32| -> Vec<f32> {
+            let mut x = vec![0f32; 88200];
+            let i0 = 44100usize;
+            let i1 = i0 + (0.3 * 44100.0) as usize;
+            for i in i0..i1 {
+                let tt = (i - i0) as f64 / 44100.0;
+                x[i] = ((2.0 * std::f64::consts::PI * f0 * tt).sin() as f32) * amp;
+            }
+            x
+        };
+        let seen = |ns: &[Note]| ns.iter().any(|n| (44..=46).contains(&n.pitch) && (0.9..1.4).contains(&n.t));
+        let loud = tr.notes(&render(0.4)).unwrap();
+        let quiet = tr.notes(&render(0.0035)).unwrap();
+        println!("loud {loud:?}\nquiet {quiet:?}");
+        assert!(seen(&loud), "precondition: model should see the loud note: {loud:?}");
+        assert!(seen(&quiet), "silence gate dropped a real 300 ms A2 at -49 dBFS peak: {quiet:?}");
+    }
 }
