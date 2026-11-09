@@ -1,6 +1,8 @@
 //! Mixer window: input strips (gain, EQ, FX, routes), buses, and an apps panel.
 #[path = "stems_view.rs"]
 mod stems_view;
+#[path = "piano_view.rs"]
+mod piano_view;
 use crate::config::{self, db_to_vol, fmt_db, names, Bus, BusKind, Config, Input, InputKind, Route, FX_PRESETS};
 use crate::engine::bus_fader_node;
 use crate::dash::{db_to_pos, hex_rgb, Hit, pos_to_db, screw_row, Analyzer, Fft, GrMeter, Knob, Lamp, LedMeter, Patch, PatchBay, Spectrum, Vu};
@@ -377,6 +379,7 @@ pub struct App {
     apps_sig: RefCell<String>,
     css: gtk::CssProvider,
     stems: stems_view::State,
+    piano: piano_view::State,
 }
 
 fn label_x(text: &str) -> gtk::Label {
@@ -2281,13 +2284,13 @@ pub fn activate(app: &adw::Application) {
     let patch_panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
     patch_panel.add_css_class("spectrum");
     patch_panel.append(&patch.area);
+    // #23: the Stems tab is gone; the Piano section sits under the analyser, and its "Neural stems"
+    // engine shows the #16 Stems panel
+    let stems_v = stems_view::View::new();
+    let piano_v = piano_view::View::new(&stems_v.root);
+    spec_panel.append(&piano_v.root);
     stack.add_titled(&spec_panel, Some("spectrum"), "Spectrum");
     stack.add_titled(&patch_panel, Some("patch"), "Patch Bay");
-    let stems_v = stems_view::View::new();
-    let stems_panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    stems_panel.add_css_class("spectrum");
-    stems_panel.append(&stems_v.root);
-    stack.add_titled(&stems_panel, Some("stems"), "Stems");
     // System monitor: read-only health of the audio system (lives under the output strips)
     let sys_panel = gtk::Box::new(gtk::Orientation::Vertical, 6);
     sys_panel.add_css_class("syspanel");
@@ -2381,7 +2384,8 @@ pub fn activate(app: &adw::Application) {
     spec_box.append(&spec_head);
     spec_box.append(&stack);
     if let Ok(page) = std::env::var("MIXER_PAGE") {
-        stack.set_visible_child_name(&page);
+        // "stems" is an alias: the Spectrum page, with the Piano engine on "Neural stems" (piano_view::wire)
+        stack.set_visible_child_name(if page == "stems" { "spectrum" } else { &page });
     }
     split.set_end_child(Some(&spec_box));
     // remember where the divider was left (per-viewer convenience)
@@ -2431,8 +2435,10 @@ pub fn activate(app: &adw::Application) {
         apps_sig: RefCell::new(String::new()),
         css: dynamic,
         stems: stems_view::State::new(),
+        piano: piano_view::State::new(),
     });
     stems_view::wire(&st, stems_v.clone());
+    piano_view::wire(&st, piano_v.clone());
 
     let add_in = gtk::MenuButton::builder().label("+ Input").popover(&st.add_input_popover()).build();
     let add_bus = gtk::MenuButton::builder().label("+ Output").popover(&st.add_bus_popover()).build();
@@ -2556,6 +2562,7 @@ pub fn activate(app: &adw::Application) {
         let src = st3.spectra.borrow().get(&format!("bus:{}", sp3.target())).cloned();
         sp3.step(dt, src.as_ref());
         stems_view::step(&st3, dt);
+        piano_view::step(&st3, dt);
         glib::ControlFlow::Continue
     });
     let (st2, ww) = (st.clone(), win.downgrade());
@@ -2563,6 +2570,7 @@ pub fn activate(app: &adw::Application) {
     glib::timeout_add_local(Duration::from_millis(100), move || {
         if ww.upgrade().is_none() {
             stems_view::shutdown(&st2);
+            piano_view::shutdown(&st2);
             // never leave channels muted by a solo when the window closes
             if !st2.solo.borrow().is_empty() {
                 st2.solo.borrow_mut().clear();
@@ -2603,6 +2611,7 @@ pub fn activate(app: &adw::Application) {
         }
         save_tick += 1;
         stems_view::housekeep(&st2, remute, save_tick % 10 == 0);
+        piano_view::housekeep(&st2, save_tick % 10 == 0);
         if save_tick % 5 == 0 && st2.dirty.get() {
             st2.cfg.borrow().save();
             st2.dirty.set(false);
