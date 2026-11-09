@@ -1,7 +1,6 @@
 //! Live piano (#23): a passive `pw-cat` tap -> `PianoTracker` -> the shared roll, and optionally the
 //! "Wavelink Piano" ALSA sequencer port for other software. It adds no engine graph nodes and plays
 //! nothing: the tap is `node.passive=true`, the same one `wavelink-mixer stems --source` uses.
-#![allow(dead_code)]
 use crate::notes::Note;
 use crate::piano::{self, lane, Downmix, Ev, PianoTracker};
 use std::io::Read;
@@ -279,6 +278,7 @@ pub struct Session {
 }
 
 impl Session {
+    #[cfg(test)]
     pub fn start(o: Opts, shared: Shared) -> Session {
         Self::start_with(o, shared, None)
     }

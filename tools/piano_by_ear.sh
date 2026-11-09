@@ -4,7 +4,7 @@
 # usage: tools/piano_by_ear.sh song.wav [wavelink-mixer binary]
 set -euo pipefail
 in="$1"
-bin="${2:-$HOME/.cache/cargo-target-23/release/wavelink-mixer}"
+bin="${2:-${CARGO_TARGET_DIR:-$HOME/.cache/cargo-target-23}/release/wavelink-mixer}"
 mid="${in%.*}.piano.mid"
 out="${in%.*}.piano.wav"
 "$bin" piano --wav "$in" --out "$mid"

@@ -22,7 +22,6 @@
 //!    The onset time is the steepest rise of that energy, velocity its peak against a per-note AGC.
 //!
 //! `PianoTracker::push` is streaming and stateful, so the live tap and the offline path share it.
-#![allow(dead_code)]
 use crate::notes::Note;
 
 /// Analysis rate. Everything above it is resampled to this first.
@@ -34,12 +33,13 @@ pub const HIGH_KEY: u8 = 108;
 pub const KEYS: usize = 88;
 /// Bins per semitone on the log axis. Key k sits on bin 3k+1.
 const BPS: usize = 3;
-/// The log axis runs up to MIDI 124 (~10.5 kHz), past C8, so high keys keep their 2nd partial.
-const TOP_MIDI: usize = 124;
+/// The log axis runs up to MIDI 121 (~8.9 kHz), past C8: high keys keep part of their 2nd partial,
+/// and the band just under the 11 kHz Nyquist (resampler transition, aliases) stays out.
+const TOP_MIDI: usize = 121;
 const NBINS: usize = (TOP_MIDI - LOW_KEY as usize) * BPS;
 const SIZES: [usize; 3] = [4096, 2048, 1024];
-/// Centre delay: a frame centred on sample c needs input up to c + 2048.
-pub const DELAY: usize = 2048;
+/// Centre delay: a frame centred on sample c needs input up to c + 2048, plus the decimators' 24.
+pub const DELAY: usize = 2048 + 32;
 /// Partials summed into the salience, and their weight decay.
 const HARMS: usize = 20;
 const HARM_DECAY: f32 = 0.95;
@@ -49,6 +49,11 @@ const CANCEL_HARMS: usize = 48;
 /// this prior weight (as if partials up to ~10 had shown no stretch) and capped (B ~ 4e-3).
 const STRETCH_PRIOR: f32 = 1e4;
 const STRETCH_MAX: f32 = 0.1;
+/// Cancel envelope: partial h of a picked note is subtracted at most up to ENV_K * ref * h^-ENV_BETA,
+/// ref from its first two partials (the second scaled by 2^BETA * ENV_H2).
+const ENV_BETA: f32 = 1.0;
+const ENV_K: f32 = 1.5;
+const ENV_H2: f32 = 0.7;
 pub const MAX_POLY: usize = 10;
 /// Whitening: the 20th percentile of ±FLOOR_HALF FFT bins, times 1.76 (the Rayleigh median / p20
 /// ratio, so noise sits at 1), evaluated every FLOOR_STEP bins; plus a floor 50 dB under the frame
@@ -58,33 +63,59 @@ const FLOOR_STEP: usize = 8;
 const FLOOR_PCT: f32 = 0.2;
 const FLOOR_SCALE: f32 = 1.76;
 const DYN_RANGE: f32 = 3e-3;
-const ABS_FLOOR: f32 = 1e-5;
+const ABS_FLOOR: f32 = 1e-6;
+/// DC blocker pole at RATE (~16 Hz corner).
+const DC_POLE: f32 = 0.9955;
 /// Salience thresholds (whitened, compressed units). A new key needs ON, a sounding one keeps going
 /// down to OFF. REL is relative to the strongest key of the frame.
 const ON_ABS: f32 = 7.0;
 const OFF_ABS: f32 = 4.5;
 /// Keys with fewer partials than this under the axis top get a proportionally lower ABS threshold.
 const WFRAC_REF: usize = 6;
-const ON_REL: f32 = 0.22;
+/// Floor of the unclaimed-weight scaling of ABS (1 = off).
+const UNCLAIMED_MIN: f32 = 0.6;
+const ON_REL: f32 = 0.3;
 const OFF_REL: f32 = 0.12;
 /// An octave/twelfth/double-octave of a picked key must keep this share of its salience after the cancel.
-const GHOST_KEEP: f32 = 0.5;
+const GHOST_KEEP: f32 = 0.55;
 /// ...and at least 3 of its first 4 partials must keep this share of their linear energy.
 const GHOST_PART: f32 = 0.3;
 /// A key's fundamental must be a residual peak this far over the floor; below this MIDI key any of its first three partials will do.
-const FUND_MIN: f32 = 2.0;
+const FUND_MIN: f32 = 5.0;
 const WEAK_FUND_BELOW: usize = 40;
 /// Tracker timing.
 pub const MIN_NOTE_S: f64 = 0.060;
 const OFF_FRAMES: u32 = 2;
+/// Extra quiet frames for keys judged on the 4096 window.
+const OFF_EXTRA_LOW: f32 = 2.0;
+const OFF_EXTRA_MID: f32 = 0.0;
 const RETRIG_S: f64 = 0.050;
 /// A held key re-strikes when its short-window energy jumps by this factor over its recent minimum.
 const RESTRIKE: f32 = 1.4;
+/// ...or this steep a rise within 4 frames, with no flux onset needed.
+const RESTRIKE_FAST: f32 = 2.0;
+/// Frames a strong flux onset stays latched for the slower energy rise to follow it.
+const RESTRIKE_LATCH: usize = 8;
+/// ...and come out of a dip to this share of the note's peak so far.
+const RESTRIKE_DIP: f32 = 0.8;
+/// A key that ended within RESTART_WIN frames restarts only after its fast energy dipped to this
+/// share of the ended note's peak.
+const RESTART_WIN: i64 = 16;
+const RESTART_DIP: f32 = 0.6;
+/// A new key under this share of the salience of a picked semitone neighbour does not start.
+const SEMI_K: f32 = 0.7;
+/// Half the fast onset-energy window (1024), in frames.
+const EHALF: i64 = (SIZES[2] / 2 / HOP) as i64;
 const RESTRIKE_LOOK: usize = 6;
-const RESTRIKE_PART: f32 = 1.25;
+const RESTRIKE_PART: f32 = 1.4;
 /// Global flux: bins of the 1024 FFT used, and the onset level relative to its running mean.
 const GF_BINS: usize = 256;
-const GF_ONSET: f32 = 2.0;
+const GF_ONSET: f32 = 4.0;
+/// Floor of the flux baseline (sum of log-rises over the bins), the flux range under the frame peak,
+/// and the per-bin dead band (log units per frame).
+const GF_FLOOR: f32 = 4.0;
+const GF_RANGE: f32 = 1e-2;
+const GF_DEAD: f32 = 0.1;
 /// A new note needs its short-window energy to have risen this much within the last ONSET_WIN frames.
 const ONSET_RISE: f32 = 1.5;
 const ONSET_WIN: usize = 12;
@@ -125,7 +156,8 @@ fn tune(name: &str, def: f32) -> f32 {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Ev {
-    /// `t` is the note start in seconds since the tracker started (sample-accurate at RATE).
+    /// `t` is the note start in seconds since the tracker started, on the 11.6 ms frame grid (the
+    /// centre of the frame with the steepest attack), not sample-accurate.
     On { t: f64, pitch: u8, vel: u8 },
     Off { t: f64, pitch: u8 },
 }
@@ -192,7 +224,6 @@ fn midi_hz(m: f64) -> f64 {
 /// Real FFT of length n through an n/2 complex FFT, Hann window, magnitudes in amplitude units
 /// (a steady sine of amplitude A reads A on its bin).
 struct Rfft {
-    n: usize,
     m: usize,
     rev: Vec<u32>,
     tw: Vec<(f32, f32)>,
@@ -223,7 +254,7 @@ impl Rfft {
             .collect();
         let win = crate::dsp::hann(n);
         let scale = 2.0 / win.iter().sum::<f32>();
-        Rfft { n, m, rev, tw, post, win, scale, re: vec![0.0; m], im: vec![0.0; m], mag: vec![0.0; m + 1] }
+        Rfft { m, rev, tw, post, win, scale, re: vec![0.0; m], im: vec![0.0; m], mag: vec![0.0; m + 1] }
     }
 
     /// `x` is exactly n samples.
@@ -272,6 +303,75 @@ impl Rfft {
     }
 }
 
+/// Streaming 2:1 decimator for the long analysis windows: a 17-tap Kaiser low-pass (cut at a
+/// quarter of the output rate, far above the band each long window serves), output m = sum over
+/// h[i] * x[2m - i], so it has a delay of 8 input samples.
+struct Dec {
+    h: [f32; DEC_TAPS],
+    /// Output samples from absolute index `base`.
+    out: Vec<f32>,
+    base: i64,
+    next: i64,
+}
+
+const DEC_TAPS: usize = 17;
+
+impl Dec {
+    fn new() -> Dec {
+        let mid = (DEC_TAPS - 1) as f64 / 2.0;
+        let fc = 0.125; // cycles per input sample: a quarter of the output rate
+        let mut h = [0f32; DEC_TAPS];
+        for (i, v) in h.iter_mut().enumerate() {
+            let d = i as f64 - mid;
+            let sinc = if d == 0.0 { 2.0 * fc } else { (2.0 * std::f64::consts::PI * fc * d).sin() / (std::f64::consts::PI * d) };
+            *v = (sinc * kaiser(d / mid, 6.0)) as f32;
+        }
+        let sum: f32 = h.iter().sum();
+        h.iter_mut().for_each(|v| *v /= sum);
+        Dec { h, out: Vec::new(), base: 0, next: 0 }
+    }
+
+    /// Computes every output whose newest input is available. `src` holds input samples from
+    /// absolute index `src_base` to `src_end` (exclusive); inputs before 0 are silence.
+    fn feed(&mut self, src: &[f32], src_base: i64) {
+        let src_end = src_base + src.len() as i64;
+        while 2 * self.next < src_end {
+            let top = 2 * self.next;
+            let mut acc = 0f32;
+            for (i, &h) in self.h.iter().enumerate() {
+                let j = top - i as i64;
+                if j >= src_base {
+                    acc += h * src[(j - src_base) as usize];
+                }
+            }
+            self.out.push(acc);
+            self.next += 1;
+        }
+    }
+
+    /// Copies out[from .. from + dst.len()] (absolute indices), silence where it doesn't exist.
+    fn window(&self, from: i64, dst: &mut [f32]) {
+        for (i, v) in dst.iter_mut().enumerate() {
+            let j = from + i as i64 - self.base;
+            *v = if j >= 0 && (j as usize) < self.out.len() { self.out[j as usize] } else { 0.0 };
+        }
+    }
+
+    /// Forgets outputs before absolute index `keep_from`.
+    fn trim(&mut self, keep_from: i64) {
+        let k = keep_from - self.base;
+        if k > 2048 {
+            self.out.drain(..k as usize);
+            self.base += k;
+        }
+    }
+}
+
+/// The FFT length actually run for each analysis size: the 4096 and 2048 windows run as 1024-point
+/// FFTs on the input decimated by 4 and 2 (same duration and bin spacing, a quarter and a half of the
+/// work), since they only serve the log axis below C6.
+const FFT_N: usize = 1024;
+
 /// Which FFT serves a log bin, and the FFT bin range it takes the max over.
 #[derive(Clone, Copy)]
 struct Kern {
@@ -295,8 +395,8 @@ fn kern(midi: f64, size: usize, half_width_semi: f64) -> Kern {
     let df = RATE as f64 / n as f64;
     let lo = midi_hz(midi - half_width_semi) / df;
     let hi = midi_hz(midi + half_width_semi) / df;
-    let k0 = (lo.round() as usize).min(n / 2);
-    let k1 = (hi.round() as usize).clamp(k0, n / 2);
+    let k0 = (lo.round() as usize).min(FFT_N / 2);
+    let k1 = (hi.round() as usize).clamp(k0, FFT_N / 2);
     Kern { size: size as u8, k0: k0 as u16, k1: k1 as u16 }
 }
 
@@ -304,9 +404,9 @@ fn kern(midi: f64, size: usize, half_width_semi: f64) -> Kern {
 enum KeyState {
     Idle,
     /// Active, not yet long enough to emit. `act` is the first active frame.
-    Pending { act: i64 },
+    Pending { act: i64, floor: i64, proven: bool },
     /// Emitted. `t0` is its start in seconds.
-    On { t0: f64, since: i64 },
+    On { t0: f64 },
 }
 
 /// Streaming song -> piano note tracker. Feed mono PCM at `RATE`.
@@ -322,7 +422,8 @@ pub struct PianoTracker {
     /// Global flux ring (relative to its running mean), the previous log spectrum, the mean.
     gflux: [f32; RING],
     gf_prev: Vec<f32>,
-    gf_mean: f32,
+    /// Raw flux of the last RING frames (the baseline).
+    gf_raw: [f32; RING],
     /// Input ring: samples from absolute index `buf_start`.
     buf: Vec<f32>,
     buf_start: u64,
@@ -336,6 +437,8 @@ pub struct PianoTracker {
     lin: Vec<f32>,
     /// Fractional log-axis position of the peak held in each bin.
     pos: Vec<f32>,
+    /// The noise floor the peak in each bin was divided by (amplitude = lin * fl).
+    fl: Vec<f32>,
     explained: Vec<bool>,
     /// Per key: tracked partial bins for this frame, and how many.
     pb: Vec<[u16; HARMS]>,
@@ -345,6 +448,9 @@ pub struct PianoTracker {
     min_abs: f32,
     /// Window scratch for the FFT input.
     xbuf: Vec<f32>,
+    /// The input decimated by 2 (for the 2048 window) and by 4 (for the 4096 window).
+    dec2: Dec,
+    dec4: Dec,
     /// Log-axis offset of partial h+1 over the fundamental: 36 log2(h+1) bins.
     hoff: Vec<f32>,
     white: Vec<f32>,
@@ -357,11 +463,15 @@ pub struct PianoTracker {
     /// Per key: short-window harmonic energy for the last RING frames, indexed frame % RING.
     energy: Vec<[f32; RING]>,
     state: Vec<KeyState>,
-    /// Per key: half the onset-energy window, in frames.
-    ehalf: Vec<u8>,
+    /// Per key: the frame its last note ended (a new note's onset can't reach back past it).
+    ended: Vec<i64>,
     quiet: Vec<u32>,
+    /// Per key: peak fast energy of the sounding note so far.
+    peak_e: Vec<f32>,
     last_trig: Vec<i64>,
     agc_db: Option<f32>,
+    dc_x: f32,
+    dc_y: f32,
     /// Cumulative processing time, for the CPU readout.
     pub busy: std::time::Duration,
 }
@@ -399,14 +509,16 @@ impl PianoTracker {
         let ekern = ekern_for(true);
         let gkern = ekern_for(false);
         PianoTracker {
-            ffts: [Rfft::new(SIZES[0]), Rfft::new(SIZES[1]), Rfft::new(SIZES[2])],
+            ffts: [Rfft::new(FFT_N), Rfft::new(FFT_N), Rfft::new(FFT_N)],
+            dec2: Dec::new(),
+            dec4: Dec::new(),
             ekern,
             gkern,
             genergy: vec![[0.0; RING]; KEYS],
             henergy: vec![[[0.0; 4]; RING]; KEYS],
             gflux: [0.0; RING],
-            gf_prev: vec![(1e-5f32).ln(); GF_BINS],
-            gf_mean: 0.0,
+            gf_prev: vec![0.0; GF_BINS],
+            gf_raw: [0.0; RING],
             buf: Vec::with_capacity(SIZES[0] * 4),
             buf_start: 0,
             n_in: 0,
@@ -417,10 +529,11 @@ impl PianoTracker {
                 let (m_lo, m_hi) = [(LOW_KEY as f64 - 1.0, 64.0), (64.0, 84.0), (84.0, TOP_MIDI as f64 + 1.0)][s];
                 let lo = midi_hz(m_lo - 0.5) / df;
                 let hi = midi_hz(m_hi + 0.5) / df;
-                ((lo.floor() as usize).max(1), (hi.ceil() as usize + 2).min(SIZES[s] / 2))
+                ((lo.floor() as usize).max(1), (hi.ceil() as usize + 2).min(FFT_N / 2))
             }),
             lin: vec![0.0; NBINS],
             pos: vec![0.0; NBINS],
+            fl: vec![0.0; NBINS],
             explained: vec![false; NBINS],
             pb: vec![[0; HARMS]; KEYS],
             nh: vec![0; KEYS],
@@ -440,10 +553,13 @@ impl PianoTracker {
             picked: Vec::with_capacity(MAX_POLY),
             energy: vec![[0.0; RING]; KEYS],
             state: vec![KeyState::Idle; KEYS],
-            ehalf: vec![(SIZES[2] / 2 / HOP) as u8; KEYS],
+            ended: vec![i64::MIN / 2; KEYS],
             quiet: vec![0; KEYS],
+            peak_e: vec![0.0; KEYS],
             last_trig: vec![i64::MIN / 2; KEYS],
             agc_db: None,
+            dc_x: 0.0,
+            dc_y: 0.0,
             min_abs: 0.0,
             xbuf: vec![0.0; SIZES[0]],
             hoff: (1..=CANCEL_HARMS).map(|h| (BPS as f32 * 12.0) * (h as f32).log2()).collect(),
@@ -459,7 +575,18 @@ impl PianoTracker {
     /// Feeds mono samples at RATE; returns the events that became certain.
     pub fn push(&mut self, pcm: &[f32]) -> Vec<Ev> {
         let t = std::time::Instant::now();
-        self.buf.extend_from_slice(pcm);
+        // DC blocker (one-pole high-pass at ~16 Hz): an offset or step can't seed the flux baseline
+        // or leak into the bottom bins
+        self.buf.reserve(pcm.len());
+        for &x in pcm {
+            let x = if x.is_finite() { x } else { 0.0 };
+            let y = x - self.dc_x + DC_POLE * self.dc_y;
+            self.dc_x = x;
+            self.dc_y = y;
+            self.buf.push(y);
+        }
+        self.dec2.feed(&self.buf, self.buf_start as i64);
+        self.dec4.feed(&self.dec2.out, self.dec2.base);
         self.n_in += pcm.len() as u64;
         let mut out = Vec::new();
         loop {
@@ -476,6 +603,8 @@ impl PianoTracker {
                 let drop = (need_from - self.buf_start) as usize;
                 self.buf.drain(..drop);
                 self.buf_start += drop as u64;
+                self.dec2.trim(self.buf_start as i64 / 2 - 64);
+                self.dec4.trim(self.buf_start as i64 / 4 - 64);
             }
         }
         self.busy += t.elapsed();
@@ -504,8 +633,20 @@ impl PianoTracker {
 
     /// Fills `spec` (log axis), `white` and `energy` for the frame centred on sample c.
     fn analyse(&mut self, c: i64) {
-        for s in 0..3 {
-            let n = SIZES[s];
+        // 4096 window: 1024 samples of the input decimated by 4, centred on c (decimator delays
+        // compensated: 8 input samples for the first stage, 8 more stage-1 samples for the second)
+        {
+            let q = (c + 2 * 8 + 8) / 4;
+            let mut x = std::mem::take(&mut self.xbuf);
+            self.dec4.window(q - FFT_N as i64 / 2, &mut x[..FFT_N]);
+            self.ffts[0].run(&x[..FFT_N]);
+            let m = (c + 8) / 2;
+            self.dec2.window(m - FFT_N as i64 / 2, &mut x[..FFT_N]);
+            self.ffts[1].run(&x[..FFT_N]);
+            self.xbuf = x;
+        }
+        {
+            let n = FFT_N;
             let start = c - n as i64 / 2;
             let x = &mut self.xbuf[..n];
             x.iter_mut().for_each(|v| *v = 0.0);
@@ -516,7 +657,7 @@ impl PianoTracker {
                 let from = (start + lo as i64 - self.buf_start as i64) as usize;
                 x[lo..hi].copy_from_slice(&self.buf[from..from + (hi - lo)]);
             }
-            self.ffts[s].run(x);
+            self.ffts[2].run(x);
         }
         // noise floor per FFT bin: a low percentile of the neighbourhood, scaled so that for noise it
         // equals the median. A percentile (not the median) keeps working where the window is too
@@ -582,6 +723,7 @@ impl PianoTracker {
                 let r = amp / self.floor[s][k];
                 if r > self.lin[bin] {
                     self.lin[bin] = r;
+                    self.fl[bin] = self.floor[s][k];
                     self.pos[bin] = (midi - LOW_KEY as f32) * BPS as f32 + 1.0;
                 }
             }
@@ -590,19 +732,24 @@ impl PianoTracker {
             self.white[b] = comp(self.lin[b]);
         }
         let slot = (self.frame.rem_euclid(RING as i64)) as usize;
-        // global spectral flux on the 1024 window (log magnitude, up to ~5.5 kHz)
+        // global spectral flux on the 1024 window: log magnitudes compressed 60 dB under the frame
+        // peak (level-invariant, and noise-level bins can't dominate), against the mean of the last
+        // RING frames with a floor, so a steady tone's near-zero flux never makes a swell an onset
         {
             let mag = &self.ffts[2].mag;
+            let pk = mag[1..GF_BINS].iter().fold(0f32, |a, &m| a.max(m));
+            let eps = (pk * tun!(GF_RANGE)).max(1e-12);
+            let dead = tun!(GF_DEAD);
             let mut fl = 0f32;
             for (i, &m) in mag[1..GF_BINS].iter().enumerate() {
-                let l = (m + 1e-5).ln();
-                fl += (l - self.gf_prev[i]).max(0.0);
+                let l = (m + eps).ln() - eps.ln();
+                // a dead band per bin: slow swells and window-phase wiggles add nothing
+                fl += (l - self.gf_prev[i] - dead).max(0.0);
                 self.gf_prev[i] = l;
             }
-            let mean = self.gf_mean;
-            self.gflux[slot] = if mean > 0.0 { fl / mean } else { 0.0 };
-            // slow running mean (~0.4 s), seeded by the first frames
-            self.gf_mean = if mean > 0.0 { mean + (fl - mean) * 0.03 } else { fl.max(1e-3) };
+            let base = self.gf_raw.iter().sum::<f32>() / RING as f32;
+            self.gflux[slot] = fl / base.max(tun!(GF_FLOOR));
+            self.gf_raw[slot] = fl;
         }
         let sum = |ffts: &[Rfft; 3], kerns: &[Kern; 4]| -> f32 {
             kerns
@@ -696,14 +843,26 @@ impl PianoTracker {
     fn cancel(&mut self, k: usize) {
         let mut bins = [0u16; CANCEL_HARMS];
         let n = self.partial_bins(k, &mut bins);
+        // (bin of the residual peak, its amplitude): amplitudes, not ratios, so partials in different
+        // FFT bands (different floors) compare
         let mut found: [(usize, f32); CANCEL_HARMS + 2] = [(0, 0.0); CANCEL_HARMS + 2];
         for h in 1..=n {
-            let bm = bins[h - 1] as usize;
-            let amp = self.res_lin[bm - 1].max(self.res_lin[bm]).max(self.res_lin[bm + 1]);
-            found[h] = (bm, amp);
+            let c = bins[h - 1] as usize;
+            let mut bm = c;
+            for b in c - 1..=c + 1 {
+                if self.res_lin[b] > self.res_lin[bm] {
+                    bm = b;
+                }
+            }
+            found[h] = (bm, self.res_lin[bm] * self.fl[bm]);
         }
+        let amp = |i: usize| found[i].1;
+        // a smooth decaying envelope from the note's own lowest partials: a chord tone or melody note
+        // sitting on a high partial of a bass note lifts that partial far above what the bass alone
+        // would put there, and the excess survives the cancel
+        let beta = tun!(ENV_BETA);
+        let reference = if n >= 2 { amp(1).max(amp(2) * 2f32.powf(beta) * tun!(ENV_H2)) } else { amp(1) };
         for h in 1..=n {
-            let amp = |i: usize| found[i].1;
             let smooth = if h == 1 {
                 amp(1)
             } else if h < n {
@@ -711,10 +870,13 @@ impl PianoTracker {
             } else {
                 amp(h).min(amp(h - 1))
             };
+            let sub = if h >= 2 { smooth.min(reference * tun!(ENV_K) * (h as f32).powf(-beta)) } else { smooth };
             let c = found[h].0;
-            for b in c - 1..=c + 1 {
-                self.res_lin[b] = (self.res_lin[b] - smooth).max(0.0);
-                self.res[b] = comp(self.res_lin[b]);
+            if self.fl[c] > 0.0 {
+                self.res_lin[c] = (self.res_lin[c] - sub / self.fl[c]).max(0.0);
+                self.res[c] = comp(self.res_lin[c]);
+            }
+            for b in c - 1..=(c + 1).min(NBINS - 1) {
                 self.explained[b] = true;
             }
         }
@@ -749,6 +911,31 @@ impl PianoTracker {
             let c = self.pb[k][h] as usize;
             self.res_lin[c - 1].max(self.res_lin[c]).max(self.res_lin[c + 1]) >= tun!(FUND_MIN)
         })
+    }
+
+    /// The share of key k's harmonic weight on partials no earlier pick has claimed, floored at
+    /// UNCLAIMED_MIN: a key whose partials were partly taken is judged on the evidence left to it
+    /// rather than against the full absolute threshold.
+    fn unclaimed(&self, k: usize) -> f32 {
+        let lo = tun!(UNCLAIMED_MIN);
+        if lo >= 1.0 || self.picked.is_empty() {
+            return 1.0;
+        }
+        let (mut all, mut free, mut w) = (0f32, 0f32, 1f32);
+        let decay = tun!(HARM_DECAY);
+        for h in 0..self.nh[k] as usize {
+            let c = self.pb[k][h] as usize;
+            all += w;
+            if !self.explained[c] {
+                free += w;
+            }
+            w *= decay;
+        }
+        if all <= 0.0 {
+            1.0
+        } else {
+            (free / all).max(lo)
+        }
     }
 
     fn sounding(&self, k: usize) -> bool {
@@ -800,7 +987,7 @@ impl PianoTracker {
                 let on = self.sounding(k);
                 let (abs, rel) = if on { (tun!(OFF_ABS), tun!(OFF_REL)) } else { (tun!(ON_ABS), tun!(ON_REL)) };
                 // the top keys have only one or two partials under the Nyquist limit
-                let abs = abs * self.wfrac[k];
+                let abs = abs * self.wfrac[k] * self.unclaimed(k);
                 if s < abs {
                     continue;
                 }
@@ -860,7 +1047,7 @@ impl PianoTracker {
         for i in j - RESTRIKE_LOOK as i64..j {
             lo = lo.min(g(i));
         }
-        g(j) / lo.max(1e-7)
+        g(j) / lo.max(1e-12)
     }
 
     /// Whether key k's gate energy rose by ONSET_RISE within the last ONSET_WIN frames, and rose at
@@ -885,20 +1072,84 @@ impl PianoTracker {
     /// ghost rule have already judged it.
     fn orphan_harmonic(&self, k: usize) -> bool {
         HARMONIC_STEPS.iter().any(|&d| {
-            k >= d && self.sounding(k - d) && !self.picked.contains(&(k - d))
+            k >= d
+                && ((self.sounding(k - d) && !self.picked.contains(&(k - d)))
+                    // or a held key being re-struck right now: its attack lifts all its partials
+                    || matches!(self.state[k - d], KeyState::Pending { proven: true, .. }))
         })
     }
 
-    fn velocity(&mut self, k: usize, from: i64, to: i64) -> u8 {
+    /// Velocity from the peak fast energy in [from, to], against the AGC reference `agc` (the first
+    /// notes of a stream are their own reference). Returns (velocity, the peak in dB).
+    fn velocity(&self, k: usize, from: i64, to: i64, agc: Option<f32>) -> (u8, f32) {
         let mut pk = 0f32;
         for f in from.max(to - RING as i64 + 1)..=to {
             pk = pk.max(self.energy_at(k, f));
         }
-        let db = 20.0 * pk.max(1e-7).log10();
-        let agc = *self.agc_db.get_or_insert(db);
-        // per-note AGC: about the last 10 notes set the reference, so the volume knob doesn't move everything
-        self.agc_db = Some(agc + (db - agc) * 0.1);
-        (90.0 + 1.5 * (db - agc)).round().clamp(1.0, 127.0) as u8
+        let db = 20.0 * pk.max(1e-12).log10();
+        let reference = agc.unwrap_or(db);
+        (((90.0 + 1.5 * (db - reference)).round().clamp(1.0, 127.0)) as u8, db)
+    }
+
+    /// Whether a held key k re-strikes at frame f (see the constants): all of its fast partials lift
+    /// together, either steeply (a 4-frame rise of RESTRIKE_FAST, faster than any tremolo or swell),
+    /// or by RESTRIKE within RESTRIKE_LATCH frames after a strong broadband flux onset (a hammer on a
+    /// sampled or real piano, whose partials can rise slowly over the damper dip). Only frames after
+    /// the last attack settled count.
+    fn restrike(&self, k: usize, f: i64) -> Option<f32> {
+        let settled = self.last_trig[k] + EHALF + 1;
+        let e = self.energy_at(k, f);
+        let he = self.henergy[k][f.rem_euclid(RING as i64) as usize];
+        let rise = |look: i64| -> (f32, usize) {
+            let mut lo = f32::MAX;
+            let mut hlo = [f32::MAX; 4];
+            let from = (f - look).max(settled);
+            if from >= f {
+                return (0.0, 0);
+            }
+            for j in from..f {
+                lo = lo.min(self.energy_at(k, j));
+                let hj = &self.henergy[k][j.rem_euclid(RING as i64) as usize];
+                for h in 0..4 {
+                    hlo[h] = hlo[h].min(hj[h]);
+                }
+            }
+            // only partials that carry energy count (a near-silent partial wobbles by any ratio)
+            let top = he.iter().fold(0f32, |a, &v| a.max(v));
+            let lifted = (0..4).filter(|&h| he[h] >= 0.15 * top && he[h] > tun!(RESTRIKE_PART) * hlo[h].max(1e-12)).count();
+            // the rise must come out of a dip: somewhere in the window the energy fell under DIP times
+            // its peak before that point (since the last attack). A slow attack (bowed, blown, sung)
+            // keeps rising and never dips, so it is not a re-strike
+            let mut m = (self.last_trig[k].max(f - RING as i64 + 1)..from).map(|j| self.energy_at(k, j)).fold(0f32, f32::max);
+            let mut dipped = false;
+            for j in from..f {
+                let ej = self.energy_at(k, j);
+                if ej <= tun!(RESTRIKE_DIP) * m {
+                    dipped = true;
+                }
+                m = m.max(ej);
+            }
+            if !dipped {
+                return (0.0, 0);
+            }
+            (e / lo.max(1e-12), lifted)
+        };
+        let (r4, l4) = rise(4);
+        if r4 >= tun!(RESTRIKE_FAST) && l4 >= 3 {
+            return Some(r4);
+        }
+        let latch = RESTRIKE_LATCH as i64;
+        let g = |j: i64| self.gflux[j.rem_euclid(RING as i64) as usize];
+        // a rising flux onset after the last attack settled (a chord's own attack flux is falling by
+        // then); the frame after it must exist, so f itself only counts as that neighbour
+        // (an attack can spread its flux over two frames: their sum counts too)
+        let onset = ((f - latch).max(settled + 1)..f)
+            .any(|j| (g(j) >= tun!(GF_ONSET) || g(j) + g(j + 1) >= 1.6 * tun!(GF_ONSET)) && g(j) > g(j - 1));
+        if !onset {
+            return None;
+        }
+        let (r8, l8) = rise(latch + 2);
+        (r8 >= tun!(RESTRIKE) && l8 >= 3).then_some(r8)
     }
 
     fn track(&mut self, out: &mut Vec<Ev>) {
@@ -906,6 +1157,31 @@ impl PianoTracker {
         let f = self.frame;
         let min_frames = (MIN_NOTE_S * RATE as f64 / HOP as f64).ceil() as i64;
         let retrig = (RETRIG_S * RATE as f64 / HOP as f64).ceil() as i64;
+        // velocities of this frame's notes are measured against the AGC as it was before the frame
+        let agc0 = self.agc_db;
+        let mut agc_new: Vec<f32> = Vec::new();
+        // re-strike candidates first: when keys that share partials (an octave, twelfth, ...) rise
+        // together, only the one with the larger own rise is re-struck (C3 struck lifts the partials
+        // of a held C2 too)
+        let mut rs: Vec<Option<f32>> = vec![None; KEYS];
+        for k in 0..KEYS {
+            // running peak of the sounding note's fast energy, measured up to the previous frame
+            if matches!(self.state[k], KeyState::On { .. }) {
+                let prev = self.energy_at(k, f - 1);
+                self.peak_e[k] = self.peak_e[k].max(prev);
+            }
+            if matches!(self.state[k], KeyState::On { .. }) && self.picked.contains(&k) && f - self.last_trig[k] >= retrig {
+                rs[k] = self.restrike(k, f);
+            }
+        }
+        let strike: Vec<bool> = (0..KEYS)
+            .map(|k| {
+                let Some(r) = rs[k] else { return false };
+                !HARMONIC_STEPS.iter().any(|&d| {
+                    (k + d < KEYS && rs[k + d].is_some_and(|q| q >= r)) || (k >= d && rs[k - d].is_some_and(|q| q > r))
+                })
+            })
+            .collect();
         for k in 0..KEYS {
             let active = self.picked.contains(&k);
             let pitch = LOW_KEY + k as u8;
@@ -913,72 +1189,105 @@ impl PianoTracker {
                 KeyState::Idle => {
                     // a note starts only at an attack of its own: a key that drifts into the pick
                     // list in the middle of other notes (their partials decaying unevenly) does not
-                    if active && self.recent_rise(k, f) && !self.orphan_harmonic(k) {
-                        self.state[k] = KeyState::Pending { act: f };
+                    if active && self.recent_rise(k, f) && !self.orphan_harmonic(k) && self.restart_ok(k, f) && !self.semitone_shadow(k) {
+                        self.state[k] = KeyState::Pending { act: f, floor: self.ended[k] + 1, proven: false };
                         self.quiet[k] = 0;
                     }
                 }
-                KeyState::Pending { act } => {
-                    if !active {
+                KeyState::Pending { act, floor, proven } => {
+                    if !active && !proven {
                         self.quiet[k] += 1;
-                        if self.quiet[k] >= OFF_FRAMES {
+                        if self.quiet[k] >= Self::off_frames(k) {
                             self.state[k] = KeyState::Idle;
                         }
                         continue;
                     }
                     self.quiet[k] = 0;
-                    if f - act + 1 >= min_frames {
-                        // never reach back past the previous note's attack on this key
-                        let o = self.onset_frame(k, (act - ONSET_WIN as i64 - 4).max(self.last_trig[k] + 1), f);
+                    // a new note goes out after MIN_NOTE_S of being picked; a re-strike once its
+                    // attack has peaked (it was already sounding, so it needs no 60 ms proof)
+                    let due = if proven { f >= act + EHALF + 2 } else { f - act + 1 >= min_frames };
+                    if due {
+                        // never reach back past the previous note's attack or its end on this key
+                        let from = (act - ONSET_WIN as i64 - 4).max(self.last_trig[k] + 1).max(floor);
+                        let o = self.onset_frame(k, from, f);
                         let t0 = Self::centre_s(o);
-                        let vel = self.velocity(k, o, f);
+                        let (vel, db) = self.velocity(k, o, f, agc0);
+                        agc_new.push(db);
                         out.push(Ev::On { t: t0, pitch, vel });
-                        self.state[k] = KeyState::On { t0, since: o };
+                        self.state[k] = KeyState::On { t0 };
+                        self.peak_e[k] = (o..f).map(|j| self.energy_at(k, j)).fold(0f32, f32::max);
                         self.last_trig[k] = o;
                     }
                 }
-                KeyState::On { t0, since } => {
+                KeyState::On { t0 } => {
                     if !active {
                         self.quiet[k] += 1;
-                        if self.quiet[k] >= OFF_FRAMES {
-                            let t = Self::centre_s(f - self.quiet[k] as i64 + 1).max(t0 + MIN_NOTE_S);
+                        if self.quiet[k] >= Self::off_frames(k) {
+                            let fo = f - self.quiet[k] as i64 + 1;
+                            let t = Self::centre_s(fo).max(t0 + MIN_NOTE_S);
                             out.push(Ev::Off { t, pitch });
                             self.state[k] = KeyState::Idle;
+                            self.ended[k] = Self::frame_of(t);
                         }
                         continue;
                     }
                     self.quiet[k] = 0;
-                    // a re-strike: the short-window energy jumps over its level since the last
-                    // attack settled (half a window after that onset)
-                    let settled = self.last_trig[k] + self.ehalf[k] as i64;
-                    if f - self.last_trig[k] >= retrig && f - settled >= 2 {
-                        let mut lo = f32::MAX;
-                        let mut hlo = [f32::MAX; 4];
-                        for j in (f - RESTRIKE_LOOK as i64).max(settled)..f {
-                            lo = lo.min(self.energy_at(k, j));
-                            let he = &self.henergy[k][j.rem_euclid(RING as i64) as usize];
-                            for h in 0..4 {
-                                hlo[h] = hlo[h].min(he[h]);
-                            }
-                        }
-                        let e = self.energy_at(k, f);
-                        // a hammer lifts all the partials at once and shows in the global flux; a
-                        // neighbouring chord tone beating inside the wide fast bins lifts one or two
-                        // partials and leaves the global flux flat
-                        let he = self.henergy[k][f.rem_euclid(RING as i64) as usize];
-                        let lifted = (0..4).filter(|&h| he[h] > RESTRIKE_PART * hlo[h].max(1e-6)).count();
-                        let global = (0..3).any(|j| self.gflux[(f - j).rem_euclid(RING as i64) as usize] >= tun!(GF_ONSET));
-                        if e > tun!(RESTRIKE) * lo.max(1e-6) && lifted >= 3 && global {
-                            let t = Self::centre_s(f).max(t0 + MIN_NOTE_S);
-                            out.push(Ev::Off { t, pitch });
-                            self.state[k] = KeyState::Pending { act: f };
-                            self.last_trig[k] = f;
-                        }
+                    if strike[k] {
+                        // the old note ends where the new attack starts, so the two never overlap
+                        let o = self.onset_frame(k, (f - RESTRIKE_LATCH as i64 - 2).max(self.last_trig[k] + 1), f);
+                        let t = Self::centre_s(o).max(t0 + MIN_NOTE_S);
+                        out.push(Ev::Off { t, pitch });
+                        // the key was already sounding, so the new strike needs no 60 ms proof: it
+                        // goes out once its attack has peaked (for the velocity), and a dip right
+                        // after the strike can't lose it
+                        let fl = Self::frame_of(t);
+                        self.ended[k] = fl;
+                        self.state[k] = KeyState::Pending { act: f, floor: fl, proven: true };
+                        self.last_trig[k] = fl - 1;
                     }
-                    let _ = since;
                 }
             }
         }
+        if !agc_new.is_empty() {
+            let mean = agc_new.iter().sum::<f32>() / agc_new.len() as f32;
+            let a = agc0.unwrap_or(mean);
+            // per-note AGC: about the last 10 notes set the reference
+            self.agc_db = Some(a + (mean - a) * (0.1 * agc_new.len() as f32).min(1.0));
+        }
+    }
+
+    /// A new key right next to a much stronger picked key (a semitone away) is its shadow: an
+    /// intermodulation or clipping product on the stronger note's partials, not a minor second.
+    fn semitone_shadow(&self, k: usize) -> bool {
+        let sk = self.salr[k];
+        [k.wrapping_sub(1), k + 1].iter().any(|&q| q < KEYS && self.picked.contains(&q) && sk < tun!(SEMI_K) * self.salr[q])
+    }
+
+    /// A key that ended moments ago restarts only out of a real dip of its own energy: a bowed or
+    /// sung note that the pick dropped for a frame or two in its slow attack, and that is still
+    /// rising, is not a new note.
+    fn restart_ok(&self, k: usize, f: i64) -> bool {
+        let e0 = self.ended[k];
+        if f - e0 > RESTART_WIN || self.peak_e[k] <= 0.0 {
+            return true;
+        }
+        let lo = (e0.max(f - RING as i64 + 1)..=f).map(|j| self.energy_at(k, j)).fold(f32::MAX, f32::min);
+        lo <= tun!(RESTART_DIP) * self.peak_e[k]
+    }
+
+    /// Quiet frames before a key is off: 2 where the short windows judge it, more where the long
+    /// window does (a re-strike or a damper dip blurs a low key's peak for several 11.6 ms frames).
+    fn off_frames(k: usize) -> u32 {
+        match size_for(LOW_KEY as f64 + k as f64) {
+            0 => OFF_FRAMES + tun!(OFF_EXTRA_LOW) as u32,
+            1 => OFF_FRAMES + tun!(OFF_EXTRA_MID) as u32,
+            _ => OFF_FRAMES,
+        }
+    }
+
+    /// The first frame whose centre is at or after t.
+    fn frame_of(t: f64) -> i64 {
+        (t * RATE as f64 / HOP as f64 - 1e-9).ceil() as i64
     }
 }
 
@@ -1022,18 +1331,20 @@ impl Default for Decim2 {
 }
 
 impl Decim2 {
-    const N: usize = 63;
+    /// Halfband length: (N - 1) / 2 = 94 input samples of delay, 47 output samples.
+    const N: usize = 189;
 
     pub fn new() -> Decim2 {
         let n = Self::N;
-        let fc = 0.45 / 2.0; // cycles per input sample
         let mid = (n - 1) as f64 / 2.0;
+        // halfband (cut at a quarter of the input rate), Kaiser beta 10: about -120 dB from 12 kHz, flat to 10 kHz,
+        // so nothing above the analysis band folds back into it (an ultrasonic tone stays silent at
+        // any input level)
         let mut taps: Vec<f32> = (0..n)
             .map(|i| {
                 let d = i as f64 - mid;
-                let sinc = if d == 0.0 { 2.0 * fc } else { (2.0 * std::f64::consts::PI * fc * d).sin() / (std::f64::consts::PI * d) };
-                let w = 0.42 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / (n - 1) as f64).cos() + 0.08 * (4.0 * std::f64::consts::PI * i as f64 / (n - 1) as f64).cos();
-                (sinc * w) as f32
+                let sinc = if d == 0.0 { 0.5 } else { (std::f64::consts::PI * 0.5 * d).sin() / (std::f64::consts::PI * d) };
+                (sinc * kaiser(d / mid, 12.0)) as f32
             })
             .collect();
         let s: f32 = taps.iter().sum();
@@ -1045,7 +1356,7 @@ impl Decim2 {
     }
 
     /// Group delay in output samples.
-    pub const DELAY_OUT: usize = 16;
+    pub const DELAY_OUT: usize = (Self::N - 1) / 4;
 
     pub fn push(&mut self, x: &[f32], out: &mut Vec<f32>) {
         let n = Self::N;
@@ -1057,7 +1368,15 @@ impl Decim2 {
         for j in first..last {
             let end = (2 * j - self.base) as usize + n; // exclusive, buf coordinates
             let w = &self.buf[end - n..end];
-            out.push(w.iter().zip(&self.taps).map(|(a, b)| a * b).sum());
+            // halfband: every other tap is zero except the centre, and the rest are symmetric
+            let mid = (n - 1) / 2;
+            let mut acc = w[mid] * self.taps[mid];
+            let mut i = 1;
+            while i <= mid {
+                acc += (w[mid - i] + w[mid + i]) * self.taps[mid + i];
+                i += 2;
+            }
+            out.push(acc);
         }
         // keep the last N-1 samples before the next even input
         let next_even = last * 2;
@@ -1104,6 +1423,70 @@ impl Downmix {
     }
 }
 
+/// Kaiser window at x in [-1, 1].
+fn kaiser(x: f64, beta: f64) -> f64 {
+    fn i0(x: f64) -> f64 {
+        let (mut sum, mut term) = (1.0, 1.0);
+        for k in 1..40 {
+            term *= (x / 2.0 / k as f64).powi(2);
+            sum += term;
+        }
+        sum
+    }
+    if x.abs() > 1.0 {
+        0.0
+    } else {
+        i0(beta * (1.0 - x * x).sqrt()) / i0(beta)
+    }
+}
+
+/// Mono resampling for any pair of rates: a Kaiser-windowed sinc (cut at 0.45 of the lower rate,
+/// 32 zero crossings a side, beta 12) read from a table, so it costs a multiply-add per tap instead
+/// of a sin and a cos (`dsp::resample` took 23.6 ms per 0.5 s for 48 kHz files).
+pub fn resample_mono(x: &[f32], from: u32, to: u32) -> Vec<f32> {
+    const ZC: f64 = 32.0;
+    const OVER: usize = 2048;
+    let lo = from.min(to) as f64;
+    let fc = 0.45 * lo / from as f64; // cutoff, cycles per input sample
+    let half = ZC * from as f64 / lo; // input samples per side
+    let table: Vec<f32> = (0..=(ZC as usize * OVER + 1))
+        .map(|i| {
+            let u = i as f64 / OVER as f64; // in zero crossings of the lower rate
+            let d = u * from as f64 / lo; // in input samples
+            let arg = 2.0 * fc * d;
+            let sinc = if arg.abs() < 1e-12 { 1.0 } else { (std::f64::consts::PI * arg).sin() / (std::f64::consts::PI * arg) };
+            (2.0 * fc * sinc * kaiser(u / ZC, 12.0)) as f32
+        })
+        .collect();
+    let g = |d: f64| -> f32 {
+        let u = d.abs() * lo / from as f64 * OVER as f64;
+        let i = u as usize;
+        if i + 1 >= table.len() {
+            return 0.0;
+        }
+        let fr = (u - i as f64) as f32;
+        table[i] * (1.0 - fr) + table[i + 1] * fr
+    };
+    let out_n = (x.len() as f64 * to as f64 / from as f64).round() as usize;
+    let mut out = Vec::with_capacity(out_n);
+    for j in 0..out_n {
+        let t = j as f64 * from as f64 / to as f64;
+        let (m0, m1) = ((t - half).ceil().max(0.0) as usize, ((t + half).floor() as usize).min(x.len().saturating_sub(1)));
+        let (mut acc, mut norm) = (0f32, 0f32);
+        let mut m = (t - half).ceil() as i64;
+        while (m as f64) <= t + half {
+            let h = g(t - m as f64);
+            norm += h;
+            if m >= m0 as i64 && m <= m1 as i64 && !x.is_empty() {
+                acc += h * x[m as usize];
+            }
+            m += 1;
+        }
+        out.push(if norm != 0.0 { acc / norm } else { 0.0 });
+    }
+    out
+}
+
 /// Mono PCM at any rate -> mono at RATE.
 pub fn to_rate(mono: &[f32], rate: u32) -> Vec<f32> {
     if rate == RATE {
@@ -1116,8 +1499,7 @@ pub fn to_rate(mono: &[f32], rate: u32) -> Vec<f32> {
         d.push(&vec![0.0; 2 * Decim2::DELAY_OUT], &mut out);
         return out[Decim2::DELAY_OUT..].to_vec();
     }
-    let st: Vec<f32> = mono.iter().flat_map(|&v| [v, v]).collect();
-    crate::dsp::resample(&st, rate, RATE).iter().step_by(2).copied().collect()
+    resample_mono(mono, rate, RATE)
 }
 
 /// Offline: mono PCM at `rate` -> piano notes.

@@ -22,12 +22,18 @@ pub(crate) fn diag(est: &[Note], gt: &[Note]) -> String {
     let hit = |a: &Note, b: &Note| a.pitch == b.pitch && (a.t - b.t).abs() <= TOL;
     let sounding = |p: i32, t: f64, set: &[Note]| set.iter().any(|g| g.pitch as i32 == p && t >= g.t - TOL && t <= g.t + g.dur + 0.1);
     let mut fp = std::collections::BTreeMap::<&str, usize>::new();
+    let mut splits: Vec<String> = Vec::new();
     for e in est {
         if gt.iter().any(|g| hit(e, g)) {
             continue;
         }
         let p = e.pitch as i32;
         let kind = if sounding(p, e.t, gt) {
+            if splits.len() < 30 {
+                let g = gt.iter().filter(|g| g.pitch == e.pitch && g.t <= e.t + TOL).map(|g| g.t).fold(f64::MIN, f64::max);
+                let prev_end = est.iter().filter(|x| x.pitch == e.pitch && x.t < e.t - 1e-6).map(|x| x.t + x.dur).fold(f64::MIN, f64::max);
+                splits.push(format!("{}@{:.2}(+{:.0}ms,gap{:.0})", e.pitch, e.t, (e.t - g) * 1000.0, (e.t - prev_end) * 1000.0));
+            }
             "split/late"
         } else if [12, 24, 36].iter().any(|d| sounding(p - d, e.t, gt)) {
             "octave-up"
@@ -61,7 +67,7 @@ pub(crate) fn diag(est: &[Note], gt: &[Note]) -> String {
         *fn_.entry(kind).or_default() += 1;
     }
     absent.truncate(40);
-    format!("FP {fp:?} FN {fn_:?} absent {absent:?}")
+    format!("FP {fp:?} FN {fn_:?} absent {absent:?} splits {splits:?}")
 }
 
 fn run(x: &[f32]) -> Vec<Note> {
@@ -228,11 +234,12 @@ fn octave_and_fifth_dyads() {
         gt.iter().filter(|g| !est.iter().any(|e| e.pitch == g.pitch && (e.t - g.t).abs() <= TOL)).map(|g| (g.pitch, g.t)).collect();
     eprintln!("DBG around 20.1: {}", names(&est.iter().filter(|e| e.t > 19.8 && e.t < 20.8).cloned().collect::<Vec<_>>()));
     eprintln!("METRIC dyads: {} notes: P {p:.3} R {r:.3} F1 {f:.3}; missed {missed:?}; ghosts {ghosts:?}", gt.len());
-    // Plan target: every dyad note found and no ghost key. NOT MET: measured R 0.924 / P 0.875 at
-    // the chosen tuning (an equal-velocity octave on top of a note shares all of its partials). These
-    // floors pin the measured level so a regression shows; the gap is reported in the PR.
-    assert!(r >= 0.90, "dyad recall {r:.3}, missed {missed:?}");
-    assert!(p >= 0.85, "dyad precision {p:.3}, ghost keys {ghosts:?}");
+    // KNOWN GAP #31. Plan target: every dyad note found and no ghost key. NOT MET: measured
+    // R 0.965 / P 0.897 (fix round 2; an equal-velocity octave on top of a note shares all of its
+    // partials). The floors sit just under the measured values, so any tuning change that costs a
+    // note or two trips them, which is the intent.
+    assert!(r >= 0.96, "dyad recall {r:.3}, missed {missed:?}");
+    assert!(p >= 0.88, "dyad precision {p:.3}, ghost keys {ghosts:?}");
 }
 
 /// Fast repeated notes, 8 per second: each key is held 90 ms and its damper (30 ms) is still
@@ -409,13 +416,13 @@ fn debug_dump() {
         to = from + 0.6;
     }
     let mut tr = PianoTracker::new();
-    for (i, c) in x.chunks(HOP).enumerate() {
+    for c in x.chunks(HOP) {
         let ev = tr.push(c);
         let tnow = (tr.frame - 1) as f64 * HOP as f64 / RATE as f64;
         if tnow < from || tnow > to {
             continue;
         }
-        if i % 4 == 0 || !ev.is_empty() || std::env::var("DBG_REP").is_ok() {
+        if true {
             let k = (p - 21) as usize;
             let sl = (tr.frame - 1).rem_euclid(RING as i64) as usize;
             let e: Vec<String> = tr.henergy[k][sl].iter().map(|v| format!("{:.4}", v)).collect();
@@ -496,6 +503,62 @@ pub(crate) fn fixture_pieces() -> Vec<(&'static str, Vec<Note>)> {
     out
 }
 
+/// Melody-over-chords material: (left-hand chords + bass, right-hand melody in C5..C6).
+pub(crate) fn melody_material() -> (Vec<Note>, Vec<Note>, Vec<Note>) {
+    // 16 bars at 90 bpm (beat 0.667 s), I-vi-IV-V in C, then ii-V-I-I
+    let beat = 60.0 / 90.0;
+    let prog: [(u8, [u8; 3]); 8] = [
+        (48, [55, 64, 60]),
+        (45, [57, 64, 60]),
+        (41, [57, 65, 60]),
+        (43, [59, 67, 62]),
+        (50, [57, 65, 62]),
+        (43, [59, 65, 62]),
+        (48, [55, 64, 60]),
+        (48, [55, 64, 60]),
+    ];
+    // melody per bar: (beat offset, length in beats, pitch), C5..C6
+    let bars: [&[(f64, f64, u8)]; 8] = [
+        &[(0.0, 1.0, 76), (1.0, 0.5, 79), (1.5, 0.5, 77), (2.0, 1.0, 76), (3.0, 1.0, 72)],
+        &[(0.0, 1.5, 81), (1.5, 0.5, 79), (2.0, 1.0, 76), (3.0, 1.0, 74)],
+        &[(0.0, 1.0, 77), (1.0, 1.0, 81), (2.0, 0.5, 84), (2.5, 0.5, 81), (3.0, 1.0, 77)],
+        &[(0.0, 2.0, 79), (2.0, 0.5, 77), (2.5, 0.5, 76), (3.0, 1.0, 74)],
+        &[(0.0, 1.0, 74), (1.0, 1.0, 77), (2.0, 1.0, 81), (3.0, 1.0, 77)],
+        &[(0.0, 1.0, 79), (1.0, 0.5, 83), (1.5, 0.5, 81), (2.0, 2.0, 79)],
+        &[(0.0, 0.5, 76), (0.5, 0.5, 79), (1.0, 1.0, 84), (2.0, 1.0, 83), (3.0, 1.0, 79)],
+        &[(0.0, 3.0, 72), (3.0, 1.0, 76)],
+    ];
+    let (mut bass, mut chords, mut mel) = (Vec::new(), Vec::new(), Vec::new());
+    for rep in 0..2 {
+        for (b, (root, tri)) in prog.iter().enumerate() {
+            let t0 = 0.5 + (rep * 8 + b) as f64 * 4.0 * beat;
+            bass.push(n(t0, 4.0 * beat * 0.95, *root - 12, 72));
+            for half in 0..2 {
+                for &p in tri {
+                    chords.push(n(t0 + half as f64 * 2.0 * beat, 2.0 * beat * 0.9, p, 58));
+                }
+            }
+            for &(o, l, p) in bars[b] {
+                mel.push(n(t0 + o * beat, l * beat * 0.92, p, 88));
+            }
+        }
+    }
+    (bass, chords, mel)
+}
+
+/// Fixture songs for the melody check: (name, [(GM program, notes)], melody notes).
+pub(crate) fn melody_fixtures() -> Vec<(&'static str, Vec<(u8, Vec<Note>)>, Vec<Note>)> {
+    let (bass, chords, mel) = melody_material();
+    let mut lh = bass.clone();
+    lh.extend(chords.iter().cloned());
+    vec![
+        // a pianist: left-hand bass and chords, right-hand tune
+        ("melody", vec![(0, lh.clone()), (0, mel.clone())], mel.clone()),
+        // a band: flute tune, piano chords, fingered bass (the tune is not a piano)
+        ("band", vec![(73, mel.clone()), (0, chords.clone()), (33, bass.clone())], mel),
+    ]
+}
+
 /// FluidSynth renders of known MIDI (FluidR3_GM, Acoustic Grand, default reverb/chorus), transcribed.
 /// fluidsynth is on the PC only (host or through distrobox-host-exec), hence #[ignore].
 #[test]
@@ -507,10 +570,16 @@ fn fluidsynth_fixtures() {
     let bin = crate::notes::synth_bin();
     let mut worst = 1.0f64;
     let mut report = Vec::new();
-    for (name, gt) in fixture_pieces() {
+    let mut pieces: Vec<(&str, Vec<(u8, Vec<Note>)>, Vec<Note>)> = fixture_pieces().into_iter().map(|(n, v)| (n, vec![(0u8, v)], Vec::new())).collect();
+    pieces.extend(melody_fixtures());
+    let mut fails = Vec::new();
+    for (name, parts, melody) in pieces {
+        let gt: Vec<Note> = parts.iter().flat_map(|p| p.1.iter().cloned()).collect();
         let mid = dir.join(format!("{name}.mid"));
         let wav = dir.join(format!("{name}.wav"));
-        std::fs::write(&mid, crate::notes::piano_midi(&gt, false, Some(0.0))).unwrap();
+        let tracks: Vec<(crate::notes::TrackSpec, Vec<Note>)> =
+            parts.iter().enumerate().map(|(i, (prog, v))| (crate::notes::TrackSpec { ch: i as u8, prog: Some(*prog), name: None }, v.clone())).collect();
+        std::fs::write(&mid, crate::notes::smf_bytes(&tracks, Some(0.0))).unwrap();
         // FluidSynth's default reverb and chorus stay on (a song has a room too); PIANO_FIX_DRY=1 turns them off
         let dry = std::env::var("PIANO_FIX_DRY").is_ok();
         let wav = if dry { dir.join(format!("{name}-dry.wav")) } else { wav };
@@ -534,11 +603,25 @@ fn fluidsynth_fixtures() {
         eprintln!("METRIC diag {name}: {}", diag(&est, &gt));
         eprintln!("METRIC fluidsynth {name}: {} ref notes, {} est: P {p:.3} R {r:.3} F1 {f:.3}", gt.len(), est.len());
         report.push((name, f));
-        // Plan target: F1 >= 0.75 for every piece. NOT MET for "chords" (5-note voicings over a bass
-        // octave, where most chord tones are partials of the bass): measured 0.455. Its floor pins
-        // the measured level; the gap is reported in the PR.
-        let floor = if name == "chords" { 0.40 } else { 0.75 };
-        assert!(f >= floor, "{name}: F1 {f:.3} < {floor}");
+        if !melody.is_empty() {
+            let (_, mr, _) = note_f1(&est, &melody, TOL);
+            eprintln!("METRIC fluidsynth {name} melody recall {mr:.3} ({} melody notes)", melody.len());
+            if std::env::var("DBG_FIX").as_deref() == Ok(name) {
+                for m in &melody {
+                    let hit = est.iter().any(|e| e.pitch == m.pitch && (e.t - m.t).abs() <= TOL);
+                    let near: Vec<String> = est.iter().filter(|e| (e.t - m.t).abs() < 0.25).map(|e| format!("{}@{:+.0}", e.pitch, (e.t - m.t) * 1000.0)).collect();
+                    eprintln!("DBG mel {} @{:.2} {} | est {:?}", m.pitch, m.t, if hit { "ok  " } else { "MISS" }, near);
+                }
+            }
+            // the tune must come through: a pianist's right hand over left-hand chords
+            if name == "melody" && mr < 0.8 {
+                fails.push(format!("{name}: melody recall {mr:.3} < 0.8"));
+            }
+        }
+        let floor = fixture_floor(name);
+        if f < floor {
+            fails.push(format!("{name}: F1 {f:.3} < {floor}"));
+        }
         if std::env::var("DBG_FIX").as_deref() == Ok(name) {
             for w in 0..12 {
                 let (a, b) = (w as f64, w as f64 + 1.0);
@@ -550,4 +633,75 @@ fn fluidsynth_fixtures() {
         worst = worst.min(f);
     }
     eprintln!("METRIC fluidsynth worst {worst:.3}: {report:?}");
+    assert!(fails.is_empty(), "{}", fails.join("\n"));
+}
+
+/// Per-fixture F1 floor. The plan asks 0.75 everywhere. KNOWN GAP #31: "chords" (5-note voicings
+/// over a bass octave, most chord tones are partials of the bass) measures 0.660 after fix round 2
+/// (0.425 before); its floor pins that level so a regression shows. "chords" is the fixture closest
+/// to chord-heavy songs, so it is the number to expect by ear on them.
+fn fixture_floor(name: &str) -> f64 {
+    match name {
+        "chords" => CHORDS_FLOOR,
+        "band" => 0.0, // measured only: flute/bass timbres are not the piano target
+        "melody" => MELODY_FLOOR,
+        _ => 0.75,
+    }
+}
+const CHORDS_FLOOR: f64 = 0.62;
+/// KNOWN GAP #31: the melody fixture's F1, measured 0.740 (its melody recall, the target, is
+/// asserted >= 0.8 above and measures 0.879).
+const MELODY_FLOOR: f64 = 0.70;
+
+/// Live-path latency on real piano audio, measured the scout's way: FluidSynth renders at 44.1 kHz
+/// (run `fluidsynth_fixtures` first for the .mid files), fed as stereo in 10 ms chunks through
+/// Downmix and the tracker; each NoteOn's emission time minus its matched reference onset.
+/// Prints p50 / p90 / max and the share over 250 ms. FluidSynth on the PC only, hence #[ignore].
+#[test]
+#[ignore]
+fn fluidsynth_live_latency() {
+    let dir = crate::config::glib_home().join(".cache/wavelink-piano-fixtures");
+    let font = crate::notes::synth_font().expect("FluidR3_GM.sf2 missing");
+    let bin = crate::notes::synth_bin();
+    let mut all = Vec::new();
+    for name in ["scales", "chords", "piece", "melody"] {
+        let mid = dir.join(format!("{name}.mid"));
+        let wav = dir.join(format!("{name}-44k.wav"));
+        let args: Vec<String> = ["-ni", "-q", "-g", "0.6", "-r", "44100", "-F"]
+            .iter()
+            .map(|s| s.to_string())
+            .chain([wav.display().to_string(), font.display().to_string(), mid.display().to_string()])
+            .collect();
+        let st = if std::path::Path::new(bin).exists() {
+            std::process::Command::new(bin).args(&args).status()
+        } else {
+            std::process::Command::new("distrobox-host-exec").arg("/home/linuxbrew/.linuxbrew/bin/fluidsynth").args(&args).status()
+        };
+        assert!(st.map(|s| s.success()).unwrap_or(false), "fluidsynth failed for {name}");
+        let (mono, rate) = read_wav(&std::fs::read(&wav).unwrap()).unwrap();
+        assert_eq!(rate, 44100);
+        let gt: Vec<Note> = crate::notes::parse_smf(&std::fs::read(&mid).unwrap()).unwrap().into_iter().map(|p| p.note).collect();
+        let (mut tr, mut dm) = (PianoTracker::new(), Downmix::new());
+        let (mut fed, mut lat) = (0f64, Vec::new());
+        for c in mono.chunks(441) {
+            let st: Vec<f32> = c.iter().flat_map(|&v| [v, v]).collect();
+            let out = tr.push(&dm.push(&st));
+            fed += c.len() as f64 / 44100.0;
+            for e in &out {
+                if let Ev::On { t, pitch, .. } = e {
+                    if let Some(g) = gt.iter().filter(|g| g.pitch == *pitch && (g.t - t).abs() <= TOL).min_by(|a, b| (a.t - t).abs().total_cmp(&(b.t - t).abs())) {
+                        lat.push((fed - g.t) * 1000.0);
+                    }
+                }
+            }
+        }
+        lat.sort_by(|a, b| a.total_cmp(b));
+        let q = |f: f64| lat[((lat.len() as f64 * f).ceil() as usize).clamp(1, lat.len()) - 1];
+        let over = 100.0 * lat.iter().filter(|&&x| x > 250.0).count() as f64 / lat.len() as f64;
+        eprintln!("METRIC live latency {name}: p50 {:.0} p90 {:.0} max {:.0} ms, {over:.0}% > 250 ms (n={})", q(0.5), q(0.9), lat[lat.len() - 1], lat.len());
+        all.extend(lat);
+    }
+    all.sort_by(|a, b| a.total_cmp(b));
+    let q = |f: f64| all[((all.len() as f64 * f).ceil() as usize).clamp(1, all.len()) - 1];
+    eprintln!("METRIC live latency all: p50 {:.0} p90 {:.0} max {:.0} ms (n={})", q(0.5), q(0.9), all[all.len() - 1], all.len());
 }
