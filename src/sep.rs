@@ -228,6 +228,12 @@ pub const FRAME_THRESH: f32 = 0.3;
 pub const MIN_NOTE_FRAMES: usize = 11;
 pub const ENERGY_TOL: usize = 11;
 
+/// True when the window is silence for the transcriber (whole-window RMS below about -60 dBFS).
+pub fn is_silent(mono44: &[f32]) -> bool {
+    let rms = (mono44.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / mono44.len().max(1) as f64).sqrt();
+    rms < 1e-3
+}
+
 pub struct Transcriber {
     session: Session,
 }
@@ -243,8 +249,7 @@ impl Transcriber {
     pub fn notes(&mut self, mono44: &[f32]) -> Result<Vec<Note>, String> {
         // The model normalises its input, so near-silence (below about -60 dBFS RMS) looks like full-scale
         // noise to it and turns into notes. Treat it as silence.
-        let rms = (mono44.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / mono44.len().max(1) as f64).sqrt();
-        if rms < 1e-3 {
+        if is_silent(mono44) {
             return Ok(Vec::new());
         }
         // Mono -> stereo -> 22.05 kHz, then one channel.
