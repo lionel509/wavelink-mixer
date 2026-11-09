@@ -1,0 +1,18 @@
+[package]
+name = "wavelink-remote"
+version = "0.1.0"
+edition = "2021"
+description = "Wavelink Remote: view and control a wavelink-mixer engine over the LAN"
+
+[[bin]]
+name = "wavelink-remote"
+path = "src/main.rs"
+
+[dependencies]
+wavelink-proto = { path = "../proto" }
+eframe = { version = "=0.36.2" }
+tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
+mdns-sd = "=0.21.5"
+dirs = "=6.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
