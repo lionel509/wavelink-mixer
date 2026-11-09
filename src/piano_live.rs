@@ -257,6 +257,10 @@ pub struct Inner {
     /// tracker's harmonic salience on the whitened spectrum, square-root scaled against a peak
     /// that falls 3 dB/s.
     pub spec: VecDeque<(f64, Vec<f32>)>,
+    /// What the subtraction kept, same layout as `spec`: per key the amplitude of the note found
+    /// there (0..1 over 40 dB under the running loudest), 0 where none was found. Empty with the
+    /// old tracker core.
+    pub found: VecDeque<(f64, Vec<f32>)>,
     /// The detected chord right now, e.g. "F", "Bbmaj7", "Dm7"; empty when there is none.
     pub chord: String,
 }
@@ -346,6 +350,7 @@ impl Inner {
         self.roll.clear();
         self.roll_part.clear();
         self.spec.clear();
+        self.found.clear();
         for o in self.open.iter_mut() {
             o.3 = false;
         }
@@ -446,11 +451,59 @@ fn spawn_tap(o: &Opts) -> Result<Child, String> {
     cmd.spawn().map_err(|e| format!("{}: {e}", crate::stems::TAP_BIN))
 }
 
+/// Appends a row to a per-key ring, reusing the row that falls out of the SPEC_KEEP_S window.
+fn push_ring(ring: &mut VecDeque<(f64, Vec<f32>)>, now: f64, vals: &[f32]) {
+    let mut row = match ring.front() {
+        Some(&(t, _)) if now - t > SPEC_KEEP_S => ring.pop_front().map(|x| x.1).unwrap_or_default(),
+        _ => Vec::with_capacity(vals.len()),
+    };
+    row.clear();
+    row.extend_from_slice(vals);
+    ring.push_back((now, row));
+    while ring.front().is_some_and(|&(t, _)| now - t > SPEC_KEEP_S + 0.5) {
+        ring.pop_front();
+    }
+}
+
+/// The live note source: the subtraction core (default) or the old tracker (MIXER_PIANO_CORE=tracker).
+enum Core {
+    Sub(Box<crate::subtract::SubTracker>),
+    Tracker(Box<PianoTracker>),
+}
+
+impl Core {
+    fn new() -> Core {
+        if std::env::var("MIXER_PIANO_CORE").as_deref() == Ok("tracker") {
+            Core::Tracker(Box::new(PianoTracker::new()))
+        } else {
+            Core::Sub(Box::new(crate::subtract::SubTracker::new()))
+        }
+    }
+    fn push(&mut self, x: &[f32]) -> Vec<Ev> {
+        match self {
+            Core::Sub(s) => s.push(x),
+            Core::Tracker(t) => t.push(x),
+        }
+    }
+    fn now(&self) -> f64 {
+        match self {
+            Core::Sub(s) => s.now(),
+            Core::Tracker(t) => t.now(),
+        }
+    }
+    fn all_off(&mut self, t: f64) -> Vec<Ev> {
+        match self {
+            Core::Sub(s) => s.all_off(t),
+            Core::Tracker(tr) => tr.all_off(t),
+        }
+    }
+}
+
 /// Per-session state shared by the tap and replay loops.
 struct Worker<'a> {
     shared: &'a Shared,
     port: Option<Port>,
-    tr: PianoTracker,
+    tr: Core,
     pianist: crate::pianist::Pianist,
     /// The spectrogram's running peak (falls 3 dB/s).
     spec_peak: f32,
@@ -459,7 +512,7 @@ struct Worker<'a> {
 }
 
 impl Worker<'_> {
-    /// Runs mono samples at RATE through the tracker, the port and the shared roll.
+    /// Runs mono samples at RATE through the note core, the port and the shared roll.
     fn feed(&mut self, mono: &[f32], busy: Duration) {
         let t = Instant::now();
         let raw = self.tr.push(mono);
@@ -475,22 +528,29 @@ impl Worker<'_> {
                 }
             }
         }
-        let sal = self.tr.key_salience();
         let dt = mono.len() as f32 / piano::RATE as f32;
-        let mx = sal.iter().fold(0f32, |a, &v| a.max(v));
-        self.spec_peak = (self.spec_peak * 10f32.powf(-0.15 * dt)).max(mx).max(1e-6);
+        let mut raw_row = [0f32; piano::KEYS];
+        let mut found_row: Option<[f32; piano::KEYS]> = None;
+        match &self.tr {
+            Core::Sub(st) => {
+                raw_row = st.raw_view;
+                found_row = Some(st.found_view);
+            }
+            Core::Tracker(tr) => {
+                let sal = tr.key_salience();
+                let mx = sal.iter().fold(0f32, |a, &v| a.max(v));
+                self.spec_peak = (self.spec_peak * 10f32.powf(-0.15 * dt)).max(mx).max(1e-6);
+                for (o, &v) in raw_row.iter_mut().zip(sal) {
+                    *o = (v.max(0.0) / self.spec_peak).sqrt().min(1.0);
+                }
+            }
+        }
         let mut g = self.shared.get();
         g.apply(&evs, self.tr.now());
         let now = g.now;
-        let mut row = match g.spec.front() {
-            Some(&(t, _)) if now - t > SPEC_KEEP_S => g.spec.pop_front().map(|x| x.1).unwrap_or_default(),
-            _ => Vec::with_capacity(sal.len()),
-        };
-        row.clear();
-        row.extend(sal.iter().map(|&v| (v.max(0.0) / self.spec_peak).sqrt().min(1.0)));
-        g.spec.push_back((now, row));
-        while g.spec.front().is_some_and(|&(t, _)| now - t > SPEC_KEEP_S + 0.5) {
-            g.spec.pop_front();
+        push_ring(&mut g.spec, now, &raw_row);
+        if let Some(f) = found_row {
+            push_ring(&mut g.found, now, &f);
         }
         if self.audio_s >= 0.5 {
             let ms = self.busy_s * 1000.0 / self.audio_s * 0.5;
@@ -523,7 +583,7 @@ fn run(o: &Opts, shared: &Shared, stop: &AtomicBool, child: &Mutex<Option<Child>
         None => None,
     };
     shared.get().port = port.as_ref().and_then(port_address);
-    let mut w = Worker { shared, port, tr: PianoTracker::new(), pianist: crate::pianist::Pianist::new(), spec_peak: 0.0, audio_s: 0.0, busy_s: 0.0 };
+    let mut w = Worker { shared, port, tr: Core::new(), pianist: crate::pianist::Pianist::new(), spec_peak: 0.0, audio_s: 0.0, busy_s: 0.0 };
     if let Some(path) = &o.wav {
         let r = replay(path, &mut w, stop);
         w.finish();
@@ -607,6 +667,7 @@ pub fn cli(args: Vec<String>) -> i32 {
     let (mut merged, mut port, mut bench, mut seconds) = (false, false, false, None::<f64>);
     let mut arrange = None::<bool>;
     let (mut subtract, mut vocal) = (false, None::<String>);
+    let mut v3 = None::<bool>;
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -621,12 +682,17 @@ pub fn cli(args: Vec<String>) -> i32 {
             "--arrange" => arrange = Some(false),
             "--piano-only" => arrange = Some(true),
             "--subtract" => subtract = true,
+            "--arrange3" => v3 = Some(false),
+            "--piano3" => v3 = Some(true),
             "--vocal" => vocal = it.next(),
             other => return usage(&format!("unknown argument {other}")),
         }
     }
     if bench {
         return run_bench();
+    }
+    if let (Some(w), Some(po)) = (&wav, v3) {
+        return arrange3_cli(w, out.as_deref(), po);
     }
     if let (Some(w), true) = (&wav, subtract || vocal.is_some()) {
         return subtract_cli(w, out.as_deref(), vocal.as_deref());
@@ -647,6 +713,53 @@ fn write_midi(path: &str, notes: &[Note], merged: bool, origin: Option<f64>) -> 
     std::fs::write(path, crate::notes::piano_midi(notes, !merged, origin)).map_err(|e| format!("{path}: {e}"))
 }
 
+/// `piano --wav X --arrange3|--piano3 [--out f.mid]`: v3, the song's own figures cleaned plus the
+/// vocal line (both from the subtraction core). Also writes <out>.melody.mid (the melody alone).
+fn arrange3_cli(wav: &str, out: Option<&str>, piano_only: bool) -> i32 {
+    let (l, r, rate) = match std::fs::read(wav).map_err(|e| e.to_string()).and_then(|b| crate::subtract::read_stereo(&b)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{wav}: {e}");
+            return 1;
+        }
+    };
+    let (l, r) = (piano::to_rate(&l, rate), piano::to_rate(&r, rate));
+    let secs = l.len() as f64 / piano::RATE as f64;
+    let t = Instant::now();
+    let fr = crate::subtract::frames(&l, &r);
+    let acc = crate::subtract::notes(&fr);
+    let line = crate::subtract::vocal_line(&fr);
+    let mel = crate::subtract::line_notes(&fr, &line);
+    let mut a = crate::arrange::analyze_from(fr.act.clone(), fr.frame_s, fr.t0, secs);
+    a.melody = mel;
+    let parts = crate::arrange::arrange_v3(&a, &acc, piano_only);
+    println!("analysed {secs:.1} s in {:.2} s: tempo {:.1} BPM, key {}, {} beats", t.elapsed().as_secs_f64(), a.bpm, a.key_name(), a.beats.len());
+    let mut line_s = String::new();
+    let mut last = String::new();
+    for (i, c) in a.chords.iter().enumerate() {
+        let n = c.name();
+        if n != last {
+            line_s += &format!("{:.1}s {n}  ", a.beats[i]);
+            last = n;
+        }
+    }
+    println!("chords: {line_s}");
+    let ms: Vec<String> = a.melody.iter().take(40).map(|n| format!("{:.2}:{}{}", n.t, crate::arrange::NAMES[(n.pitch % 12) as usize], n.pitch / 12 - 1)).collect();
+    println!("melody (first 40): {}", ms.join(" "));
+    for p in &parts {
+        println!("part {} (ch {}, GM {}): {} notes", p.name, p.ch + 1, p.prog, p.notes.len());
+    }
+    if let Some(path) = out {
+        let mp = std::path::Path::new(path).with_extension("melody.mid");
+        if let Err(e) = std::fs::write(path, crate::arrange::midi(&parts)).and_then(|_| std::fs::write(&mp, crate::notes::piano_midi(&a.melody, false, Some(0.0)))) {
+            eprintln!("{path}: {e}");
+            return 1;
+        }
+        println!("wrote {path} and {}", mp.display());
+    }
+    0
+}
+
 /// `piano --wav X --subtract [--out notes.mid] [--vocal stem.wav]`: notes by complex harmonic
 /// subtraction (through the pianist layer), and the vocal stem plus its melody (stem.mid).
 fn subtract_cli(wav: &str, out: Option<&str>, vocal: Option<&str>) -> i32 {
@@ -662,7 +775,22 @@ fn subtract_cli(wav: &str, out: Option<&str>, vocal: Option<&str>) -> i32 {
     let t = Instant::now();
     let fr = crate::subtract::frames(&l, &r);
     let el = t.elapsed().as_secs_f64();
-    let raw = crate::subtract::notes(&fr);
+    let raw = if std::env::var_os("PIANO_STREAM").is_some() {
+        // the live core, fed in 10 ms chunks of the mono mix
+        let mono: Vec<f32> = l.iter().zip(&r).map(|(a, b)| 0.5 * (a + b)).collect();
+        let mut st = crate::subtract::SubTracker::new();
+        let t1 = Instant::now();
+        let mut evs = Vec::new();
+        for c in mono.chunks(220) {
+            evs.extend(st.push(c));
+        }
+        evs.extend(st.flush());
+        let e1 = t1.elapsed().as_secs_f64();
+        println!("live core: {:.2} ms per 0.5 s", e1 * 1000.0 / (secs / 0.5));
+        piano::events_to_notes(&evs)
+    } else {
+        crate::subtract::notes(&fr)
+    };
     let notes = if std::env::var_os("PIANO_RAW").is_some() { raw.clone() } else { crate::pianist::perform(&raw) };
     let poly = fr.found.iter().map(|f| f.len()).sum::<usize>() as f64 / fr.found.len().max(1) as f64;
     println!("{} notes ({} raw) from {secs:.1} s in {el:.2} s ({:.2} ms per 0.5 s), {poly:.1} series per frame", notes.len(), raw.len(), el * 1000.0 / (secs / 0.5));

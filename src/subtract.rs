@@ -167,66 +167,110 @@ fn score(mag: &[f32], k: usize, df: f32) -> f32 {
 }
 
 /// Analyses stereo PCM at RATE.
-pub fn frames(l: &[f32], r: &[f32]) -> Frames {
-    let fft = Fft::new(N);
-    let win = hann(N);
-    let df = RATE as f32 / N as f32;
-    let len = l.len().min(r.len());
-    let nfr = len / HOP + 1;
-    let stop_rel = tun("STOP_REL", 0.22);
-    let mut out = Frames {
-        frame_s: HOP as f64 / RATE as f64,
-        t0: 0.0,
-        act: Vec::with_capacity(nfr),
-        found: Vec::with_capacity(nfr),
-        centre: Vec::with_capacity(nfr),
-        gain: Vec::with_capacity(nfr),
-    };
-    let (mut lr, mut li, mut rr, mut ri) = (vec![0f32; N], vec![0f32; N], vec![0f32; N], vec![0f32; N]);
-    let mut mag = vec![0f32; KMAX];
-    let mut g = vec![0f32; KMAX];
-    for f in 0..nfr {
-        let c0 = (f * HOP) as isize - (N / 2) as isize;
+/// One frame of the subtraction: FFT, whitening, pursuit.
+pub struct Analyzer {
+    fft: Fft,
+    win: Vec<f32>,
+    lr: Vec<f32>,
+    li: Vec<f32>,
+    rr: Vec<f32>,
+    ri: Vec<f32>,
+    mag: Vec<f32>,
+    g: Vec<f32>,
+    df: f32,
+    stop_rel: f32,
+}
+
+pub struct FrameOut {
+    pub act: [f32; KEYS],
+    /// The harmonic score of every key before any subtraction (the raw per-key spectrum).
+    pub raw: [f32; KEYS],
+    pub found: Vec<Found>,
+    pub cen: Vec<f32>,
+    pub gain: Vec<f32>,
+}
+
+impl Default for Analyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Analyzer {
+    pub fn new() -> Analyzer {
+        Analyzer {
+            fft: Fft::new(N),
+            win: hann(N),
+            lr: vec![0.0; N],
+            li: vec![0.0; N],
+            rr: vec![0.0; N],
+            ri: vec![0.0; N],
+            mag: vec![0.0; KMAX],
+            g: vec![0.0; KMAX],
+            df: RATE as f32 / N as f32,
+            stop_rel: tun("STOP_REL", 0.22),
+        }
+    }
+
+    /// `get(i)` gives the (left, right) sample i of the N-sample window (i = 0 is N/2 before the
+    /// frame centre); with `stereo` false only the left is read and the centre is all ones.
+    pub fn analyse(&mut self, get: impl Fn(usize) -> (f32, f32), stereo: bool) -> FrameOut {
         for i in 0..N {
-            let s = c0 + i as isize;
-            let (a, b) = if s >= 0 && (s as usize) < len { (l[s as usize], r[s as usize]) } else { (0.0, 0.0) };
+            let (a, b) = get(i);
             // zero-phase: rotate by N/2 so phases refer to the frame centre and W is real
             let j = (i + N / 2) % N;
-            lr[j] = a * win[i];
-            rr[j] = b * win[i];
-            li[j] = 0.0;
-            ri[j] = 0.0;
+            self.lr[j] = a * self.win[i];
+            self.li[j] = 0.0;
+            if stereo {
+                self.rr[j] = b * self.win[i];
+                self.ri[j] = 0.0;
+            }
         }
-        fft.run(&mut lr, &mut li, false);
-        fft.run(&mut rr, &mut ri, false);
+        self.fft.run(&mut self.lr, &mut self.li, false);
+        if stereo {
+            self.fft.run(&mut self.rr, &mut self.ri, false);
+        } else {
+            self.rr.copy_from_slice(&self.lr);
+            self.ri.copy_from_slice(&self.li);
+        }
         let mut cen = vec![0f32; KMAX];
         let (mut xr, mut xi) = (vec![0f32; KMAX], vec![0f32; KMAX]);
         for k in 0..KMAX {
-            let (ar, ai, br, bi) = (lr[k], li[k], rr[k], ri[k]);
+            let (ar, ai, br, bi) = (self.lr[k], self.li[k], self.rr[k], self.ri[k]);
             let cross = ar * br + ai * bi; // Re(L conj R)
             let pw = ar * ar + ai * ai + br * br + bi * bi;
             cen[k] = (2.0 * cross / pw.max(1e-20)).max(0.0);
             xr[k] = 0.5 * (ar + br);
             xi[k] = 0.5 * (ai + bi);
-            mag[k] = (xr[k] * xr[k] + xi[k] * xi[k]).sqrt();
+            self.mag[k] = (xr[k] * xr[k] + xi[k] * xi[k]).sqrt();
         }
-        whiten(&mag, &mut g);
+        whiten(&self.mag, &mut self.g);
         for k in 0..KMAX {
-            xr[k] *= g[k];
-            xi[k] *= g[k];
-            mag[k] = (xr[k] * xr[k] + xi[k] * xi[k]).sqrt();
+            xr[k] *= self.g[k];
+            xi[k] *= self.g[k];
+            self.mag[k] = (xr[k] * xr[k] + xi[k] * xi[k]).sqrt();
         }
         let mut act = [0f32; KEYS];
+        let mut raw = [0f32; KEYS];
         let mut found: Vec<Found> = Vec::new();
         let mut first = 0f32;
         let mut taken = [false; KEYS];
+        let mut got = [false; KEYS];
         for _ in 0..MAX_NOTES {
             let mut best = (0f32, usize::MAX);
             for k in 0..KEYS {
                 if taken[k] || key_hz(k) > 2100.0 {
                     continue;
                 }
-                let s = score(&mag, k, df);
+                let mut s = score(&self.mag, k, self.df);
+                if first == 0.0 {
+                    raw[k] = s;
+                }
+                // an octave (or twelfth) over a note already found needs more evidence: its partials
+                // were that note's even ones
+                if (k >= 12 && got[k - 12]) || (k >= 19 && got[k - 19]) {
+                    s *= tun("OCT_PEN", 0.6);
+                }
                 if s > best.0 {
                     best = (s, k);
                 }
@@ -235,36 +279,46 @@ pub fn frames(l: &[f32], r: &[f32]) -> Frames {
                 break;
             }
             // against noise: the same weights on the residual's mean level (a flat spectrum scores this x ~2)
-            let lvl = mag[10..KMAX].iter().sum::<f32>() / (KMAX - 10) as f32;
+            let lvl = self.mag[10..KMAX].iter().sum::<f32>() / (KMAX - 10) as f32;
             let f0b = key_hz(best.1);
-            let wsum: f32 = (1..=n_harm(f0b, df)).map(|h| (f0b + 27.0) / (h as f32 * f0b + 320.0)).sum();
+            let wsum: f32 = (1..=n_harm(f0b, self.df)).map(|h| (f0b + 27.0) / (h as f32 * f0b + 320.0)).sum();
             if best.0 < tun("SNR", 4.0) * lvl * wsum {
                 break;
             }
             if first == 0.0 {
                 first = best.0;
-            } else if best.0 < stop_rel * first {
+            } else if best.0 < self.stop_rel * first {
                 break;
             }
-            let k = best.1;
-            taken[k] = true;
+            let mut k = best.1;
             // refine f0 from the partial peaks
             let f0n = key_hz(k);
-            let nh = n_harm(f0n, df);
+            let nh = n_harm(f0n, self.df);
             let mut pk: Vec<Option<(f32, f32)>> = Vec::with_capacity(nh);
             let (mut num, mut den) = (0f32, 0f32);
             for h in 1..=nh {
-                let c = h as f32 * f0n * (1.0 + 0.0004 * (h * h) as f32).sqrt() / df;
-                let p = peak(&mag, c, (0.03 * c).max(1.0));
+                let c = h as f32 * f0n * (1.0 + 0.0004 * (h * h) as f32).sqrt() / self.df;
+                let p = peak(&self.mag, c, (0.03 * c).max(1.0));
                 if let Some((pos, a)) = p {
-                    if h <= 6 {
-                        num += a * pos * df / h as f32;
-                        den += a;
+                    if h <= 10 {
+                        // higher partials resolve f0 finer: weight by h (a * h * f_h / h), stretch removed
+                        num += a * pos * self.df / (1.0 + 0.0002 * (h * h) as f32).sqrt();
+                        den += a * h as f32;
                     }
                 }
                 pk.push(p);
             }
             let f0 = if den > 0.0 { num / den } else { f0n };
+            // the key the refined f0 rounds to; no semitone neighbours in the same frame
+            let kr = (69.0 + 12.0 * (f0 / 440.0).log2()).round() as i32 - LOW_KEY as i32;
+            if (0..KEYS as i32).contains(&kr) && (kr - k as i32).abs() == 1 && !taken[kr as usize] {
+                k = kr as usize;
+            }
+            for j in k.saturating_sub(1)..=(k + 1).min(KEYS - 1) {
+                taken[j] = true;
+            }
+            taken[best.1] = true;
+            got[k] = true;
             // complex amplitudes by LS against the window transform over ±2 bins
             let mut parts: Vec<Partial> = Vec::with_capacity(nh);
             for p in pk.iter().flatten() {
@@ -289,7 +343,7 @@ pub fn frames(l: &[f32], r: &[f32]) -> Frames {
                 if nb.is_empty() || i == 0 {
                     continue;
                 }
-                let cap = 1.5 * nb.iter().sum::<f32>() / nb.len() as f32;
+                let cap = tun("CAP", 1.8) * nb.iter().sum::<f32>() / nb.len() as f32;
                 if mags[i] > cap && mags[i] > 0.0 {
                     let s = cap / mags[i];
                     parts[i].re *= s;
@@ -306,17 +360,46 @@ pub fn frames(l: &[f32], r: &[f32]) -> Frames {
                     let w = wk(kk as f32 - p.pos);
                     xr[kk as usize] -= p.re * w;
                     xi[kk as usize] -= p.im * w;
-                    mag[kk as usize] = (xr[kk as usize].powi(2) + xi[kk as usize].powi(2)).sqrt();
+                    self.mag[kk as usize] = (xr[kk as usize].powi(2) + xi[kk as usize].powi(2)).sqrt();
                 }
             }
             let amp = parts.iter().map(|p| p.re * p.re + p.im * p.im).sum::<f32>().sqrt();
             act[k] = amp;
             found.push(Found { key: (LOW_KEY as usize + k) as u8, f0, amp, partials: parts });
         }
-        out.act.push(act);
-        out.found.push(found);
-        out.centre.push(cen);
-        out.gain.push(g.clone());
+        FrameOut { act, raw, found, cen, gain: self.g.clone() }
+    }
+}
+
+pub fn frames(l: &[f32], r: &[f32]) -> Frames {
+    let len = l.len().min(r.len());
+    let nfr = len / HOP + 1;
+    let mut an = Analyzer::new();
+    let mut out = Frames {
+        frame_s: HOP as f64 / RATE as f64,
+        t0: 0.0,
+        act: Vec::with_capacity(nfr),
+        found: Vec::with_capacity(nfr),
+        centre: Vec::with_capacity(nfr),
+        gain: Vec::with_capacity(nfr),
+    };
+    for f in 0..nfr {
+        let c0 = (f * HOP) as isize - (N / 2) as isize;
+        let fo = an.analyse(
+            |i| {
+                let s = c0 + i as isize;
+                if s >= 0 && (s as usize) < len {
+                    (l[s as usize], r[s as usize])
+                } else {
+                    (0.0, 0.0)
+                }
+            },
+            true,
+        );
+        out.act.push(fo.act);
+        out.found.push(fo.found);
+        out.centre.push(fo.cen);
+        out.gain.push(fo.gain);
     }
     out
 }
@@ -531,19 +614,38 @@ pub fn line_notes(fr: &Frames, line: &[Option<usize>]) -> Vec<Note> {
             amax = amax.max(fr.found[f][*i].amp);
         }
     }
+    let mut dip = f32::INFINITY;
     for (f, sel) in line.iter().enumerate() {
         let p = sel.map(|i| {
             let x = &fr.found[f][i];
             ((69.0 + 12.0 * (x.f0 / 440.0).log2()).round() as u8, x.amp / amax)
         });
+        let prev_start = cur.map(|c| c.0);
         match (cur, p) {
-            (Some((s, cp, a)), Some((np, na))) if np == cp => cur = Some((s, cp, a.max(na))),
+            (Some((s, cp, a)), Some((np, na))) if np == cp => {
+                // a syllable: the same pitch dips under half its peak and comes back up
+                if na > 0.8 * a && dip < 0.5 * a && f - s > 6 {
+                    push(&mut out, s, f, cp, a);
+                    cur = Some((f, np, na));
+                } else {
+                    cur = Some((s, cp, a.max(na)));
+                }
+            }
             (Some((s, cp, a)), _) => {
                 push(&mut out, s, f, cp, a);
                 cur = p.map(|(np, na)| (f, np, na));
             }
             (None, Some((np, na))) => cur = Some((f, np, na)),
             (None, None) => {}
+        }
+        if cur.map(|c| c.0) != prev_start {
+            dip = f32::INFINITY;
+        }
+        if let Some((_, na)) = p {
+            dip = dip.min(na);
+            if cur.is_some_and(|c| na >= c.2) {
+                dip = na;
+            }
         }
     }
     if let Some((s, cp, a)) = cur {
@@ -553,7 +655,7 @@ pub fn line_notes(fr: &Frames, line: &[Option<usize>]) -> Vec<Note> {
     let mut merged: Vec<Note> = Vec::new();
     for n in out {
         match merged.last_mut() {
-            Some(l) if l.pitch == n.pitch && n.t - (l.t + l.dur) < 0.06 => l.dur = n.t + n.dur - l.t,
+            Some(l) if l.pitch == n.pitch && (1e-6..0.06).contains(&(n.t - (l.t + l.dur))) => l.dur = n.t + n.dur - l.t,
             _ => merged.push(n),
         }
     }
@@ -640,5 +742,222 @@ mod tests {
             assert!(ps.contains(&p), "{p} missing: {got:?}");
         }
         assert!(ps.len() <= 5, "ghosts: {got:?}");
+    }
+}
+
+/// Live: streaming subtraction tracker (mono), the default live note core. Same frames as the
+/// offline path; a causal per-key segmenter turns the activations into On/Off events.
+/// Latency: N/2 (93 ms) for the window plus the confirmation (9 frames, 14 for weak notes): about
+/// 200 ms, as the old tracker; the confirmation is what keeps attack transients from sounding.
+pub struct SubTracker {
+    an: Analyzer,
+    /// Mono input from absolute sample `start`.
+    buf: Vec<f32>,
+    start: u64,
+    n_in: u64,
+    /// Next frame; its centre is frame * HOP.
+    frame: u64,
+    seg: Vec<KeySeg>,
+    /// Smoothing ring: the last 3 frames' activations.
+    ring: [[f32; KEYS]; 3],
+    /// dB history per key of the smoothed activation, the last 4 frames.
+    hist: Vec<[f32; 4]>,
+    /// Raw activation per key for the last 16 frames, indexed frame % 16 (onset refinement).
+    rawh: Vec<[f32; 16]>,
+    gref: f32,
+    /// The last frame's raw per-key scores and found amplitudes, 0..1 (for the UI rings).
+    pub raw_view: [f32; KEYS],
+    pub found_view: [f32; KEYS],
+    raw_peak: f32,
+    pub busy: std::time::Duration,
+}
+
+#[derive(Clone, Copy)]
+enum KeySeg {
+    Idle,
+    /// Started at frame s, peak dB pk, seen since frame i0.
+    Pending { s: u64, pk: f32, i0: u64 },
+    On { s: u64, pk: f32, below: u8 },
+}
+
+impl Default for SubTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SubTracker {
+    pub fn new() -> SubTracker {
+        SubTracker {
+            an: Analyzer::new(),
+            buf: Vec::with_capacity(2 * N),
+            start: 0,
+            n_in: 0,
+            frame: 0,
+            seg: vec![KeySeg::Idle; KEYS],
+            ring: [[0.0; KEYS]; 3],
+            hist: vec![[-120.0; 4]; KEYS],
+            rawh: vec![[0.0; 16]; KEYS],
+            gref: -120.0,
+            raw_view: [0.0; KEYS],
+            found_view: [0.0; KEYS],
+            raw_peak: 1e-6,
+            busy: std::time::Duration::ZERO,
+        }
+    }
+
+    pub fn now(&self) -> f64 {
+        self.n_in as f64 / RATE as f64
+    }
+
+    fn t(f: u64) -> f64 {
+        (f * HOP as u64) as f64 / RATE as f64
+    }
+
+    pub fn push(&mut self, pcm: &[f32]) -> Vec<crate::piano::Ev> {
+        let t0 = std::time::Instant::now();
+        self.buf.extend_from_slice(pcm);
+        self.n_in += pcm.len() as u64;
+        let mut evs = Vec::new();
+        while self.frame * HOP as u64 + (N / 2) as u64 <= self.n_in {
+            let c0 = (self.frame * HOP as u64) as i64 - (N / 2) as i64;
+            let (buf, start) = (&self.buf, self.start as i64);
+            let fo = self.an.analyse(
+                |i| {
+                    let s = c0 + i as i64 - start;
+                    let v = if s >= 0 && (s as usize) < buf.len() { buf[s as usize] } else { 0.0 };
+                    (v, v)
+                },
+                false,
+            );
+            self.step(&fo, &mut evs);
+            self.frame += 1;
+            // keep N samples before the next frame's centre
+            let keep_from = (self.frame * HOP as u64).saturating_sub((N / 2) as u64);
+            if keep_from > self.start + N as u64 {
+                let d = (keep_from - self.start) as usize;
+                self.buf.drain(..d.min(self.buf.len()));
+                self.start += d as u64;
+            }
+        }
+        self.busy += t0.elapsed();
+        evs
+    }
+
+    fn step(&mut self, fo: &FrameOut, evs: &mut Vec<crate::piano::Ev>) {
+        use crate::piano::Ev;
+        let on_db = tun("ON_DB", -26.0);
+        let off_db = tun("OFF_DB", -36.0);
+        let weak_db = tun("WEAK_DB", -14.0);
+        let db = |v: f32| 20.0 * v.max(1e-9).log10();
+        let fs = HOP as f32 / RATE as f32;
+        self.ring[(self.frame % 3) as usize] = fo.act;
+        let fmax = fo.act.iter().fold(0f32, |m, &v| m.max(v));
+        // running reference: the loudest frame, falling 1.5 dB/s
+        self.gref = (self.gref - 1.5 * fs).max(db(fmax));
+        let rmax = fo.raw.iter().fold(0f32, |m, &v| m.max(v));
+        self.raw_peak = (self.raw_peak * 10f32.powf(-0.15 * fs)).max(rmax).max(1e-6);
+        let i = self.frame;
+        for k in 0..KEYS {
+            self.rawh[k][(i % 16) as usize] = fo.act[k];
+            self.raw_view[k] = (fo.raw[k] / self.raw_peak).sqrt().min(1.0);
+            self.found_view[k] = if fo.act[k] > 0.0 { ((db(fo.act[k]) - self.gref + 40.0) / 40.0).clamp(0.0, 1.0) } else { 0.0 };
+            let v = db((self.ring[0][k] + self.ring[1][k] + self.ring[2][k]) / 3.0) - self.gref;
+            let h = &mut self.hist[k];
+            let v3 = h[0];
+            h.rotate_left(1);
+            h[3] = v;
+            let rise = v - v3 > 5.0;
+            let pitch = (LOW_KEY as usize + k) as u8;
+            // the smoothed value is centred one frame back
+            let at = i.saturating_sub(1);
+            self.seg[k] = match self.seg[k] {
+                KeySeg::Idle => {
+                    if v > on_db && (rise || v3 < on_db) {
+                        KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i }
+                    } else {
+                        KeySeg::Idle
+                    }
+                }
+                KeySeg::Pending { s, pk, i0 } => {
+                    let pk = pk.max(v);
+                    if v < off_db || v < pk - 18.0 {
+                        KeySeg::Idle
+                    } else if i - i0 >= if pk >= weak_db { tun("CONFIRM", 9.0) as u64 } else { tun("CONFIRM_WEAK", 14.0) as u64 } {
+                        let vel = (100.0 + 2.0 * pk).clamp(25.0, 120.0) as u8;
+                        // the window sees an attack N/2 early: start at the steepest rise since s
+                        let rh = &self.rawh[k];
+                        let lo = s.max(i.saturating_sub(15));
+                        let s = (lo..i).max_by(|&x, &y| {
+                            let d = |j: u64| rh[((j + 1) % 16) as usize] - rh[(j % 16) as usize];
+                            d(x).total_cmp(&d(y))
+                        }).unwrap_or(s);
+                        evs.push(Ev::On { t: Self::t(s), pitch, vel });
+                        KeySeg::On { s, pk, below: 0 }
+                    } else {
+                        KeySeg::Pending { s, pk, i0 }
+                    }
+                }
+                KeySeg::On { s, pk, below } => {
+                    let pk = pk.max(v);
+                    if rise && at > s + 8 && v > on_db {
+                        evs.push(Ev::Off { t: Self::t(at.saturating_sub(1)), pitch });
+                        KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i }
+                    } else {
+                        let below = if v < off_db || v < pk - 18.0 { below + 1 } else { 0 };
+                        if below >= 3 {
+                            evs.push(Ev::Off { t: Self::t(at.saturating_sub(2)), pitch });
+                            KeySeg::Idle
+                        } else {
+                            KeySeg::On { s, pk, below }
+                        }
+                    }
+                }
+            };
+        }
+    }
+
+    /// End of input: pads with silence so the last frames are analysed, then everything off.
+    pub fn flush(&mut self) -> Vec<crate::piano::Ev> {
+        let mut evs = self.push(&vec![0.0; N]);
+        evs.extend(self.all_off(self.now()));
+        evs
+    }
+
+    pub fn all_off(&mut self, t: f64) -> Vec<crate::piano::Ev> {
+        let mut evs = Vec::new();
+        for k in 0..KEYS {
+            if let KeySeg::On { .. } = self.seg[k] {
+                evs.push(crate::piano::Ev::Off { t, pitch: (LOW_KEY as usize + k) as u8 });
+            }
+            self.seg[k] = KeySeg::Idle;
+        }
+        evs
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    #[test]
+    fn streaming_finds_the_triad_in_10ms_chunks() {
+        let notes = vec![
+            Note { t: 0.2, dur: 1.0, pitch: 60, vel: 90 },
+            Note { t: 0.2, dur: 1.0, pitch: 64, vel: 90 },
+            Note { t: 0.2, dur: 1.0, pitch: 67, vel: 90 },
+        ];
+        let x = crate::piano::synth_piano(&notes, 1.6, 3);
+        let mut st = SubTracker::new();
+        let mut evs = Vec::new();
+        for c in x.chunks(220) {
+            evs.extend(st.push(c));
+        }
+        evs.extend(st.flush());
+        let got = crate::piano::events_to_notes(&evs);
+        for p in [60, 64, 67] {
+            let n = got.iter().find(|n| n.pitch == p && n.dur > 0.5);
+            assert!(n.is_some_and(|n| (n.t - 0.2).abs() < 0.06), "{p}: {got:?}");
+        }
     }
 }

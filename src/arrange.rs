@@ -393,12 +393,21 @@ pub fn analyze(mono: &[f32], rate: u32) -> Analysis {
     let frame_s = HOP as f64 / RATE as f64;
     // salience frame i was computed once (i+1)*HOP samples were in; its centre lags by DELAY
     let t0 = (HOP as f64 - DELAY as f64) / RATE as f64;
+    let mut a = analyze_from(sal, frame_s, t0, x.len() as f64 / RATE as f64);
+    a.melody = melody(&a, &raw);
+    a.raw = raw;
+    a
+}
+
+/// The model from per-frame 88-key activations (tracker salience or the subtraction core's
+/// fitted amplitudes): tempo, beats, key, chords. Melody and raw notes are left empty.
+pub fn analyze_from(sal: Vec<[f32; KEYS]>, frame_s: f64, t0: f64, secs: f64) -> Analysis {
     let onset = onset_strength(&sal);
     let period = tempo(&onset, frame_s);
     let bf = track_beats(&onset, period);
     let mut beats: Vec<f64> = bf.iter().map(|&i| t0 + i as f64 * frame_s).filter(|&t| t >= 0.0).collect();
     if beats.len() < 2 {
-        beats = (0..((x.len() as f64 / RATE as f64) / 0.6) as usize).map(|i| i as f64 * 0.6).collect();
+        beats = (0..(secs / 0.6) as usize).map(|i| i as f64 * 0.6).collect();
     }
     let fr = |t: f64| (((t - t0) / frame_s).round().max(0.0) as usize).min(sal.len());
     let (total, _) = chroma(&sal, 0, sal.len());
@@ -414,10 +423,93 @@ pub fn analyze(mono: &[f32], rate: u32) -> Analysis {
     let path = viterbi(&scores, tun_f("ARR_SWITCH", 0.05));
     let chords = path.iter().map(|&s| Chord { root: (s / TYPES.len()) as u8, kind: (s % TYPES.len()) as u8 }).collect();
     let bpm = 60.0 / (period * frame_s);
-    let mut a = Analysis { frame_s, t0, sal, onset, bpm, beats, key, chords, melody: vec![], raw: vec![] };
-    a.melody = melody(&a, &raw);
-    a.raw = raw;
-    a
+    Analysis { frame_s, t0, sal, onset, bpm, beats, key, chords, melody: vec![], raw: vec![] }
+}
+
+fn chord_at(a: &Analysis, t: f64) -> Option<Chord> {
+    let i = a.beats.windows(2).position(|w| w[0] <= t && t < w[1])?;
+    a.chords.get(i).copied()
+}
+
+/// v3: the song's own figures, cleaned. `acc` are the detected notes (their real onsets and
+/// durations are the rhythm), `a.melody` the vocal line with its real rhythm. Accompaniment pitches
+/// outside the key and the chord snap to the nearest chord tone, onsets move 30 % toward the 1/16
+/// grid, the melody's own notes are taken out of the accompaniment, and beats with nothing detected
+/// are filled with the chord. Then the pianist layer (pedal, velocities).
+pub fn arrange_v3(a: &Analysis, acc: &[Note], piano_only: bool) -> Vec<Part> {
+    let scale = scale_of(a.key);
+    let q = tun_f("QUANT", 0.3) as f64;
+    let grid = |t: f64| -> f64 {
+        let Some(i) = a.beats.windows(2).position(|w| w[0] <= t && t < w[1]) else {
+            return t;
+        };
+        let (b0, b1) = (a.beats[i], a.beats[i + 1]);
+        let step = (b1 - b0) / 4.0;
+        let g = b0 + ((t - b0) / step).round() * step;
+        t + (g - t) * q
+    };
+    let mel_hit = |n: &Note| a.melody.iter().any(|m| m.pitch == n.pitch && (m.t - n.t).abs() < 0.08);
+    let mut clean: Vec<Note> = Vec::new();
+    for n in acc {
+        if mel_hit(n) {
+            continue;
+        }
+        let mut p = n.pitch;
+        if let Some(c) = chord_at(a, n.t) {
+            let pcs = c.pcs();
+            if !scale[(p % 12) as usize] && !pcs.contains(&(p % 12)) {
+                // nearest chord tone
+                let best = (1..=3).flat_map(|d| [p as i32 - d, p as i32 + d]).find(|&x| x > 0 && pcs.contains(&((x % 12) as u8)));
+                if let Some(x) = best {
+                    p = x as u8;
+                }
+            }
+        }
+        let t = grid(n.t);
+        clean.push(Note { t, dur: (n.t + n.dur - t).max(0.06), pitch: p, vel: n.vel });
+    }
+    // fill beats where nothing was detected
+    let sp = spans(a);
+    let mut fill = Vec::new();
+    let mut prev: Vec<u8> = Vec::new();
+    for &(t0, t1, c) in &sp {
+        let v = voice(&c.pcs(), 52, 70, &prev);
+        for b in beats_in(a, t0, t1) {
+            let e = a.beats.iter().copied().find(|&x| x > b + 1e-6).unwrap_or(t1);
+            if !clean.iter().any(|n| n.t < e && n.t + n.dur > b + 0.05) {
+                let low = 36 + c.root % 12;
+                fill.push(Note { t: b, dur: e - b, pitch: if low > 45 { low - 12 } else { low }, vel: 50 });
+                for &p in &v {
+                    fill.push(Note { t: b, dur: e - b, pitch: p, vel: 44 });
+                }
+            }
+        }
+        prev = v;
+    }
+    clean.extend(fill);
+    clean.sort_by(|x, y| x.t.total_cmp(&y.t));
+    let acc_p = crate::pianist::perform(&clean);
+    let mel: Vec<Note> = a.melody.iter().map(|m| Note { vel: (m.vel as f32 * 0.8 + 25.0).min(118.0) as u8, ..m.clone() }).collect();
+    let mut piano = acc_p.clone();
+    piano.extend(mel.iter().cloned());
+    piano.sort_by(|x, y| x.t.total_cmp(&y.t));
+    let mut parts = vec![Part { name: "Piano", ch: 0, prog: 0, rgb: (0xc8, 0xd6, 0xe5), notes: piano }];
+    if !piano_only {
+        let mut strings = Vec::new();
+        let mut prev_pad: Vec<u8> = Vec::new();
+        for &(t0, t1, c) in &sp {
+            let pad = voice(&c.pcs(), 48, 67, &prev_pad);
+            for &p in &pad {
+                strings.push(Note { t: t0, dur: t1 - t0, pitch: p, vel: 42 });
+            }
+            prev_pad = pad;
+        }
+        let bass: Vec<Note> = acc_p.iter().filter(|n| n.pitch < 48).map(|n| Note { pitch: if n.pitch >= 40 { n.pitch - 12 } else { n.pitch }, vel: (n.vel as f32 * 0.9 + 15.0).min(115.0) as u8, ..n.clone() }).collect();
+        parts.push(Part { name: "Strings", ch: 1, prog: 48, rgb: (0x9b, 0x59, 0xb6), notes: strings });
+        parts.push(Part { name: "Lead", ch: 2, prog: 73, rgb: (0xfe, 0xca, 0x57), notes: mel.clone() });
+        parts.push(Part { name: "Bass", ch: 3, prog: 32, rgb: (0x54, 0xa0, 0xff), notes: bass });
+    }
+    parts
 }
 
 /// One arranged part.
