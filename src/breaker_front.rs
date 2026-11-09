@@ -19,6 +19,7 @@ fn user_input(id: &str, name: &str, target: &str) -> Input {
         normalize: false,
         norm_base: None,
         norm_out: None,
+        norm_target: None,
     }
 }
 
