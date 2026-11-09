@@ -55,7 +55,20 @@ pub fn hostname() -> String {
 pub fn print_info() -> i32 {
     match settings::load_or_create(&settings::path()) {
         Ok(rc) => {
-            println!("host:  {}.local  port {}", hostname(), rc.port);
+            // avahi may have renamed the host on a name clash (bazzite-2.local), so show its real name and the LAN IPs
+            let mdns = crate::pw::output_timeout("avahi-resolve", &["-a", "127.0.0.1"], std::time::Duration::from_secs(2))
+                .and_then(|o| String::from_utf8(o).ok())
+                .and_then(|s| s.split_whitespace().nth(1).map(String::from))
+                .unwrap_or_else(|| format!("{}.local", hostname()));
+            let ips = crate::pw::output_timeout("ip", &["-4", "-o", "addr", "show", "scope", "global"], std::time::Duration::from_secs(2))
+                .and_then(|o| String::from_utf8(o).ok())
+                .map(|s| lan_ips(&s))
+                .unwrap_or_default();
+            println!("port:  {}", rc.port);
+            println!("host:  {mdns}");
+            for (dev, ip) in ips {
+                println!("ip:    {ip}  ({dev})");
+            }
             println!("token: {}", rc.token);
             0
         }
@@ -66,5 +79,24 @@ pub fn print_info() -> i32 {
     }
 }
 
+/// (interface, IPv4) from `ip -4 -o addr`, skipping container bridges.
+fn lan_ips(out: &str) -> Vec<(String, String)> {
+    out.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let dev = f.get(1)?.to_string();
+            let ip = f.iter().position(|x| *x == "inet").and_then(|i| f.get(i + 1))?.split('/').next()?.to_string();
+            (!["podman", "docker", "veth", "virbr", "br-"].iter().any(|p| dev.starts_with(p))).then_some((dev, ip))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[test]
+fn lan_ips_skip_bridges() {
+    let out = "2: enp14s0    inet 192.168.1.231/24 brd 192.168.1.255 scope global dynamic\n3: podman0    inet 10.88.0.1/16 scope global\n4: wlp15s0    inet 192.168.1.157/24 scope global\n";
+    assert_eq!(lan_ips(out), vec![("enp14s0".into(), "192.168.1.231".into()), ("wlp15s0".into(), "192.168.1.157".into())]);
+}
