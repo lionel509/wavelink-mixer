@@ -49,8 +49,9 @@ fn chroma_audio(x: &[f32]) -> (Vec<[f32; 12]>, Vec<Vec<(f32, f32)>>) {
         }
         out.push(ch);
         // prominent peaks: local maxima >= 6 dB over the local median (+-20 bins), within 40 dB of
-        // the frame max, 27 Hz - 4.5 kHz
-        let (k0, k1) = ((27.0 / df) as usize + 1, (4500.0 / df) as usize);
+        // the frame max, 55 Hz - 4.5 kHz
+        // from 55 Hz: below that the peaks are mostly kick drum and sub rumble (lofi: 100 % unexplained)
+        let (k0, k1) = ((55.0 / df) as usize + 1, (4500.0 / df) as usize);
         let fmax = mag[k0..k1].iter().fold(0f32, |m, &v| m.max(v));
         let mut pk = Vec::new();
         let mut loc: Vec<f32> = Vec::with_capacity(41);
@@ -203,6 +204,55 @@ pub fn eval(mono: &[f32], sections: &[(String, f64, f64)]) -> String {
     let cn = chroma_notes(&notes, ca.len());
     let synth = piano::synth_piano(&notes, secs, 7);
     let (ma, ms_) = (logmel(mono), logmel(&synth));
+    if std::env::var_os("PIANO_EVAL_PEAKS").is_some() {
+        // unexplained peak energy by octave band, and its strongest pitch classes
+        let mut band = [0f32; 9];
+        let mut tot = [0f32; 9];
+        let mut pcs = [0f32; 12];
+        for (f, pk) in peaks.iter().enumerate() {
+            for &(hz, e) in pk {
+                let b = ((hz / 27.5).log2().floor() as usize).min(8);
+                tot[b] += e;
+                let ok = sounding[f].iter().any(|&p| {
+                    let f0 = 440.0 * 2f32.powf((p as f32 - 69.0) / 12.0);
+                    let h = (hz / f0).round();
+                    (1.0..=16.0).contains(&h) && (1200.0 * (hz / (h * f0)).log2()).abs() <= 35.0
+                });
+                if !ok {
+                    band[b] += e;
+                    pcs[((69.0 + 12.0 * (hz / 440.0).log2()).round() as i32).rem_euclid(12) as usize] += e;
+                }
+            }
+        }
+        for b in 0..9 {
+            eprintln!("A{}..: unexplained {:.0}% of {:.3e}", b, 100.0 * band[b] / tot[b].max(1e-12), tot[b]);
+        }
+        // the strongest unexplained low peaks (55-110 Hz), by frequency
+        let mut low: std::collections::BTreeMap<i32, f32> = Default::default();
+        for (f, pk) in peaks.iter().enumerate() {
+            for &(hz, e) in pk {
+                if (55.0..110.0).contains(&hz) {
+                    let ok = sounding[f].iter().any(|&p| {
+                        let f0 = 440.0 * 2f32.powf((p as f32 - 69.0) / 12.0);
+                        let h = (hz / f0).round();
+                        (1.0..=16.0).contains(&h) && (1200.0 * (hz / (h * f0)).log2()).abs() <= 35.0
+                    });
+                    if !ok {
+                        *low.entry((69.0 + 12.0 * (hz / 440.0).log2()).round() as i32).or_default() += e;
+                    }
+                }
+            }
+        }
+        eprintln!("unexplained 55-110 Hz by midi: {:?}", low.iter().map(|(k, v)| (*k, (*v / 1e3).round())).collect::<Vec<_>>());
+        let mut bass: std::collections::BTreeMap<u8, usize> = Default::default();
+        for n in &notes {
+            if n.pitch < 52 {
+                *bass.entry(n.pitch).or_default() += 1;
+            }
+        }
+        eprintln!("bass notes played: {bass:?}");
+        eprintln!("unexplained by pitch class: {:?}", pcs.iter().map(|v| (v / pcs.iter().sum::<f32>().max(1e-12) * 100.0).round()).collect::<Vec<_>>());
+    }
     let mut rep = format!("live path: {} notes over {secs:.0} s, {ms:.1} ms CPU per 0.5 s\n", notes.len());
     rep += "section          notes  len_s  high/s  chroma  meldist  peakcov  extra/s  poly  restrk/s  oct/s\n";
     let mut all = vec![("all".to_string(), 0.0, secs)];

@@ -31,6 +31,12 @@ pub fn precision() -> bool {
     env_on("MIXER_PIANO_PRECISION", true)
 }
 
+/// Longer holds: decoding lag 465 ms (was 300) and 8 pianist voices (was 6);
+/// MIXER_PIANO_LEGATO=0 restores e9cac14's.
+pub fn legato() -> bool {
+    env_on("MIXER_PIANO_LEGATO", true)
+}
+
 /// Runtime A/B switches for the live path: "0"/"1" (unset: the default).
 pub fn env_on(name: &str, def: bool) -> bool {
     match std::env::var(name).as_deref() {
@@ -1225,7 +1231,7 @@ impl SubTracker {
                     let (rs_ok, drop, nbelow) = if self.decode {
                         // interval decoding (fixed lag): the note holds while the key comes back above
                         // its floor within DECODE_LAG frames; it ends where it last was above
-                        (v - v3 >= tun("RESTRIKE_DB", 6.0) && at > s + 21, tun("OFF_DROP", 24.0), tun("DECODE_LAG", 26.0) as u8)
+                        (v - v3 >= tun("RESTRIKE_DB", 6.0) && at > s + 21, tun("OFF_DROP", 24.0), tun("DECODE_LAG", if legato() { 40.0 } else { 26.0 }) as u8)
                     } else if self.holdkey {
                         // hold: a re-strike needs a clear new attack on this key, 250 ms after the last
                         (v - v3 >= tun("RESTRIKE_DB", 6.0) && at > s + 21, tun("OFF_DROP", 24.0), tun("HOLD_BELOW", 8.0) as u8)

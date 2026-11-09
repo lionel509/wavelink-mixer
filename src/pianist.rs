@@ -56,7 +56,7 @@ impl Pianist {
     pub fn new() -> Pianist {
         Pianist {
             hold: std::env::var("MIXER_PIANO_HOLD").ok().and_then(|v| v.parse().ok()).unwrap_or(HOLD_S),
-            voices: std::env::var("MIXER_PIANO_VOICES").ok().and_then(|v| v.parse().ok()).unwrap_or(if crate::subtract::precision() { 6 } else { MAX_VOICES }),
+            voices: std::env::var("MIXER_PIANO_VOICES").ok().and_then(|v| v.parse().ok()).unwrap_or(if crate::subtract::legato() || !crate::subtract::precision() { MAX_VOICES } else { 6 }),
             pedal_merge: crate::subtract::env_on("MIXER_PIANO_PEDALMERGE", true),
             held: Vec::with_capacity(16), swallow: [0; 128], recent_ons: Vec::with_capacity(16), vel_avg: [0.0; 3], bass: None }
     }
