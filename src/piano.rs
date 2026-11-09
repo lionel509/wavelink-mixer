@@ -1073,6 +1073,9 @@ impl Decim2 {
 pub struct Downmix {
     d: Decim2,
     mono: Vec<f32>,
+    /// Output samples still to drop: the decimator's group delay, dropped like `to_rate` does, so the
+    /// live grid matches the offline one sample for sample.
+    skip: usize,
 }
 
 impl Default for Downmix {
@@ -1083,7 +1086,7 @@ impl Default for Downmix {
 
 impl Downmix {
     pub fn new() -> Downmix {
-        Downmix { d: Decim2::new(), mono: Vec::new() }
+        Downmix { d: Decim2::new(), mono: Vec::new(), skip: Decim2::DELAY_OUT }
     }
     pub fn push(&mut self, stereo: &[f32]) -> Vec<f32> {
         self.mono.clear();
@@ -1092,6 +1095,11 @@ impl Downmix {
         let m = std::mem::take(&mut self.mono);
         self.d.push(&m, &mut out);
         self.mono = m;
+        if self.skip > 0 {
+            let k = self.skip.min(out.len());
+            out.drain(..k);
+            self.skip -= k;
+        }
         out
     }
 }
@@ -1198,6 +1206,9 @@ pub fn read_wav(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
         return Err("bad fmt chunk".into());
     }
     let bps = (bits as usize).div_ceil(8);
+    if bps == 0 || bits > 64 {
+        return Err(format!("unsupported WAV format {tag}/{bits}-bit"));
+    }
     let sample = |b: &[u8]| -> Option<f32> {
         Some(match (tag, bits) {
             (1, 16) => i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0,

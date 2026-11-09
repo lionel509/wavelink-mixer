@@ -68,6 +68,7 @@ impl<S: Sink> MidiOut<S> {
         }
     }
 
+    #[cfg(test)]
     pub fn sounding(&self) -> usize {
         self.sounding.len()
     }
@@ -96,10 +97,11 @@ pub struct AlsaSink {
 }
 
 impl AlsaSink {
+    /// Opens the client non-blocking: a slow subscriber can never stall the analysis thread.
     pub fn open() -> Result<AlsaSink, String> {
         use alsa::seq::{PortCap, PortType};
         use std::ffi::CString;
-        let seq = alsa::Seq::open(None, Some(alsa::Direction::Playback), false).map_err(|e| format!("ALSA sequencer: {e}"))?;
+        let seq = alsa::Seq::open(None, Some(alsa::Direction::Playback), true).map_err(|e| format!("ALSA sequencer: {e}"))?;
         seq.set_client_name(&CString::new(CLIENT_NAME).unwrap()).map_err(|e| format!("ALSA client name: {e}"))?;
         let port = seq
             .create_simple_port(
@@ -116,37 +118,69 @@ impl AlsaSink {
         format!("{}:{}", self.seq.client_id().unwrap_or(-1), self.port)
     }
 
-    fn send(&self, mut ev: alsa::seq::Event) -> Result<(), String> {
+    /// Sends one event. A full output queue (EAGAIN on the non-blocking client) drops a note-on, but
+    /// note-offs and controllers are retried for up to 20 ms so nothing is left hanging.
+    fn send(&self, mut ev: alsa::seq::Event, must: bool) -> Result<(), String> {
         ev.set_source(self.port);
         ev.set_subs();
         ev.set_direct();
-        self.seq.event_output_direct(&mut ev).map(|_| ()).map_err(|e| e.to_string())
+        let mut tries = 0;
+        loop {
+            match self.seq.event_output_direct(&mut ev) {
+                Ok(_) => return Ok(()),
+                Err(e) if must && tries < 20 && e.errno() == libc_eagain() => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
     }
+}
+
+fn libc_eagain() -> i32 {
+    11 // EAGAIN on Linux
 }
 
 impl Sink for AlsaSink {
     fn note(&mut self, on: bool, ch: u8, key: u8, vel: u8) -> Result<(), String> {
         use alsa::seq::{EvNote, Event, EventType};
         let d = EvNote { channel: ch, note: key, velocity: if on { vel } else { 0 }, off_velocity: 0, duration: 0 };
-        self.send(Event::new(if on { EventType::Noteon } else { EventType::Noteoff }, &d))
+        self.send(Event::new(if on { EventType::Noteon } else { EventType::Noteoff }, &d), !on)
     }
     fn control(&mut self, ch: u8, cc: u8, val: u8) -> Result<(), String> {
         use alsa::seq::{EvCtrl, Event, EventType};
-        self.send(Event::new(EventType::Controller, &EvCtrl { channel: ch, param: cc as u32, value: val as i32 }))
+        self.send(Event::new(EventType::Controller, &EvCtrl { channel: ch, param: cc as u32, value: val as i32 }), true)
     }
 }
 
-/// What the UI and the CLI read from a running session.
+/// The long-lived MIDI port slot: one "Wavelink Piano" client for the life of the panel or CLI run,
+/// shared by every session, so a source change or restart never changes its client:port address.
+/// The panel's "Live MIDI port" toggle fills or empties the slot; a running session follows it.
+pub type Port = Arc<Mutex<Option<MidiOut<AlsaSink>>>>;
+
+pub fn open_port() -> Result<Port, String> {
+    Ok(Arc::new(Mutex::new(Some(MidiOut::new(AlsaSink::open()?)))))
+}
+
+/// "client:port" of the port in the slot, if any.
+pub fn port_address(p: &Port) -> Option<String> {
+    lock(p).as_ref().map(|m| m.sink.address())
+}
+
+/// What the UI and the CLI read. It outlives sessions: a restart keeps the roll and the take.
 #[derive(Default)]
 pub struct Inner {
-    /// Finished notes, last ROLL_KEEP_S seconds, times on the session clock.
+    /// Finished notes, last ROLL_KEEP_S seconds, times on the take clock.
     pub roll: Vec<Note>,
-    /// Every finished note of the session, for Save MIDI.
+    /// Every finished note of the take not yet handed out by `take_notes`.
     pub all: Vec<Note>,
-    /// Sounding notes: (start, pitch, vel).
-    pub open: Vec<(f64, u8, u8)>,
-    /// Session clock: seconds of audio analysed.
+    /// Sounding notes: (start, pitch, vel, already handed out by `take_notes`).
+    pub open: Vec<(f64, u8, u8, bool)>,
+    /// Take clock: seconds of audio analysed across all sessions of this take.
     pub now: f64,
+    /// Where the current session's own clock starts on the take clock.
+    pub base: f64,
     pub status: String,
     /// CPU per 0.5 s of audio, ms (smoothed).
     pub cpu_ms: f64,
@@ -168,39 +202,59 @@ impl Shared {
 }
 
 impl Inner {
-    /// Applies tracker events to the roll. `fed` is the analysis clock when they were returned.
+    /// Applies tracker events (times on the session clock). `fed` is the session clock when they
+    /// were returned.
     pub fn apply(&mut self, evs: &[Ev], fed: f64) {
+        let b = self.base;
         for e in evs {
             match *e {
                 Ev::On { t, pitch, vel } => {
-                    self.close(pitch, t);
-                    self.open.push((t, pitch, vel));
+                    self.close(pitch, t + b);
+                    self.open.push((t + b, pitch, vel, false));
                     let lat = (fed - t) * 1000.0;
                     self.latency_ms = if self.latency_ms == 0.0 { lat } else { self.latency_ms * 0.9 + lat * 0.1 };
                 }
-                Ev::Off { t, pitch } => self.close(pitch, t),
+                Ev::Off { t, pitch } => self.close(pitch, t + b),
             }
         }
-        self.now = fed;
-        let keep = fed - ROLL_KEEP_S;
+        self.now = fed + b;
+        let keep = self.now - ROLL_KEEP_S;
         self.roll.retain(|n| n.t + n.dur >= keep);
     }
 
     fn close(&mut self, pitch: u8, t: f64) {
         if let Some(i) = self.open.iter().position(|o| o.1 == pitch) {
-            let (t0, p, v) = self.open.swap_remove(i);
+            let (t0, p, v, handed) = self.open.swap_remove(i);
             let n = Note { t: t0, dur: (t - t0).max(0.0), pitch: p, vel: v };
             self.roll.push(n.clone());
-            self.all.push(n);
+            if !handed {
+                self.all.push(n);
+            }
         }
     }
 
-    /// Notes for Save MIDI: everything finished, plus the sounding ones cut at `now`.
-    pub fn take_notes(&mut self) -> Vec<Note> {
-        let mut v = std::mem::take(&mut self.all);
-        v.extend(self.open.iter().map(|&(t, p, vel)| Note { t, dur: (self.now - t).max(0.0), pitch: p, vel }));
+    fn sorted(mut v: Vec<Note>) -> Vec<Note> {
         v.sort_by(|a, b| a.t.total_cmp(&b.t).then(a.pitch.cmp(&b.pitch)));
         v
+    }
+
+    /// Save MIDI: a copy of the whole take, with sounding notes cut at `now` in the copy only.
+    pub fn snapshot(&self) -> Vec<Note> {
+        let mut v = self.all.clone();
+        v.extend(self.open.iter().filter(|o| !o.3).map(|&(t, p, vel, _)| Note { t, dur: (self.now - t).max(0.0), pitch: p, vel }));
+        Self::sorted(v)
+    }
+
+    /// "Since the last call": hands out the finished notes and the sounding ones cut at `now`; a cut
+    /// note is marked so it is never handed out again when it closes.
+    pub fn take_notes(&mut self) -> Vec<Note> {
+        let mut v = std::mem::take(&mut self.all);
+        let now = self.now;
+        for o in self.open.iter_mut().filter(|o| !o.3) {
+            v.push(Note { t: o.0, dur: (now - o.0).max(0.0), pitch: o.1, vel: o.2 });
+            o.3 = true;
+        }
+        Self::sorted(v)
     }
 }
 
@@ -208,33 +262,49 @@ pub struct Opts {
     /// PipeWire node to tap and whether it is a sink (`stemcfg::tap`).
     pub tap: String,
     pub tap_sink: bool,
-    /// Open the ALSA port.
+    /// Open a port for this session only (the CLI and tests; the panel passes its long-lived one).
     pub port: bool,
     /// Replay this WAV at real-time pace instead of tapping (MIXER_PIANO_WAV: UI drives in test mode).
     pub wav: Option<std::path::PathBuf>,
 }
 
-/// One live run. Drop stops it: the stop flag, then the pw-cat child (ours, by handle) is killed and
-/// reaped; the worker sees EOF, sends all-notes-off and closes the port.
+/// One live run. Drop stops it: the stop flag, the pw-cat child (ours, by handle) is killed and
+/// reaped, and the worker is joined (bounded at 500 ms), so by the time drop returns every sounding
+/// note got its note-off on the port and nothing writes the shared state any more.
 pub struct Session {
     stop: Arc<AtomicBool>,
     child: Arc<Mutex<Option<Child>>>,
+    done: Option<std::sync::mpsc::Receiver<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Session {
     pub fn start(o: Opts, shared: Shared) -> Session {
+        Self::start_with(o, shared, None)
+    }
+
+    /// `port` is a long-lived port to send to; with None, `o.port` opens one for this session.
+    pub fn start_with(o: Opts, shared: Shared, port: Option<Port>) -> Session {
         let stop = Arc::new(AtomicBool::new(false));
         let child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
-        *shared.get() = Inner { status: "starting…".into(), ..Inner::default() };
+        {
+            // the take continues: the new session's clock starts where the last one ended
+            let mut g = shared.get();
+            g.base = g.now;
+            g.open.clear();
+            g.status = "starting…".into();
+        }
         let (s2, c2) = (stop.clone(), child.clone());
-        std::thread::spawn(move || {
-            if let Err(e) = run(&o, &shared, &s2, &c2) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            if let Err(e) = run(&o, &shared, &s2, &c2, port) {
                 if !s2.load(Ordering::Relaxed) {
                     shared.get().status = format!("error: {e}");
                 }
             }
+            let _ = tx.send(());
         });
-        Session { stop, child }
+        Session { stop, child, done: Some(rx), worker: Some(worker) }
     }
 }
 
@@ -244,6 +314,12 @@ impl Drop for Session {
         if let Some(mut c) = lock(&self.child).take() {
             let _ = c.kill();
             let _ = c.wait();
+        }
+        let finished = self.done.take().map(|rx| rx.recv_timeout(Duration::from_millis(500)).is_ok()).unwrap_or(true);
+        if finished {
+            if let Some(h) = self.worker.take() {
+                let _ = h.join();
+            }
         }
     }
 }
@@ -255,16 +331,67 @@ fn spawn_tap(o: &Opts) -> Result<Child, String> {
     cmd.spawn().map_err(|e| format!("{}: {e}", crate::stems::TAP_BIN))
 }
 
-fn run(o: &Opts, shared: &Shared, stop: &AtomicBool, child: &Mutex<Option<Child>>) -> Result<(), String> {
-    let mut out = if o.port && !crate::dash::no_audio() {
-        let s = AlsaSink::open()?;
-        shared.get().port = Some(s.address());
-        Some(MidiOut::new(s))
-    } else {
-        None
+/// Per-session state shared by the tap and replay loops.
+struct Worker<'a> {
+    shared: &'a Shared,
+    port: Option<Port>,
+    tr: PianoTracker,
+    audio_s: f64,
+    busy_s: f64,
+}
+
+impl Worker<'_> {
+    /// Runs mono samples at RATE through the tracker, the port and the shared roll.
+    fn feed(&mut self, mono: &[f32], busy: Duration) {
+        let t = Instant::now();
+        let evs = self.tr.push(mono);
+        self.busy_s += (t.elapsed() + busy).as_secs_f64();
+        self.audio_s += mono.len() as f64 / piano::RATE as f64;
+        if let Some(p) = &self.port {
+            if let Some(m) = lock(p).as_mut() {
+                for e in &evs {
+                    m.event(e);
+                }
+            }
+        }
+        let mut g = self.shared.get();
+        g.apply(&evs, self.tr.now());
+        if self.audio_s >= 0.5 {
+            let ms = self.busy_s * 1000.0 / self.audio_s * 0.5;
+            g.cpu_ms = if g.cpu_ms == 0.0 { ms } else { g.cpu_ms * 0.8 + ms * 0.2 };
+            self.audio_s = 0.0;
+            self.busy_s = 0.0;
+        }
+    }
+
+    /// End of the session: every sounding note off on the port and in the roll.
+    fn finish(&mut self) {
+        let end = self.tr.now();
+        let evs = self.tr.all_off(end);
+        if let Some(p) = &self.port {
+            if let Some(m) = lock(p).as_mut() {
+                m.all_off();
+            }
+        }
+        self.shared.get().apply(&evs, end);
+    }
+}
+
+fn run(o: &Opts, shared: &Shared, stop: &AtomicBool, child: &Mutex<Option<Child>>, port: Option<Port>) -> Result<(), String> {
+    let port = match port {
+        Some(p) => Some(p),
+        None if o.port && !crate::dash::no_audio() => Some(open_port()?),
+        None => None,
     };
+    shared.get().port = port.as_ref().and_then(port_address);
+    let mut w = Worker { shared, port, tr: PianoTracker::new(), audio_s: 0.0, busy_s: 0.0 };
     if let Some(path) = &o.wav {
-        return replay(path, shared, stop, out.as_mut());
+        let r = replay(path, &mut w, stop);
+        w.finish();
+        if r.is_ok() {
+            shared.get().status = "replay finished".into();
+        }
+        return r;
     }
     let mut stdout = {
         let mut g = lock(child);
@@ -277,11 +404,9 @@ fn run(o: &Opts, shared: &Shared, stop: &AtomicBool, child: &Mutex<Option<Child>
         so
     };
     shared.get().status = format!("listening to {}", o.tap);
-    let mut tr = PianoTracker::new();
     let mut dm = Downmix::new();
     let mut raw = vec![0u8; 4 * 2 * 441]; // 10 ms of f32 stereo
     let mut carry: Vec<u8> = Vec::new();
-    let (mut audio_s, mut busy_s) = (0f64, 0f64);
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -296,42 +421,21 @@ fn run(o: &Opts, shared: &Shared, stop: &AtomicBool, child: &Mutex<Option<Child>
         carry.drain(..whole);
         let t = Instant::now();
         let mono = dm.push(&stereo);
-        let evs = tr.push(&mono);
-        busy_s += t.elapsed().as_secs_f64();
-        audio_s += (stereo.len() / 2) as f64 / TAP_RATE as f64;
-        if let Some(m) = out.as_mut() {
-            for e in &evs {
-                m.event(e);
-            }
-        }
-        let mut g = shared.get();
-        g.apply(&evs, tr.now());
-        if audio_s >= 0.5 {
-            let ms = busy_s * 1000.0 / audio_s * 0.5;
-            g.cpu_ms = if g.cpu_ms == 0.0 { ms } else { g.cpu_ms * 0.8 + ms * 0.2 };
-            audio_s = 0.0;
-            busy_s = 0.0;
-        }
+        let busy = t.elapsed();
+        w.feed(&mono, busy);
     }
-    let end = tr.now();
-    let evs = tr.all_off(end);
-    if let Some(m) = out.as_mut() {
-        m.all_off();
-    }
-    shared.get().apply(&evs, end);
+    w.finish();
     Ok(())
 }
 
 /// Feeds a WAV through the tracker in 10 ms steps at real-time pace. Reads a file, plays nothing.
-fn replay(path: &std::path::Path, shared: &Shared, stop: &AtomicBool, mut out: Option<&mut MidiOut<AlsaSink>>) -> Result<(), String> {
+fn replay(path: &std::path::Path, w: &mut Worker, stop: &AtomicBool) -> Result<(), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let (pcm, rate) = piano::read_wav(&bytes)?;
     let x = piano::to_rate(&pcm, rate);
-    shared.get().status = format!("replaying {}", path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default());
-    let mut tr = PianoTracker::new();
+    w.shared.get().status = format!("replaying {}", path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default());
     let step = piano::RATE as usize / 100;
     let t0 = Instant::now();
-    let (mut audio_s, mut busy_s) = (0f64, 0f64);
     for (i, c) in x.chunks(step).enumerate() {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -340,32 +444,8 @@ fn replay(path: &std::path::Path, shared: &Shared, stop: &AtomicBool, mut out: O
         if let Some(d) = due.checked_duration_since(Instant::now()) {
             std::thread::sleep(d);
         }
-        let t = Instant::now();
-        let evs = tr.push(c);
-        busy_s += t.elapsed().as_secs_f64();
-        audio_s += c.len() as f64 / piano::RATE as f64;
-        if let Some(m) = out.as_deref_mut() {
-            for e in &evs {
-                m.event(e);
-            }
-        }
-        let mut g = shared.get();
-        g.apply(&evs, tr.now());
-        if audio_s >= 0.5 {
-            let ms = busy_s * 1000.0 / audio_s * 0.5;
-            g.cpu_ms = if g.cpu_ms == 0.0 { ms } else { g.cpu_ms * 0.8 + ms * 0.2 };
-            audio_s = 0.0;
-            busy_s = 0.0;
-        }
+        w.feed(c, Duration::ZERO);
     }
-    let end = tr.now();
-    let evs = tr.all_off(end);
-    if let Some(m) = out {
-        m.all_off();
-    }
-    let mut g = shared.get();
-    g.apply(&evs, end);
-    g.status = "replay finished".into();
     Ok(())
 }
 
@@ -466,6 +546,33 @@ fn offline(wav: &str, out: Option<&str>, merged: bool, reference: Option<&str>) 
     0
 }
 
+static SIGNALLED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_sig: i32) {
+    // async-signal-safe: one atomic store
+    SIGNALLED.store(true, Ordering::Relaxed);
+}
+
+extern "C" {
+    fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+}
+
+/// SIGINT and SIGTERM set SIGNALLED instead of killing the process; a watcher copies it to `flag`.
+fn on_signals(flag: Arc<AtomicBool>) {
+    // SAFETY: installs a handler that only stores to a static atomic.
+    unsafe {
+        signal(2, on_signal);
+        signal(15, on_signal);
+    }
+    std::thread::spawn(move || loop {
+        if SIGNALLED.load(Ordering::Relaxed) {
+            flag.store(true, Ordering::Relaxed);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    });
+}
+
 fn live_cli(src: &str, port: bool, seconds: Option<f64>, out: Option<&str>, merged: bool) -> i32 {
     let cfg = crate::config::Config::load();
     let Some(id) = crate::stemcfg::resolve(&cfg, src) else {
@@ -482,8 +589,22 @@ fn live_cli(src: &str, port: bool, seconds: Option<f64>, out: Option<&str>, merg
         return 0;
     }
     let shared = Shared::new();
-    let session = Session::start(Opts { tap, tap_sink, port, wav: None }, shared.clone());
+    let port = if port {
+        match open_port() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+    let session = Session::start_with(Opts { tap, tap_sink, port: false, wav: None }, shared.clone(), port.clone());
     let eof = Arc::new(AtomicBool::new(false));
+    // Ctrl-C / SIGTERM leave through the same path as EOF: the session is dropped (joined), which
+    // sends every note-off and CC 123 before the process exits
+    on_signals(eof.clone());
     if seconds.is_none() {
         let eof = eof.clone();
         std::thread::spawn(move || {
@@ -523,8 +644,11 @@ fn live_cli(src: &str, port: bool, seconds: Option<f64>, out: Option<&str>, merg
         }
     }
     drop(session);
-    std::thread::sleep(Duration::from_millis(100));
+    drop(port);
     let mut g = shared.get();
+    for n in g.all.iter().skip(printed) {
+        println!("{:8.3}s {:>4} ({:3}) vel {:3} dur {:.3}s {}", n.t, name(n.pitch), n.pitch, n.vel, n.dur, lane(n.pitch).name());
+    }
     eprintln!("[cpu {:.2} ms per 0.5 s, attack->NoteOn {:.0} ms on the analysis stream]", g.cpu_ms, g.latency_ms);
     let notes = g.take_notes();
     if let Some(path) = out {

@@ -135,12 +135,20 @@ pub fn smf_bytes(tracks: &[(TrackSpec, Vec<Note>)], origin: Option<f64>) -> Vec<
         if let Some(prog) = spec.prog {
             ev.push((0u64, 0u8, vec![0xc0 | ch, prog & 0x7f]));
         }
-        for n in notes {
+        // a note of a key ends no later than the next start of that key on this track, so overlapping
+        // same-key notes never let the first Off cut the second note short
+        let mut order: Vec<&Note> = notes.iter().collect();
+        order.sort_by(|a, b| a.t.total_cmp(&b.t));
+        for (i, n) in order.iter().enumerate() {
             let k = n.pitch.min(127);
             let vel = n.vel.clamp(1, 127);
-            ev.push((tick(n.t), 1, vec![0x90 | ch, k, vel]));
-            // at least one tick after the note-on, so a zero-length note still stops after it starts
-            ev.push((tick(n.t + n.dur).max(tick(n.t) + 1), 0, vec![0x80 | ch, k, 0]));
+            let on = tick(n.t);
+            let mut off = tick(n.t + n.dur).max(on + 1);
+            if let Some(next) = order[i + 1..].iter().find(|m| m.pitch.min(127) == k) {
+                off = off.min(tick(next.t).max(on + 1));
+            }
+            ev.push((on, 1, vec![0x90 | ch, k, vel]));
+            ev.push((off, 0, vec![0x80 | ch, k, 0]));
         }
         out.extend(track_chunk(&mut ev));
     }

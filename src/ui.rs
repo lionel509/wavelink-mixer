@@ -2289,7 +2289,9 @@ pub fn activate(app: &adw::Application) {
     let stems_v = stems_view::View::new();
     let piano_v = piano_view::View::new(&stems_v.root);
     spec_panel.append(&piano_v.root);
-    stack.add_titled(&spec_panel, Some("spectrum"), "Spectrum");
+    // the analyser plus the Piano section is taller than the bottom pane often is (S1): it scrolls
+    let spec_scroll = gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never).vscrollbar_policy(gtk::PolicyType::Automatic).child(&spec_panel).build();
+    stack.add_titled(&spec_scroll, Some("spectrum"), "Spectrum");
     stack.add_titled(&patch_panel, Some("patch"), "Patch Bay");
     // System monitor: read-only health of the audio system (lives under the output strips)
     let sys_panel = gtk::Box::new(gtk::Orientation::Vertical, 6);

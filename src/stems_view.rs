@@ -280,6 +280,16 @@ pub(super) fn housekeep(app: &Rc<App>, remute: bool, refill: bool) {
     }
 }
 
+/// Switches Stems off (the on switch, so the panel shows it) and undoes the live mute. Called when
+/// the Piano engine leaves "Neural stems", so a hidden session can never keep a channel muted.
+pub(super) fn turn_off(app: &App) {
+    let v = app.stems.view.borrow().clone();
+    if let Some(v) = v {
+        v.on.set_active(false);
+    }
+    stop(app);
+}
+
 /// Stops the session and undoes the live mute. Called on window close.
 pub(super) fn shutdown(app: &App) {
     stop(app);

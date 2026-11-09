@@ -2,12 +2,11 @@
 //! on switch, live MIDI port, split lanes, Save MIDI, CPU and latency readout, and an 88-key piano
 //! roll with the Bass / Mid / High lanes coloured. "Neural stems" shows the #16 Stems panel.
 //! Compiled as a child of `ui` (see the #[path] mod line in ui.rs), so it can use App's private items.
-#![allow(dead_code)]
 use super::App;
 use crate::config::glib_home;
 use crate::dash::hex_rgb;
 use crate::piano::{lane, HIGH_KEY, LOW_KEY};
-use crate::piano_live::{Opts, Session, Shared};
+use crate::piano_live::{Opts, Port, Session, Shared};
 use crate::stemcfg;
 use gtk::prelude::*;
 use gtk::{glib, Orientation};
@@ -15,6 +14,8 @@ use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// Bass / Mid / High lane colours on the roll.
 pub(super) const LANE_COLORS: [&str; 3] = ["#54a0ff", "#1dd1a1", "#feca57"];
@@ -62,13 +63,31 @@ pub(super) fn save_to(c: &PianoCfg, p: &Path) {
 pub(super) struct State {
     pub(super) shared: Shared,
     session: RefCell<Option<Session>>,
+    /// The "Wavelink Piano" client: opened when Live MIDI port is ticked, kept for the app's life
+    /// across sessions and source changes, emptied (all-notes-off) when unticked or at shutdown.
+    port: Port,
     view: RefCell<Option<Rc<View>>>,
     srcs: RefCell<Vec<(String, String)>>,
+    /// The source id the running session taps.
+    running: RefCell<Option<String>>,
+    /// A one-off message (Save, errors) is shown until then instead of the session status.
+    msg_until: Cell<Option<Instant>>,
+    /// The roll needs one more paint after a stop.
+    repaint: Cell<bool>,
 }
 
 impl State {
     pub(super) fn new() -> State {
-        State { shared: Shared::new(), session: RefCell::new(None), view: RefCell::new(None), srcs: RefCell::new(Vec::new()) }
+        State {
+            shared: Shared::new(),
+            session: RefCell::new(None),
+            port: Arc::new(Mutex::new(None)),
+            view: RefCell::new(None),
+            srcs: RefCell::new(Vec::new()),
+            running: RefCell::new(None),
+            msg_until: Cell::new(None),
+            repaint: Cell::new(true),
+        }
     }
 }
 
@@ -78,8 +97,8 @@ pub(super) struct View {
     stack: gtk::Stack,
     source: gtk::DropDown,
     on: gtk::Switch,
-    port: gtk::CheckButton,
-    split: gtk::CheckButton,
+    port: gtk::ToggleButton,
+    split: gtk::ToggleButton,
     save: gtk::Button,
     status: gtk::Label,
     readout: gtk::Label,
@@ -87,30 +106,41 @@ pub(super) struct View {
     quiet: Cell<bool>,
 }
 
+fn name_it(w: &impl IsA<gtk::Accessible>, label: &str) {
+    w.update_property(&[gtk::accessible::Property::Label(label)]);
+}
+
 impl View {
     /// `stems` is the #16 Stems panel, shown when the engine is "Neural stems".
     pub(super) fn new(stems: &gtk::Box) -> Rc<View> {
         let engine = gtk::DropDown::from_strings(&["Piano DSP", "Neural stems"]);
         engine.set_tooltip_text(Some("Piano DSP: our own CPU algorithm, song → piano MIDI. Neural stems: the separator from #16."));
+        name_it(&engine, "Piano engine");
         let source = gtk::DropDown::from_strings(&[]);
         source.set_tooltip_text(Some("Channel to listen to (a passive tap: nothing is added to the mix)"));
+        name_it(&source, "Piano source");
         let on = gtk::Switch::new();
         on.set_tooltip_text(Some("Listen and turn what plays into piano MIDI"));
-        let port = gtk::CheckButton::with_label("Live MIDI port");
+        name_it(&on, "Piano on");
+        // toggle buttons, not check buttons: they expose a press action over AT-SPI
+        let port = gtk::ToggleButton::with_label("Live MIDI port");
         port.set_tooltip_text(Some("ALSA sequencer port \"Wavelink Piano\": lanes on MIDI channels 1 (Bass) / 2 (Mid) / 3 (High)"));
-        let split = gtk::CheckButton::with_label("Split lanes");
+        let split = gtk::ToggleButton::with_label("Split lanes");
         split.set_tooltip_text(Some("Save MIDI: one track per lane (Bass < C3, Mid C3–C5, High > C5) instead of one merged track"));
         let save = gtk::Button::with_label("Save MIDI");
         let status = gtk::Label::new(None);
         status.set_xalign(0.0);
         status.set_hexpand(true);
         status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        name_it(&status, "Piano status");
         let readout = gtk::Label::new(None);
-        readout.add_css_class("small");
         readout.set_tooltip_text(Some("CPU per 0.5 s of audio · attack → NoteOn on the analysis stream"));
+        name_it(&readout, "Piano CPU and latency");
 
         let head = gtk::Box::new(Orientation::Horizontal, 8);
-        head.append(&gtk::Label::new(Some("PIANO")));
+        let title = gtk::Label::new(Some("PIANO"));
+        title.add_css_class("section");
+        head.append(&title);
         head.append(&engine);
         let stack = gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).vhomogeneous(false).build();
 
@@ -124,8 +154,9 @@ impl View {
         row.append(&status);
         row.append(&readout);
         dsp.append(&row);
-        let roll = gtk::DrawingArea::new();
-        roll.set_content_height(150);
+        let roll: gtk::DrawingArea = glib::Object::builder().property("accessible-role", gtk::AccessibleRole::Img).build();
+        name_it(&roll, "Piano roll");
+        roll.set_content_height(110);
         roll.set_hexpand(true);
         roll.set_vexpand(true);
         dsp.append(&roll);
@@ -181,6 +212,7 @@ pub(super) fn wire(app: &Rc<App>, v: Rc<View>) {
     v.port.set_active(saved.port);
     v.split.set_active(saved.split);
     v.quiet.set(false);
+    set_port(app, &v, saved.port);
 
     let (a, vv) = (app.clone(), v.clone());
     v.engine.connect_selected_notify(move |d| {
@@ -188,11 +220,15 @@ pub(super) fn wire(app: &Rc<App>, v: Rc<View>) {
         if vv.quiet.get() {
             return;
         }
-        if d.selected() == 1 && vv.on.is_active() {
-            vv.on.set_active(false);
+        if d.selected() == 1 {
+            if vv.on.is_active() {
+                vv.on.set_active(false);
+            }
+        } else {
+            // the Stems panel is about to be hidden: never leave its session (and a live mute) running
+            super::stems_view::turn_off(&a);
         }
         edit(|c| c.engine = engine_name(d.selected()).into());
-        let _ = &a;
     });
     let (a, vv) = (app.clone(), v.clone());
     v.source.connect_selected_notify(move |_| {
@@ -211,7 +247,7 @@ pub(super) fn wire(app: &Rc<App>, v: Rc<View>) {
         }
         let on = b.is_active();
         edit(|c| c.port = on);
-        restart_if_on(&a);
+        set_port(&a, &vv, on);
     });
     let vv = v.clone();
     v.split.connect_toggled(move |b| {
@@ -236,6 +272,31 @@ pub(super) fn wire(app: &Rc<App>, v: Rc<View>) {
     }
 }
 
+/// Fills or empties the long-lived port slot. A running session follows it without a restart.
+/// Never opened under MIXER_NO_AUDIO.
+fn set_port(app: &App, v: &View, on: bool) {
+    let mut slot = app.piano.port.lock().unwrap_or_else(|e| e.into_inner());
+    if on && slot.is_none() && !crate::dash::no_audio() {
+        match crate::piano_live::AlsaSink::open() {
+            Ok(s) => *slot = Some(crate::piano_live::MidiOut::new(s)),
+            Err(e) => {
+                drop(slot);
+                say(app, v, &format!("MIDI port: {e}"));
+                return;
+            }
+        }
+    } else if !on {
+        // dropping the MidiOut sends the note-offs and CC 123 before the client closes
+        *slot = None;
+    }
+}
+
+/// Shows a one-off message for 4 s, over the session status.
+fn say(app: &App, v: &View, msg: &str) {
+    v.status.set_text(msg);
+    app.piano.msg_until.set(Some(Instant::now() + std::time::Duration::from_secs(4)));
+}
+
 /// Reads piano.json, applies one change, writes it back (env overrides are never saved).
 fn edit(f: impl FnOnce(&mut PianoCfg)) {
     let p = cfg_path();
@@ -258,9 +319,11 @@ fn fill_sources(app: &App, v: &View, list: Vec<(String, String)>, want: &str) {
     *app.piano.srcs.borrow_mut() = list;
 }
 
+/// Source change: a new session on the new tap. The take (roll and unsaved notes) and the MIDI port
+/// carry over; the old session sends its note-offs before the new one starts.
 fn restart_if_on(app: &Rc<App>) {
     if app.piano.session.borrow().is_some() {
-        stop(app);
+        *app.piano.session.borrow_mut() = None;
         start(app);
     }
 }
@@ -269,10 +332,11 @@ fn start(app: &Rc<App>) {
     let Some(v) = app.piano.view.borrow().clone() else {
         return;
     };
-    let src = source_id(app, &v).and_then(|id| stemcfg::resolve(&app.cfg.borrow(), &id));
+    let id = source_id(app, &v);
+    let src = id.clone().and_then(|id| stemcfg::resolve(&app.cfg.borrow(), &id));
     let input = src.and_then(|id| app.cfg.borrow().inputs.iter().find(|i| i.id == id).cloned());
     let Some(input) = input else {
-        v.status.set_text("no channel to read");
+        say(app, &v, "no channel to read");
         v.on.set_active(false);
         return;
     };
@@ -284,17 +348,21 @@ fn start(app: &Rc<App>) {
         return;
     }
     let (tap, tap_sink) = stemcfg::tap(&input);
-    let port = v.port.is_active() && !crate::dash::no_audio();
-    *app.piano.session.borrow_mut() = Some(Session::start(Opts { tap, tap_sink, port, wav }, app.piano.shared.clone()));
+    *app.piano.running.borrow_mut() = id;
+    let port = Some(app.piano.port.clone());
+    *app.piano.session.borrow_mut() = Some(Session::start_with(Opts { tap, tap_sink, port: false, wav }, app.piano.shared.clone(), port));
 }
 
-/// Drops the session (kills its tap; the worker sends all-notes-off and closes the port).
+/// Drops the session (joined: its note-offs are out when this returns). The take stays for Save MIDI.
 fn stop(app: &App) {
     *app.piano.session.borrow_mut() = None;
+    *app.piano.running.borrow_mut() = None;
+    app.piano.repaint.set(true);
     if let Some(v) = app.piano.view.borrow().as_ref() {
-        if crate::dash::no_audio() {
-            v.status.set_text("");
+        if app.piano.msg_until.get().is_none_or(|t| Instant::now() >= t) {
+            v.status.set_text("stopped");
         }
+        v.readout.set_text("");
     }
 }
 
@@ -306,25 +374,33 @@ pub(super) fn step(app: &Rc<App>, _dt: f64) {
     if !v.root.is_mapped() || v.stack.visible_child_name().as_deref() != Some("dsp") {
         return;
     }
-    v.roll.queue_draw();
-    if app.piano.session.borrow().is_none() {
+    let running = app.piano.session.borrow().is_some();
+    if running || app.piano.repaint.replace(false) {
+        v.roll.queue_draw();
+    }
+    if !running {
         return;
     }
-    let g = app.piano.shared.get();
-    let st = match &g.port {
-        Some(p) => format!("{} · port {p}", g.status),
-        None => g.status.clone(),
+    let (status, cpu, lat) = {
+        let g = app.piano.shared.get();
+        (g.status.clone(), g.cpu_ms, g.latency_ms)
     };
-    if v.status.text() != st {
+    let st = match crate::piano_live::port_address(&app.piano.port) {
+        Some(p) => format!("{status} · port {p}"),
+        None => status,
+    };
+    let msg = app.piano.msg_until.get().is_some_and(|t| Instant::now() < t);
+    if !msg && v.status.text() != st {
         v.status.set_text(&st);
     }
-    let r = format!("{:.1} ms · {:.0} ms", g.cpu_ms, g.latency_ms);
+    let r = format!("CPU {cpu:.1} ms/0.5 s · latency {lat:.0} ms");
     if v.readout.text() != r {
         v.readout.set_text(&r);
     }
 }
 
-/// Re-lists the channels every second (called from the 100 ms housekeeping loop).
+/// Re-lists the channels every second (called from the 100 ms housekeeping loop). If the source a
+/// session taps disappears, the session stops with a message instead of tapping a stale node.
 pub(super) fn housekeep(app: &Rc<App>, refill: bool) {
     let Some(v) = app.piano.view.borrow().clone() else {
         return;
@@ -333,13 +409,21 @@ pub(super) fn housekeep(app: &Rc<App>, refill: bool) {
         let list = stemcfg::sources(&app.cfg.borrow());
         if list != *app.piano.srcs.borrow() {
             let keep = source_id(app, &v).unwrap_or_default();
+            let gone = !list.iter().any(|(id, _)| *id == keep);
             fill_sources(app, &v, list, &keep);
+            let running = app.piano.running.borrow().clone();
+            if gone && running.as_deref() == Some(keep.as_str()) {
+                v.on.set_active(false);
+                say(app, &v, &format!("{keep} is gone: stopped"));
+            }
         }
     }
 }
 
+/// Window close: stop the session and close the port (all-notes-off first).
 pub(super) fn shutdown(app: &App) {
     stop(app);
+    *app.piano.port.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// home/Music/wavelink/piano-<source>-<stamp>.mid, then -2, -3... on a clash; never overwrites.
@@ -358,21 +442,18 @@ pub(super) fn create_midi(home: &Path, source: &str, stamp: &str) -> std::io::Re
 }
 
 fn save_midi(app: &Rc<App>, v: &View) {
-    let notes = app.piano.shared.get().take_notes();
+    // a copy: Save never drains the take, and sounding notes are cut at now in the copy only
+    let notes = app.piano.shared.get().snapshot();
     if notes.is_empty() {
-        v.status.set_text("no notes yet");
+        say(app, v, "no notes yet");
         return;
     }
     let src = source_id(app, v).unwrap_or_else(|| "source".into());
     let stamp = glib::DateTime::now_local().and_then(|d| d.format("%Y%m%d-%H%M%S")).map(|s| s.to_string()).unwrap_or_else(|_| "unknown-time".into());
     let bytes = crate::notes::piano_midi(&notes, v.split.is_active(), None);
     match create_midi(&glib_home(), &src, &stamp).and_then(|(p, mut f)| f.write_all(&bytes).map(|_| p)) {
-        Ok(p) => v.status.set_text(&format!("saved {} ({} notes)", p.display(), notes.len())),
-        Err(e) => {
-            // put the notes back so a retry can still save them
-            app.piano.shared.get().all.extend(notes);
-            v.status.set_text(&format!("save failed: {e}"));
-        }
+        Ok(p) => say(app, v, &format!("saved {} ({} notes)", p.display(), notes.len())),
+        Err(e) => say(app, v, &format!("save failed: {e}")),
     }
 }
 
@@ -392,8 +473,12 @@ fn draw_roll(cr: &gtk::cairo::Context, w: f64, h: f64, sh: &Shared) {
         cr.rectangle(0.0, y(split) + kh - 0.5, w, 1.0);
     }
     let _ = cr.fill();
-    let g = sh.get();
-    let now = g.now;
+    // copy out, so the worker never waits on a paint
+    let (roll, open, now) = {
+        let g = sh.get();
+        let from = g.now - ROLL_S;
+        (g.roll.iter().filter(|n| n.t + n.dur >= from).cloned().collect::<Vec<_>>(), g.open.clone(), g.now)
+    };
     let from = now - ROLL_S;
     let x = |t: f64| (t - from) / ROLL_S * (w - 1.0);
     let draw = |t: f64, dur: f64, p: u8, vel: u8| {
@@ -405,10 +490,10 @@ fn draw_roll(cr: &gtk::cairo::Context, w: f64, h: f64, sh: &Shared) {
         cr.rectangle(x(t), y(p), (dur / ROLL_S * (w - 1.0)).max(2.0), kh.max(1.5));
         let _ = cr.fill();
     };
-    for n in g.roll.iter() {
+    for n in roll.iter() {
         draw(n.t, n.dur, n.pitch, n.vel);
     }
-    for &(t, p, vel) in g.open.iter() {
+    for &(t, p, vel, _) in open.iter() {
         draw(t, now - t, p, vel);
     }
     cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
