@@ -418,11 +418,11 @@ fn r2_probe_renamed_raop_destination_has_no_ceiling() {
 /// the fader cannot be raised with the arrow keys from 0 dB or from most of -10..0 dB.
 #[test]
 fn red_r2_snap_back_also_undoes_rounding_keyboard_up_is_stuck() {
-    // exact copy of the handler's arithmetic
+    // the handler's arithmetic (fix round 3: the snap-back decision is crate::busvol::snap_back, called by ui.rs)
     fn key_up(pos: f64, ceil: f64) -> f64 {
         let v = pos + 0.001;
         let db = write_db(pos_to_db(v), ceil);
-        if db_to_pos(db) + 1e-6 < v { db_to_pos(db) } else { v }
+        crate::busvol::snap_back(v, db, ceil).unwrap_or(v)
     }
     let mut stuck = vec![];
     for start in [0.0, -10.0, -6.0, -3.0, -30.0] {

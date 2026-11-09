@@ -68,6 +68,12 @@ pub fn write_db(pos_db: f64, ceiling_db: f64) -> f64 {
     db.min(ceiling_db)
 }
 
+/// Where the slider must be put back after a write, if anywhere: only when its position is above the
+/// ceiling (never for the 0.1 dB rounding or the unity snap, which would undo a keyboard step).
+pub fn snap_back(pos: f64, written_db: f64, ceiling_db: f64) -> Option<f64> {
+    (crate::dash::pos_to_db(pos) > ceiling_db + 1e-6).then(|| crate::dash::db_to_pos(written_db))
+}
+
 /// Everything the adopt-vs-re-apply decision looks at, for one physical bus.
 #[derive(Clone, Copy, Debug)]
 pub struct Obs {
@@ -415,6 +421,22 @@ mod tests {
         assert_eq!(write_db(0.2, MAX_DB), 0.0);
         assert_eq!(write_db(pos_to_db(1.0), MAX_DB), MAX_DB);
         assert_eq!(write_db(f64::NAN, ceil), MIN_DB);
+    }
+
+    #[test]
+    fn snap_back_only_above_the_ceiling() {
+        use crate::dash::{db_to_pos, pos_to_db};
+        // rounding / unity snap below the position: no snap back
+        let p = db_to_pos(-3.0) + 0.001;
+        assert_eq!(snap_back(p, write_db(pos_to_db(p), MAX_DB), MAX_DB), None);
+        let p = db_to_pos(0.1);
+        assert_eq!(snap_back(p, write_db(pos_to_db(p), MAX_DB), MAX_DB), None);
+        // above the ceiling: back to it
+        let p = db_to_pos(-10.0);
+        assert_eq!(snap_back(p, write_db(pos_to_db(p), -20.0), -20.0), Some(db_to_pos(-20.0)));
+        assert_eq!(snap_back(1.0, write_db(pos_to_db(1.0), -20.0), -20.0), Some(db_to_pos(-20.0)));
+        // at the ceiling exactly: stays
+        assert_eq!(snap_back(db_to_pos(-20.0), -20.0, -20.0), None);
     }
 
     #[test]

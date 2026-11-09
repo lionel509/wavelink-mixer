@@ -1205,10 +1205,10 @@ impl App {
             if f.updating.get() {
                 return;
             }
-            if db_to_pos(db) + 1e-6 < s.value() {
-                // above the ceiling: the cap stops at it
+            if let Some(p) = crate::busvol::snap_back(s.value(), db, f.max_db.get()) {
+                // above the ceiling: the cap stops at it (rounding / the unity snap never move it back)
                 f.updating.set(true);
-                s.set_value(db_to_pos(db));
+                s.set_value(p);
                 f.updating.set(false);
             }
             f.busy.set(6);
