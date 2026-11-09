@@ -1,6 +1,9 @@
-# Synthetic NxM config from a base config.json (read-only; override with BASE_CONFIG). Usage: gen_config.py N_INPUTS N_BUSES HOME_DIR
+# Synthetic NxM config from a base config.json given in $BASE_CONFIG (required; never defaults to the live config).
+# Usage: BASE_CONFIG=... gen_config.py N_INPUTS N_BUSES HOME_DIR
 import json,sys,os
-src=json.load(open(os.environ.get('BASE_CONFIG', os.path.expanduser('~/.config/wavelink-mixer/config.json'))))
+import sys as _s
+if 'BASE_CONFIG' not in os.environ: _s.exit('BASE_CONFIG is required')
+src=json.load(open(os.environ['BASE_CONFIG']))
 nin,nbus,home=int(sys.argv[1]),int(sys.argv[2]),sys.argv[3]
 base=src['inputs'][1]
 names=['system','spotify','discord','browser','game','mic','piano','stems']+[f'x{k}' for k in range(20)]
