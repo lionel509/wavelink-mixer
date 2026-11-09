@@ -97,39 +97,209 @@ fn track_chunk(events: &mut Vec<(u64, u8, Vec<u8>)>) -> Vec<u8> {
     out
 }
 
-/// SMF 1, 480 tpq. Track 0 is the tempo map; then drums (ch 9, pitch 0 -> key 38), bass (ch 1, prog 33), other (ch 2, prog 0).
-pub fn midi_bytes(tracks: &[Vec<Note>; 3]) -> Vec<u8> {
-    let t_min = tracks.iter().flatten().map(|n| n.t).fold(f64::INFINITY, f64::min);
-    let t_min = if t_min.is_finite() { t_min } else { 0.0 };
-    let tick = |t: f64| ((t - t_min) * TICKS_PER_SEC).round().max(0.0) as u64;
+/// One SMF track: MIDI channel (0-based), optional program change and track name.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrackSpec {
+    pub ch: u8,
+    pub prog: Option<u8>,
+    pub name: Option<String>,
+}
+
+/// SMF 1, 480 tpq, 120 bpm. Track 0 is the tempo map, then one track per entry. Times are measured
+/// from `origin`, or from the earliest note when `origin` is None. Notes are written as given
+/// (key = pitch, length = dur, at least one tick).
+pub fn smf_bytes(tracks: &[(TrackSpec, Vec<Note>)], origin: Option<f64>) -> Vec<u8> {
+    let t_min = tracks.iter().flat_map(|t| t.1.iter()).map(|n| n.t).fold(f64::INFINITY, f64::min);
+    let t0 = origin.unwrap_or(if t_min.is_finite() { t_min } else { 0.0 });
+    let tick = |t: f64| ((t - t0) * TICKS_PER_SEC).round().max(0.0) as u64;
 
     let mut out = Vec::new();
     out.extend_from_slice(b"MThd");
     out.extend_from_slice(&6u32.to_be_bytes());
     out.extend_from_slice(&1u16.to_be_bytes()); // format 1
-    out.extend_from_slice(&4u16.to_be_bytes()); // track count: tempo + 3 stems
+    out.extend_from_slice(&(tracks.len() as u16 + 1).to_be_bytes()); // tempo + tracks
     out.extend_from_slice(&(TPQ as u16).to_be_bytes());
 
     let mut tempo = vec![(0u64, 0u8, vec![0xff, 0x51, 0x03, 0x07, 0xa1, 0x20])];
     out.extend(track_chunk(&mut tempo));
 
-    for (stem, notes) in tracks.iter().enumerate() {
-        let (ch, prog) = PROGRAMS[stem];
+    for (spec, notes) in tracks {
+        let ch = spec.ch & 0x0f;
         let mut ev = Vec::new();
-        if stem != 0 {
-            ev.push((0u64, 0u8, vec![0xc0 | ch, prog]));
+        if let Some(name) = &spec.name {
+            let mut b = vec![0xff, 0x03];
+            write_vlq(name.len() as u32, &mut b);
+            b.extend_from_slice(name.as_bytes());
+            ev.push((0u64, 0u8, b));
+        }
+        if let Some(prog) = spec.prog {
+            ev.push((0u64, 0u8, vec![0xc0 | ch, prog & 0x7f]));
         }
         for n in notes {
-            let k = key(stem, n.pitch);
-            let dur = if stem == 0 { DRUM_DUR } else { n.dur };
+            let k = n.pitch.min(127);
             let vel = n.vel.clamp(1, 127);
             ev.push((tick(n.t), 1, vec![0x90 | ch, k, vel]));
             // at least one tick after the note-on, so a zero-length note still stops after it starts
-            ev.push((tick(n.t + dur).max(tick(n.t) + 1), 0, vec![0x80 | ch, k, 0]));
+            ev.push((tick(n.t + n.dur).max(tick(n.t) + 1), 0, vec![0x80 | ch, k, 0]));
         }
         out.extend(track_chunk(&mut ev));
     }
     out
+}
+
+/// SMF 1, 480 tpq. Track 0 is the tempo map; then drums (ch 9, pitch 0 -> key 38), bass (ch 1, prog 33), other (ch 2, prog 0).
+pub fn midi_bytes(tracks: &[Vec<Note>; 3]) -> Vec<u8> {
+    let specs: Vec<(TrackSpec, Vec<Note>)> = tracks
+        .iter()
+        .enumerate()
+        .map(|(stem, notes)| {
+            let (ch, prog) = PROGRAMS[stem];
+            let notes = notes
+                .iter()
+                .map(|n| Note { t: n.t, dur: if stem == 0 { DRUM_DUR } else { n.dur }, pitch: key(stem, n.pitch), vel: n.vel })
+                .collect();
+            (TrackSpec { ch, prog: if stem == 0 { None } else { Some(prog) }, name: None }, notes)
+        })
+        .collect();
+    smf_bytes(&specs, None)
+}
+
+/// Piano export: Acoustic Grand (program 0). `split` writes one track per lane (Bass / Mid / High on
+/// MIDI channels 1 / 2 / 3), otherwise one merged track on channel 1. `origin` as in `smf_bytes`.
+pub fn piano_midi(notes: &[Note], split: bool, origin: Option<f64>) -> Vec<u8> {
+    if split {
+        let lanes = crate::piano::split_lanes(notes);
+        let tracks: Vec<(TrackSpec, Vec<Note>)> = crate::piano::LANES
+            .iter()
+            .zip(lanes)
+            .map(|(l, v)| (TrackSpec { ch: l.index() as u8, prog: Some(0), name: Some(format!("Piano {}", l.name())) }, v))
+            .collect();
+        smf_bytes(&tracks, origin)
+    } else {
+        smf_bytes(&[(TrackSpec { ch: 0, prog: Some(0), name: Some("Piano".into()) }, notes.to_vec())], origin)
+    }
+}
+
+/// A parsed note: track index (0 = the first chunk), channel, program in effect, and the note.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParsedNote {
+    pub track: usize,
+    pub ch: u8,
+    pub prog: u8,
+    pub note: Note,
+}
+
+fn read_vlq(b: &[u8], i: &mut usize) -> Result<u32, String> {
+    let mut v = 0u32;
+    for _ in 0..4 {
+        let c = *b.get(*i).ok_or("truncated varlen")?;
+        *i += 1;
+        v = (v << 7) | (c & 0x7f) as u32;
+        if c & 0x80 == 0 {
+            return Ok(v);
+        }
+    }
+    Err("varlen too long".into())
+}
+
+/// A small SMF (format 0/1, PPQ timing) reader: notes in seconds, honouring tempo changes from any
+/// track, running status, and note-on with velocity 0 as note-off. Enough to round-trip our writer
+/// and to score a reference file.
+pub fn parse_smf(b: &[u8]) -> Result<Vec<ParsedNote>, String> {
+    if b.len() < 14 || &b[..4] != b"MThd" {
+        return Err("not a MIDI file".into());
+    }
+    let hlen = u32::from_be_bytes(b[4..8].try_into().unwrap()) as usize;
+    let ntrk = u16::from_be_bytes([b[10], b[11]]) as usize;
+    let div = u16::from_be_bytes([b[12], b[13]]);
+    if div & 0x8000 != 0 || div == 0 {
+        return Err("SMPTE timing not supported".into());
+    }
+    let tpq = div as f64;
+    // pass 1: collect raw events (abs tick, track, bytes)
+    let mut pos = 8 + hlen;
+    let mut tempos: Vec<(u64, u32)> = Vec::new();
+    let mut evs: Vec<(u64, usize, u8, u8, u8)> = Vec::new(); // tick, track, status, d1, d2
+    for trk in 0..ntrk {
+        if pos + 8 > b.len() || &b[pos..pos + 4] != b"MTrk" {
+            return Err(format!("track {trk}: bad chunk"));
+        }
+        let len = u32::from_be_bytes(b[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let body = b.get(pos + 8..pos + 8 + len).ok_or("truncated track")?;
+        pos += 8 + len;
+        let (mut i, mut tick, mut status) = (0usize, 0u64, 0u8);
+        while i < body.len() {
+            tick += read_vlq(body, &mut i)? as u64;
+            let first = *body.get(i).ok_or("truncated event")?;
+            if first == 0xff {
+                let ty = *body.get(i + 1).ok_or("truncated meta")?;
+                i += 2;
+                let l = read_vlq(body, &mut i)? as usize;
+                let d = body.get(i..i + l).ok_or("truncated meta data")?;
+                if ty == 0x51 && l == 3 {
+                    tempos.push((tick, u32::from_be_bytes([0, d[0], d[1], d[2]])));
+                }
+                i += l;
+                if ty == 0x2f {
+                    break;
+                }
+                continue;
+            }
+            if first == 0xf0 || first == 0xf7 {
+                i += 1;
+                let l = read_vlq(body, &mut i)? as usize;
+                i += l;
+                continue;
+            }
+            if first & 0x80 != 0 {
+                status = first;
+                i += 1;
+            } else if status == 0 {
+                return Err("running status without a status".into());
+            }
+            let n = if matches!(status & 0xf0, 0xc0 | 0xd0) { 1 } else { 2 };
+            let d = body.get(i..i + n).ok_or("truncated channel event")?;
+            evs.push((tick, trk, status, d[0], if n == 2 { d[1] } else { 0 }));
+            i += n;
+        }
+    }
+    tempos.sort_by_key(|t| t.0);
+    let secs = |tick: u64| -> f64 {
+        let (mut t, mut last, mut us) = (0f64, 0u64, 500_000u32);
+        for &(tt, v) in &tempos {
+            if tt >= tick {
+                break;
+            }
+            t += (tt - last) as f64 * us as f64 / 1e6 / tpq;
+            last = tt;
+            us = v;
+        }
+        t + (tick - last) as f64 * us as f64 / 1e6 / tpq
+    };
+    evs.sort_by_key(|e| (e.0, e.1));
+    let mut prog = [0u8; 16];
+    let mut open: std::collections::HashMap<(usize, u8, u8), (f64, u8, u8)> = Default::default();
+    let mut out = Vec::new();
+    for (tick, trk, st, d1, d2) in evs {
+        let ch = st & 0x0f;
+        match st & 0xf0 {
+            0xc0 => prog[ch as usize] = d1,
+            0x90 if d2 > 0 => {
+                let t = secs(tick);
+                if let Some((t0, v, p)) = open.insert((trk, ch, d1), (t, d2, prog[ch as usize])) {
+                    out.push(ParsedNote { track: trk, ch, prog: p, note: Note { t: t0, dur: t - t0, pitch: d1, vel: v } });
+                }
+            }
+            0x80 | 0x90 => {
+                if let Some((t0, v, p)) = open.remove(&(trk, ch, d1)) {
+                    out.push(ParsedNote { track: trk, ch, prog: p, note: Note { t: t0, dur: secs(tick) - t0, pitch: d1, vel: v } });
+                }
+            }
+            _ => {}
+        }
+    }
+    out.sort_by(|a, b| a.note.t.total_cmp(&b.note.t).then(a.note.pitch.cmp(&b.note.pitch)));
+    Ok(out)
 }
 
 /// Per note: (t + lag, "noteon C K V") and (t + lag + d, "noteoff C K"). Drums: K = 38 if pitch == 0, d = 0.1.
@@ -383,6 +553,41 @@ mod tests {
         let p = synth_props("ch_stems");
         assert!(p.contains("target.object=ch_stems"), "{p}");
         assert!(p.contains("node.name=stems_synth"), "{p}");
+    }
+
+    #[test]
+    fn smf_roundtrips_through_parser() {
+        let notes = vec![n(0.25, 0.5, 40, 90), n(0.25, 1.0, 60, 100), n(1.0, 0.25, 76, 64), n(1.5, 0.125, 60, 30)];
+        let b = piano_midi(&notes, true, Some(0.0));
+        let p = parse_smf(&b).unwrap();
+        assert_eq!(p.len(), notes.len());
+        for (got, want) in p.iter().zip(&notes) {
+            assert!((got.note.t - want.t).abs() < 1.5 / 960.0, "{got:?} vs {want:?}");
+            assert!((got.note.dur - want.dur).abs() < 1.5 / 960.0, "{got:?} vs {want:?}");
+            assert_eq!((got.note.pitch, got.note.vel, got.prog), (want.pitch, want.vel, 0));
+            let lane = crate::piano::lane(want.pitch).index();
+            assert_eq!((got.track, got.ch as usize), (lane + 1, lane), "lane track/channel for {want:?}");
+        }
+        let merged = parse_smf(&piano_midi(&notes, false, Some(0.0))).unwrap();
+        assert!(merged.iter().all(|p| p.track == 1 && p.ch == 0));
+        assert_eq!(merged.len(), 4);
+        // origin None measures from the first note, as the stems export does
+        let shifted = parse_smf(&piano_midi(&notes, false, None)).unwrap();
+        assert!((shifted[0].note.t).abs() < 1e-9);
+        // the stems writer keeps its layout: 4 chunks, drums on channel 9 as key 38
+        let st = parse_smf(&midi_bytes(&[vec![n(0.0, 0.5, 0, 100)], vec![n(0.0, 1.0, 40, 90)], vec![]])).unwrap();
+        assert_eq!(st.len(), 2);
+        assert!(st.iter().any(|p| p.ch == 9 && p.note.pitch == 38 && (p.note.dur - 0.1).abs() < 0.002));
+        assert!(st.iter().any(|p| p.ch == 1 && p.prog == 33 && p.note.pitch == 40));
+    }
+
+    #[test]
+    fn parse_smf_rejects_garbage() {
+        assert!(parse_smf(b"RIFF....").is_err());
+        assert!(parse_smf(&[]).is_err());
+        let mut b = piano_midi(&[n(0.0, 0.5, 60, 90)], false, Some(0.0));
+        b.truncate(b.len() - 3);
+        assert!(parse_smf(&b).is_err());
     }
 
     /// A zero-length note still writes its note-on before its note-off, and back-to-back notes of the

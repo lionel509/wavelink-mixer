@@ -6,6 +6,7 @@ mod dash;
 mod dsp;
 mod models;
 mod notes;
+mod piano;
 mod sep;
 mod stemcfg;
 mod stems;
