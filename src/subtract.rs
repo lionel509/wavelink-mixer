@@ -1320,7 +1320,7 @@ impl SubTracker {
                         if self.allow(k, s, pk, own_rise) {
                             self.last_on[k] = s;
                             self.lvl[k] = v;
-                            evs.push(Ev::On { t: Self::t(s), pitch, vel });
+                            evs.push(Ev::On { t: (Self::t(s) - tun("ONSET_SHIFT", 0.02) as f64).max(0.0), pitch, vel });
                             KeySeg::On { s, pk, below: 0 }
                         } else {
                             self.blocked += 1;
