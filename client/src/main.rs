@@ -1,16 +1,17 @@
 //! Wavelink Remote: view and control a wavelink-mixer engine from another computer.
 //!
 //!   wavelink-remote                         open the window
-//!   wavelink-remote --probe HOST[:PORT] TOKEN ['<command json>'...]
+//!   wavelink-remote --probe HOST[:PORT] ['<command json>'...]
 //!       headless check: print the engine's state, send each command (e.g. '{"op":"set_bus_gain","bus":"a1","db":-20}'),
-//!       print the acks/deltas and a few meter frames, then exit
+//!       print the acks/deltas and a few meter frames, then exit. The token comes from $WAVELINK_REMOTE_TOKEN,
+//!       else the first line of stdin (never argv: `ps` would show it).
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 mod discover;
 mod net;
 mod settings;
 
 use eframe::egui::{self, Color32, RichText, Vec2};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use wavelink_proto::{self as p, ClientMsg, Command, ServerMsg};
 
@@ -22,7 +23,15 @@ const SEND_EVERY: Duration = Duration::from_millis(40);
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|a| a == "--probe").unwrap_or(false) {
-        std::process::exit(probe(args.get(2).cloned().unwrap_or_default(), args.get(3).cloned().unwrap_or_default(), args.get(4..).unwrap_or_default()));
+        let token = match std::env::var("WAVELINK_REMOTE_TOKEN") {
+            Ok(t) if !t.trim().is_empty() => t,
+            _ => {
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+                line
+            }
+        };
+        std::process::exit(probe(args.get(2).cloned().unwrap_or_default(), token.trim().to_string(), args.get(3..).unwrap_or_default()));
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title("Wavelink Remote").with_inner_size([1180.0, 660.0]).with_min_inner_size([480.0, 360.0]),
@@ -164,7 +173,8 @@ struct Remote {
     meters: HashMap<String, Ballistic>,
     meter_raw: HashMap<String, (f32, f32)>,
     held: HashMap<String, Held>,
-    unlock: HashSet<String>,
+    /// buses this connection holds a server-side unlock for, until when (the server says, and expires it)
+    unlock: HashMap<String, Instant>,
     note: Option<(String, Instant)>,
     next_id: u64,
     addr_edit: String,
@@ -191,7 +201,7 @@ impl Remote {
             meters: HashMap::new(),
             meter_raw: HashMap::new(),
             held: HashMap::new(),
-            unlock: HashSet::new(),
+            unlock: HashMap::new(),
             note: None,
             next_id: 1,
             addr_edit,
@@ -292,6 +302,13 @@ impl Remote {
             ServerMsg::Ack { ok: false, error: Some(e), .. } => self.note = Some((e, Instant::now())),
             ServerMsg::Ack { note: Some(n), .. } => self.note = Some((n, Instant::now())),
             ServerMsg::Error { message, .. } => self.note = Some((message, Instant::now())),
+            ServerMsg::Unlock { bus, seconds } => {
+                if seconds > 0 {
+                    self.unlock.insert(bus, Instant::now() + Duration::from_secs(seconds as u64));
+                } else {
+                    self.unlock.remove(&bus);
+                }
+            }
             _ => {}
         }
     }
@@ -447,29 +464,42 @@ impl Remote {
         strip_frame(ui, color, |ui| {
             ui.label(RichText::new(&b.name).strong().size(15.0));
             ui.label(RichText::new(format!("{} · {}", b.id.to_uppercase(), if b.physical() { "output" } else { "virtual" })).small().weak());
-            let unlocked = self.unlock.contains(&b.id);
-            let cap = b.max_db.filter(|_| !unlocked);
-            if let Some(mut db) = self.fader(ui, &format!("bus:{}", b.id), b.gain_db, color, Some(format!("bus:{}", b.id)), b.max_db) {
+            let left = self.unlock.get(&b.id).map(|t| t.saturating_duration_since(Instant::now()).as_secs()).filter(|s| *s > 0);
+            let unlocked = left.is_some();
+            // what the server will allow: the soft cap unless unlocked, never above the hard ceiling
+            let cap = match (b.max_db.filter(|_| !unlocked), b.ceiling_db) {
+                (Some(a), Some(c)) => Some(a.min(c)),
+                (a, c) => a.or(c),
+            };
+            if let Some(mut db) = self.fader(ui, &format!("bus:{}", b.id), b.gain_db, color, Some(format!("bus:{}", b.id)), cap) {
                 if let Some(c) = cap {
                     db = db.min(c); // the server enforces this too
                 }
-                self.send(Command::SetBusGain { bus: b.id.clone(), db, unlock: unlocked });
+                self.send(Command::SetBusGain { bus: b.id.clone(), db, unlock: false });
             }
             if ui.add(egui::Button::new(RichText::new("M").strong()).fill(if b.mute { Color32::from_rgb(220, 50, 50) } else { Color32::from_gray(45) })).clicked() {
                 self.send(Command::SetBusMute { bus: b.id.clone(), mute: !b.mute });
             }
-            if let Some(c) = b.max_db {
+            if let Some(c) = b.ceiling_db {
+                ui.label(RichText::new(format!("max {c:.0} dB")).small().color(Color32::from_rgb(255, 100, 60))).on_hover_text("Hard ceiling set on the PC: never louder");
+            }
+            if let Some(c) = b.max_db.filter(|c| b.ceiling_db.map_or(true, |x| *c < x)) {
                 ui.label(RichText::new(format!("cap {c:.0} dB")).small().color(Color32::from_rgb(255, 160, 40)));
                 let mut u = unlocked;
-                if ui.checkbox(&mut u, "unlock").on_hover_text("Allow this output above its safety cap (still +6 dB per step at most)").changed() {
-                    if u {
-                        self.unlock.insert(b.id.clone());
-                    } else {
-                        self.unlock.remove(&b.id);
+                let label = match left {
+                    Some(s) => format!("unlocked {s}s"),
+                    None => "unlock".into(),
+                };
+                if ui.checkbox(&mut u, label).on_hover_text("Allow this output above its safety cap for 60 s (this connection only; the ceiling and the raise limit still apply)").changed() {
+                    if let Some(c) = &self.conn {
+                        c.send(ClientMsg::Unlock { bus: b.id.clone(), on: u });
                     }
                 }
+                if unlocked {
+                    ui.ctx().request_repaint_after(Duration::from_millis(500));
+                }
             } else if b.physical() {
-                ui.label(RichText::new("+6 dB/step").small().weak());
+                ui.label(RichText::new("raise ≤ 12 dB/s").small().weak());
             }
         });
     }
@@ -631,7 +661,7 @@ mod tests {
             meters: HashMap::new(),
             meter_raw: HashMap::new(),
             held: HashMap::new(),
-            unlock: HashSet::new(),
+            unlock: HashMap::new(),
             note: None,
             next_id: 1,
             addr_edit: String::new(),
@@ -643,7 +673,7 @@ mod tests {
             rev: 1,
             server: "x".into(),
             inputs: vec![],
-            buses: vec![p::Bus { id: "a1".into(), name: "H".into(), color: "#fff".into(), kind: p::BusKind::Physical, gain_db: -10.0, mute: false, outputs: vec![], max_db: None }],
+            buses: vec![p::Bus { id: "a1".into(), name: "H".into(), color: "#fff".into(), kind: p::BusKind::Physical, gain_db: -10.0, mute: false, outputs: vec![], max_db: None, ceiling_db: None }],
             zones: vec![],
         };
         r.on_msg(ServerMsg::State { state: st });
@@ -655,5 +685,10 @@ mod tests {
         r.on_msg(ServerMsg::Meters { meters: p::Meters { inputs: vec![], buses: vec![p::Level { id: "a1".into(), peak_db: -3.0, rms_db: -12.0 }] } });
         r.step_meters(0.016);
         assert_eq!(r.meters["bus:a1"].peak, -3.0);
+        // unlock state comes from the server, and it can take it back
+        r.on_msg(ServerMsg::Unlock { bus: "a1".into(), seconds: 60 });
+        assert!(r.unlock["a1"] > Instant::now() + Duration::from_secs(50));
+        r.on_msg(ServerMsg::Unlock { bus: "a1".into(), seconds: 0 });
+        assert!(!r.unlock.contains_key("a1"));
     }
 }
