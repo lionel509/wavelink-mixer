@@ -614,3 +614,194 @@ mod tests {
         assert!(expected(&cfg).len() >= 10 * 6);
     }
 }
+
+/// Breaker round 1 for PR #27 (#22). `sim` mirrors the step-2 restart decision in `run()` so the
+/// policy (Settle + graph_patience + stuck_restarts + 5 s minimum) can be driven by a scripted
+/// missing-node timeline. Keep it in sync with run() if that block changes.
+#[cfg(test)]
+mod breaker27 {
+    use super::*;
+
+    const TICK: f64 = 1.2; // 1 s sleep + pw-dump
+    const AFTER_RESTART: f64 = 1.5;
+
+    struct Ev { t: f64, stuck: bool }
+
+    /// `missing(t, since_spawn, restarts_so_far)`; `structure_change_at`: times at which the config
+    /// structure changes (forces a restart like run() does).
+    fn sim(n: usize, total: f64, structure_change_at: &[f64], mut missing: impl FnMut(f64, f64, usize) -> usize) -> Vec<Ev> {
+        let base = Instant::now();
+        let at = |t: f64| base + Duration::from_secs_f64(t);
+        let mut settle = Settle::default();
+        let mut stuck_restarts = 0u32;
+        let mut child_started = -60.0f64;
+        let mut have_child = false;
+        let mut pending_struct: Vec<f64> = structure_change_at.to_vec();
+        let mut ev: Vec<Ev> = vec![];
+        let mut t = 0.0;
+        while t < total {
+            let m = missing(t, t - child_started, ev.len());
+            if m == 0 {
+                stuck_restarts = 0;
+            }
+            let stuck = settle.stuck(m, at(t), graph_patience(n, stuck_restarts));
+            let struct_changed = pending_struct.first().map_or(false, |s| t >= *s);
+            let need = !have_child || struct_changed || stuck;
+            if need && t - child_started > 5.0 {
+                if struct_changed { pending_struct.remove(0); }
+                if stuck { stuck_restarts += 1; }
+                if have_child { ev.push(Ev { t, stuck }); }
+                have_child = true;
+                child_started = t;
+                settle.reset(at(t));
+                t += AFTER_RESTART;
+                continue;
+            }
+            t += TICK;
+        }
+        ev
+    }
+
+    fn cfg_nxm(nin: usize, nbus: usize) -> Config {
+        let mut cfg = Config::default_config();
+        let tmpl = cfg.inputs[0].clone();
+        let bus = cfg.buses.iter().find(|b| matches!(b.kind, BusKind::Virtual { .. })).unwrap().clone();
+        cfg.inputs.truncate(nin.min(cfg.inputs.len()));
+        while cfg.inputs.len() < nin { let mut i = tmpl.clone(); i.id = format!("x{}", cfg.inputs.len()); i.name = i.id.clone(); cfg.inputs.push(i); }
+        cfg.buses.truncate(nbus.min(cfg.buses.len()));
+        while cfg.buses.len() < nbus {
+            let mut b = bus.clone(); let k = cfg.buses.len();
+            b.id = format!("y{k}"); b.name = b.id.clone();
+            b.kind = BusKind::Virtual { node: format!("vmix{k}"), description: b.id.clone() };
+            cfg.buses.push(b);
+        }
+        cfg
+    }
+
+    // ---------------- red: real defects ----------------
+
+    /// F1: a node that a restart cannot bring back (server-side fd/mem failure, i.e. the server's
+    /// own 1024 limit the PR leaves alone, or a child whose limit could not be raised because
+    /// hard == soft) makes the engine tear the WHOLE working graph down forever, every <=120 s.
+    /// Restarting is pointless after the same set came back missing a few times in a row.
+    #[test]
+    fn red_permanent_missing_node_restarts_forever() {
+        let n = expected(&cfg_nxm(8, 5)).len();
+        let ev = sim(n, 3600.0, &[], |_, since, _| if since < 1.0 { n } else { 1 });
+        let stuck = ev.iter().filter(|e| e.stuck).count();
+        assert!(stuck <= 4, "{stuck} full-graph restarts (audio cut each time) in 1 h for one permanently missing node; last at {:.0}s", ev.last().map_or(0.0, |e| e.t));
+    }
+
+    /// F2: a node lost from a graph that has been COMPLETE for minutes (not a slow fresh spawn,
+    /// so there is no creation race to wait for) is now left broken 3x longer than before at
+    /// 8x5, and >2x longer even on the small default config. Old rule: ~4 ticks (~5 s).
+    #[test]
+    fn red_steady_state_loss_restart_latency() {
+        for (label, cfg) in [("default", Config::default_config()), ("8x5", cfg_nxm(8, 5))] {
+            let n = expected(&cfg).len();
+            let mut fixed = false;
+            let ev = sim(n, 900.0, &[], |t, _, r| {
+                if r >= 1 { fixed = true; }
+                if t >= 600.0 && !fixed { 1 } else { 0 }
+            });
+            let first = ev.iter().find(|e| e.t >= 600.0).map(|e| e.t - 600.0).unwrap_or(f64::INFINITY);
+            assert!(first <= 6.5, "{label} ({n} nodes): node lost at t=600 after a complete graph, restart only after {first:.1}s (old rule ~5 s)");
+        }
+    }
+
+    /// F3: stuck_restarts (the x2..x16 backoff) survives a structure change. A user who edits the
+    /// config after a stuck period gets a brand-new graph that inherits up to 120 s patience.
+    #[test]
+    fn red_backoff_survives_structure_change() {
+        let n = expected(&cfg_nxm(8, 5)).len();
+        // graph A is permanently stuck for 10 min, structure change at t=600; graph B also has a
+        // missing node (different cause) that a restart would fix
+        let mut b_spawned_at: Option<usize> = None;
+        let ev = sim(n, 1200.0, &[600.0], |t, since, r| {
+            if since < 1.0 { return n; }
+            if t < 600.0 { return 1; }
+            // r0 = restarts before the structure restart; B is the graph after it
+            let r0 = *b_spawned_at.get_or_insert(r);
+            if r > r0 + 1 { 0 } else { 1 }
+        });
+        let sc = ev.iter().find(|e| e.t >= 600.0).expect("structure restart").t;
+        let next = ev.iter().find(|e| e.t > sc).map(|e| e.t - sc).unwrap_or(f64::INFINITY);
+        let fresh = graph_patience(n, 0).as_secs_f64() + 3.0;
+        assert!(next <= fresh, "new structure stuck for {next:.0}s before its first restart; a fresh graph should get ~{:.0}s", fresh - 3.0);
+    }
+
+    // ---------------- green probes (regression tests) ----------------
+
+    #[test]
+    fn probe_shrink_then_grow_is_stuck_from_best_point() {
+        let t0 = Instant::now(); let p = Duration::from_secs(10);
+        let mut s = Settle::default(); s.reset(t0);
+        assert!(!s.stuck(5, t0, p));
+        assert!(!s.stuck(2, t0 + Duration::from_secs(3), p));
+        assert!(!s.stuck(4, t0 + Duration::from_secs(4), p));
+        assert!(!s.stuck(4, t0 + Duration::from_secs(12), p));
+        assert!(s.stuck(4, t0 + Duration::from_secs(13), p));
+    }
+
+    #[test]
+    fn probe_oscillation_does_not_count_as_progress() {
+        let t0 = Instant::now(); let p = Duration::from_secs(10);
+        let mut s = Settle::default(); s.reset(t0);
+        let mut hit = None;
+        for k in 0..30u64 {
+            if s.stuck(if k % 2 == 0 { 3 } else { 4 }, t0 + Duration::from_secs(k), p) { hit = Some(k); break; }
+        }
+        assert_eq!(hit, Some(10));
+    }
+
+    #[test]
+    fn probe_zero_nodes_and_complete_never_stuck() {
+        let t0 = Instant::now();
+        let mut s = Settle::default();
+        for k in 0..1000u64 { assert!(!s.stuck(0, t0 + Duration::from_secs(k), Duration::ZERO)); }
+        assert_eq!(graph_patience(0, 0), Duration::from_secs(8));
+        let cfg = Config { inputs: vec![], buses: vec![], ..Config::default_config() };
+        assert!(expected(&cfg).is_empty());
+    }
+
+    #[test]
+    fn probe_clock_earlier_than_progress_no_panic() {
+        let t0 = Instant::now() + Duration::from_secs(100);
+        let mut s = Settle::default(); s.reset(t0);
+        assert!(!s.stuck(3, t0, Duration::from_secs(1)));
+        assert!(!s.stuck(3, t0 - Duration::from_secs(50), Duration::from_secs(1)));
+        // default (never reset) Settle: first observation is progress
+        let mut d = Settle::default();
+        assert!(!d.stuck(7, Instant::now(), Duration::ZERO));
+    }
+
+    #[test]
+    fn probe_patience_caps_and_monotone() {
+        for r in [0u32, 1, 4, 5, 63, 64, u32::MAX] {
+            assert!(graph_patience(10_000, r) <= Duration::from_secs(120));
+        }
+        let mut prev = Duration::ZERO;
+        for n in 0..800 { let p = graph_patience(n, 0); assert!(p >= prev); prev = p; }
+        for n in [1usize, 61, 135] {
+            for r in 0..6 { assert!(graph_patience(n, r + 1) >= graph_patience(n, r)); }
+        }
+    }
+
+    /// Transient fresh-spawn race (all nodes up within a few seconds) at 8x5: never restarts.
+    #[test]
+    fn probe_slow_spawn_8x5_no_restart() {
+        let n = expected(&cfg_nxm(8, 5)).len();
+        let ev = sim(n, 600.0, &[], |_, since, _| if since < 12.0 { (n as f64 * (1.0 - since / 12.0)).max(1.0) as usize } else { 0 });
+        assert!(ev.is_empty(), "{} restarts", ev.len());
+    }
+
+    /// A fault that one restart clears (the #22 fd race once the limit is raised) recovers with
+    /// exactly one restart and the backoff resets.
+    #[test]
+    fn probe_one_restart_clears_fault() {
+        let n = expected(&cfg_nxm(8, 5)).len();
+        let ev = sim(n, 900.0, &[], |_, since, r| if since < 1.0 { n } else if r == 0 { 3 } else { 0 });
+        assert_eq!(ev.len(), 1);
+        assert!(ev[0].t < graph_patience(n, 0).as_secs_f64() + 4.0);
+    }
+}
