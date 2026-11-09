@@ -72,6 +72,7 @@ fn state() -> State {
             },
         ],
         zones: vec![],
+        hosts: vec![],
     }
 }
 
@@ -86,7 +87,7 @@ fn rt_server(m: ServerMsg) {
 
 #[test]
 fn client_messages_round_trip() {
-    rt_client(ClientMsg::Hello(Hello { protocol: PROTOCOL_VERSION, token: "abc".into(), client: "test".into(), meters: true }));
+    rt_client(ClientMsg::Hello(Hello { protocol: PROTOCOL_VERSION, token: "abc".into(), client: "test".into(), meters: true, host: None }));
     rt_client(ClientMsg::Subscribe { meters: false });
     rt_client(ClientMsg::Ping { t: 42 });
     for cmd in [
@@ -133,7 +134,7 @@ fn wire_format_is_stable() {
     let s = ClientMsg::Command { id: 1, cmd: Command::SetBusGain { bus: "a3".into(), db: -25.0, unlock: false } }.to_json();
     assert_eq!(s, r#"{"type":"command","id":1,"cmd":{"op":"set_bus_gain","bus":"a3","db":-25.0}}"#);
     let h: ClientMsg = ClientMsg::from_json(r#"{"type":"hello","protocol":1,"token":"t"}"#).unwrap();
-    assert_eq!(h, ClientMsg::Hello(Hello { protocol: 1, token: "t".into(), client: String::new(), meters: false }));
+    assert_eq!(h, ClientMsg::Hello(Hello { protocol: 1, token: "t".into(), client: String::new(), meters: false, host: None }));
 }
 
 #[test]

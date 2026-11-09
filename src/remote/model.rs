@@ -43,12 +43,14 @@ pub fn to_state(cfg: &Config, server: &str, rev: u64, caps: &BTreeMap<String, f6
             }
         })
         .collect();
-    p::State { rev, server: server.to_string(), inputs, buses, zones: vec![] }
+    p::State { rev, server: server.to_string(), inputs, buses, zones: vec![], hosts: vec![] }
 }
 
 /// Write one already-checked command into the config. False if it names nothing (raced with a structure change).
 pub fn apply(cfg: &mut Config, cmd: &p::Command) -> bool {
     match cmd {
+        // scaffold (U2 todo): host commands never touch config.json
+        p::Command::SetHostVolume { .. } | p::Command::SetHostMute { .. } => false,
         p::Command::SetInputGain { input, db } => match cfg.inputs.iter_mut().find(|i| &i.id == input) {
             Some(i) => {
                 i.gain_db = *db;

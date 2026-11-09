@@ -70,6 +70,8 @@ impl Backend for PwBackend {
 
     fn apply(&self, cfg: &Config, cmd: &p::Command) {
         match cmd {
+            // scaffold (U2 todo): host commands bypass the graph backend
+            p::Command::SetHostVolume { .. } | p::Command::SetHostMute { .. } => {}
             p::Command::SetInputGain { input, db } => {
                 if let Some(id) = self.node_id(&names::strip_in(input)) {
                     pw::set_volume(id, db_to_vol(*db));
@@ -248,8 +250,7 @@ impl Tap {
     }
 }
 
-/// Test double: records every applied command, synthesises meters.
-#[cfg(test)]
+/// Fake graph: records every applied command, synthesises meters (tests and `fake-engine`, #37).
 #[derive(Default)]
 pub struct FakeBackend {
     /// node names the fake graph reports as AirPlay sinks by their props
@@ -259,7 +260,6 @@ pub struct FakeBackend {
     pub stopped: AtomicU64,
 }
 
-#[cfg(test)]
 impl Backend for FakeBackend {
     fn node_is_raop(&self, node: &str) -> bool {
         self.raop_nodes.lock().unwrap().iter().any(|n| n == node)

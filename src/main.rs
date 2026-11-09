@@ -2,6 +2,8 @@
 //!   wavelink-mixer           open the mixer window
 //!   wavelink-mixer engine    run the routing engine (systemd user service) + LAN control server
 //!   wavelink-mixer remote-token [--rotate]   print the host/port/token a remote client needs (new token with --rotate)
+//!   wavelink-mixer remote [ADDR]             the mixer console for another computer (a MacBook), a client of the engine
+//!   wavelink-mixer fake-engine [PORT]        a test engine (no PipeWire) for the remote console demo
 mod config;
 mod dash;
 mod dsp;
@@ -25,6 +27,9 @@ mod pw;
 mod remote;
 mod busvol;
 mod ui;
+mod link;
+mod macvol;
+mod console;
 #[cfg(test)]
 #[path = "breaker_front.rs"]
 mod breaker_front;
@@ -85,6 +90,12 @@ fn main() -> glib::ExitCode {
     }
     if std::env::args().nth(1).as_deref() == Some("latency") {
         std::process::exit(latency::run(std::env::args().skip(2).collect()));
+    }
+    if std::env::args().nth(1).as_deref() == Some("remote") {
+        std::process::exit(console::run(std::env::args().skip(2).collect()));
+    }
+    if std::env::args().nth(1).as_deref() == Some("fake-engine") {
+        std::process::exit(remote::fake_engine(&std::env::args().skip(2).collect::<Vec<_>>()));
     }
     if std::env::args().nth(1).as_deref() == Some("stems") {
         std::process::exit(stems::cli(std::env::args().skip(2).collect()));

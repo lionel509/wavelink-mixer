@@ -64,6 +64,10 @@ struct Core {
     clients: Vec<Client>,
     /// time-based raise limit per physical bus, shared by every client
     limits: HashMap<String, safety::RaiseLimiter>,
+    /// the Macs (and other hosts) that report their own output volume (#37)
+    hosts: Vec<p::Host>,
+    /// host id -> the connection that owns it (the newest registration wins)
+    host_owner: HashMap<String, u64>,
 }
 
 struct Token {
@@ -271,7 +275,7 @@ pub fn serve(opts: Opts, backend: Arc<dyn Backend>) -> std::io::Result<Running> 
     let inner = Arc::new(Inner {
         opts,
         backend,
-        core: Mutex::new(Core { cfg, state, clients: vec![], limits: HashMap::new() }),
+        core: Mutex::new(Core { cfg, state, clients: vec![], limits: HashMap::new(), hosts: vec![], host_owner: HashMap::new() }),
         next_id: AtomicU64::new(1),
         stop: AtomicBool::new(false),
         conns: AtomicUsize::new(0),
@@ -354,6 +358,11 @@ fn io_timeout(e: &tungstenite::Error) -> bool {
 }
 
 /// A client-chosen name, safe for one log line: printable, no control characters, at most 64 chars.
+/// A host id is what `console::sanitize_host_id` would return for it: non-empty, [a-z0-9] runs joined by single '-'.
+fn valid_host_id(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') && !id.starts_with('-') && !id.ends_with('-') && !id.contains("--")
+}
+
 pub fn sanitize_name(s: &str) -> String {
     let t: String = s.chars().filter(|c| !c.is_control()).take(64).collect();
     if t.trim().is_empty() {
@@ -440,8 +449,23 @@ impl Inner {
 
     /// Make `cfg` current and tell everyone what changed (deltas, or a full state on structure changes).
     fn publish(&self, core: &mut Core, cfg: Config) {
-        let new = model::to_state(&cfg, &self.opts.name, core.state.rev + 1, &self.opts.caps);
+        let mut new = model::to_state(&cfg, &self.opts.name, core.state.rev + 1, &self.opts.caps);
+        new.hosts = core.hosts.clone();
         core.cfg = cfg;
+        self.publish_state(core, new);
+    }
+
+    /// Edit the host list (engine memory only, never config.json) and tell everyone what changed.
+    fn edit_hosts(&self, core: &mut Core, f: impl FnOnce(&mut Vec<p::Host>)) {
+        f(&mut core.hosts);
+        let mut new = core.state.clone();
+        new.rev += 1;
+        new.hosts = core.hosts.clone();
+        self.publish_state(core, new);
+    }
+
+    /// Diff `new` against the current state and broadcast it (deltas, or a full state on structure changes).
+    fn publish_state(&self, core: &mut Core, new: p::State) {
         match core.state.diff(&new) {
             Some(d) if d.is_empty() => {}
             Some(d) => {
@@ -469,6 +493,32 @@ impl Inner {
     fn command(&self, id: u64, cmd: &p::Command, unlocked: &dyn Fn(&str) -> bool) -> ServerMsg {
         let nack = |e: String| ServerMsg::Ack { id, ok: false, error: Some(e), note: None };
         let mut core = self.lock();
+        if let p::Command::SetHostVolume { .. } | p::Command::SetHostMute { .. } = cmd {
+            // a host's output: engine memory only (never config.json, never the PipeWire backend) (#37)
+            let checked = match safety::check(cmd, &core.state, unlocked) {
+                Ok(c) => c,
+                Err(e) => return nack(e.to_string()),
+            };
+            let note = checked.note.clone();
+            self.edit_hosts(&mut core, |hosts| {
+                for c in &checked.cmds {
+                    match c {
+                        p::Command::SetHostVolume { host, volume } => {
+                            if let Some(h) = hosts.iter_mut().find(|h| &h.id == host) {
+                                h.volume = (*volume).min(100);
+                            }
+                        }
+                        p::Command::SetHostMute { host, mute } => {
+                            if let Some(h) = hosts.iter_mut().find(|h| &h.id == host) {
+                                h.mute = *mute;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            return ServerMsg::Ack { id, ok: true, error: None, note };
+        }
         let flock = config::lock_config(&self.opts.cfg_path);
         self.sync_disk(&mut core);
         // a destination that is AirPlay only by its node props gets its ceiling saved first (#35's rule),
@@ -593,6 +643,11 @@ impl Inner {
             std::thread::sleep(Duration::from_millis(400)); // slows guessing
             return refuse(&mut ws, ErrorCode::Auth, "bad token");
         };
+        if let Some(h) = &hello.host {
+            if !valid_host_id(&h.id) {
+                return refuse(&mut ws, ErrorCode::BadRequest, "bad host id");
+            }
+        }
         drop(pre); // authenticated: no longer counts against the pre-auth cap
         send(&mut ws, &ServerMsg::Welcome { protocol: p::PROTOCOL_VERSION, server: self.opts.name.clone(), version: env!("CARGO_PKG_VERSION").into() })?;
         let (tx, rx) = mpsc::sync_channel::<Arc<str>>(QUEUE);
@@ -602,20 +657,27 @@ impl Inner {
             // snapshot first, then join the broadcast list, under one lock: no delta can slip between
             let mut core = self.lock();
             self.sync_disk(&mut core);
+            if let Some(h) = &hello.host {
+                self.register_host(&mut core, id, h);
+            }
             let _ = tx.try_send(ServerMsg::State { state: core.state.clone() }.to_json().into());
             core.clients.push(Client { id, tx, meters: meters.clone() });
         }
         let who = format!("client {id} ({}, {peer})", sanitize_name(&hello.client));
         eprintln!("wavelink remote: {who} connected");
-        let r = self.client_loop(&mut ws, &rx, &meters, &who, token_gen);
+        let host = hello.host.as_ref().map(|h| (id, h.id.clone()));
+        let r = self.client_loop(&mut ws, &rx, &meters, &who, token_gen, host.as_ref());
         self.lock().clients.retain(|c| c.id != id);
+        if let Some((_, hid)) = &host {
+            self.host_left(id, hid);
+        }
         let _ = ws.close(None);
         let _ = ws.flush();
         eprintln!("wavelink remote: {who} left");
         r
     }
 
-    fn client_loop(&self, ws: &mut tungstenite::WebSocket<TcpStream>, rx: &mpsc::Receiver<Arc<str>>, meters: &AtomicBool, who: &str, token_gen: u64) -> Result<(), String> {
+    fn client_loop(&self, ws: &mut tungstenite::WebSocket<TcpStream>, rx: &mpsc::Receiver<Arc<str>>, meters: &AtomicBool, who: &str, token_gen: u64, host: Option<&(u64, String)>) -> Result<(), String> {
         ws.get_ref().set_read_timeout(Some(Duration::from_millis(15))).map_err(|e| e.to_string())?;
         let mut heard = Instant::now();
         // this connection's unlocks: bus -> expiry. Gone with the connection.
@@ -656,6 +718,7 @@ impl Inner {
                         Ok(ClientMsg::Unlock { bus, on }) => Some(self.unlock(&mut unlocks, &bus, on, who)),
                         Ok(ClientMsg::Ping { t }) => Some(ServerMsg::Pong { t }),
                         Ok(ClientMsg::Hello(_)) => Some(ServerMsg::Error { code: ErrorCode::BadRequest, message: "already greeted".into() }),
+                        Ok(ClientMsg::HostState { volume, mute }) => self.host_state(host, volume, mute),
                         Err(e) => Some(ServerMsg::Error { code: ErrorCode::BadRequest, message: format!("bad message: {e}") }),
                     };
                     if let Some(r) = reply {
@@ -688,6 +751,56 @@ impl Inner {
             eprintln!("wavelink remote: {who}: unlock of bus {b} cleared (disconnect)");
         }
         result
+    }
+
+    /// A host connection registers (or re-registers) its output; the newest registration owns the host.
+    fn register_host(&self, core: &mut Core, conn: u64, h: &p::HostHello) {
+        let (id, label, volume, mute) = (h.id.clone(), h.label.clone(), h.volume.min(100), h.mute);
+        self.edit_hosts(core, |hosts| match hosts.iter_mut().find(|x| x.id == id) {
+            Some(x) => {
+                x.label = label;
+                x.volume = volume;
+                x.mute = mute;
+                x.online = true;
+            }
+            None => hosts.push(p::Host { id: id.clone(), label, volume, mute, online: true }),
+        });
+        core.host_owner.insert(h.id.clone(), conn);
+        eprintln!("wavelink remote: host {} ({}) online", h.id, sanitize_name(&h.label));
+    }
+
+    /// A host connection closed: its host goes OFFLINE, unless a newer connection has taken it over.
+    fn host_left(&self, conn: u64, hid: &str) {
+        let mut core = self.lock();
+        if core.host_owner.get(hid) != Some(&conn) {
+            return;
+        }
+        core.host_owner.remove(hid);
+        self.edit_hosts(&mut core, |hosts| {
+            if let Some(h) = hosts.iter_mut().find(|h| h.id == hid) {
+                h.online = false;
+            }
+        });
+        eprintln!("wavelink remote: host {hid} offline");
+    }
+
+    /// A host reports the volume/mute it saw itself (volume keys). Overrides the engine's value and tells everyone.
+    fn host_state(&self, host: Option<&(u64, String)>, volume: u8, mute: bool) -> Option<ServerMsg> {
+        let Some((conn, hid)) = host else {
+            return Some(ServerMsg::Error { code: ErrorCode::BadRequest, message: "not a host connection".into() });
+        };
+        let mut core = self.lock();
+        if core.host_owner.get(hid) != Some(conn) {
+            return Some(ServerMsg::Error { code: ErrorCode::BadRequest, message: "host superseded by a newer connection".into() });
+        }
+        let volume = volume.min(100);
+        self.edit_hosts(&mut core, |hosts| {
+            if let Some(h) = hosts.iter_mut().find(|h| &h.id == hid) {
+                h.volume = volume;
+                h.mute = mute;
+            }
+        });
+        None
     }
 
     /// Unlock (or relock) a bus's soft cap for one connection, for safety::UNLOCK_S seconds.

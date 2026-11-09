@@ -109,6 +109,53 @@ pub fn print_info(args: &[String]) -> i32 {
     }
 }
 
+/// `wavelink-mixer fake-engine [PORT]`: the engine's protocol server over a fake graph, for the remote console demo (#37).
+/// No PipeWire and no real config: the config lives in the temp dir, and the token is the one in remote.json.
+pub fn fake_engine(args: &[String]) -> i32 {
+    let port: u16 = match args.first().map(|a| a.parse()) {
+        None => 8791,
+        Some(Ok(p)) => p,
+        Some(Err(_)) => {
+            eprintln!("usage: wavelink-mixer fake-engine [PORT]");
+            return 2;
+        }
+    };
+    let rc = match settings::load_or_create(&settings::path()) {
+        Ok(rc) => rc,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let dir = std::env::temp_dir().join("wavelink-fake-engine");
+    let _ = std::fs::create_dir_all(&dir);
+    let cfg_path = dir.join("config.json");
+    if !cfg_path.exists() && !crate::config::Config::default_config().save_to(&cfg_path) {
+        eprintln!("wavelink fake-engine: can't write {}", cfg_path.display());
+        return 1;
+    }
+    let opts = server::Opts {
+        bind: "127.0.0.1".into(),
+        port,
+        token: rc.token.clone(),
+        cfg_path,
+        name: "fake-engine".into(),
+        caps: rc.caps.clone(),
+    };
+    match server::serve(opts, std::sync::Arc::new(backend::FakeBackend::default())) {
+        Ok(run) => {
+            eprintln!("wavelink fake-engine: listening on {} (token in {})", run.addr, settings::path().display());
+            loop {
+                std::thread::park();
+            }
+        }
+        Err(e) => {
+            eprintln!("wavelink fake-engine: can't listen on 127.0.0.1:{port}: {e}");
+            1
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

@@ -48,6 +48,31 @@ pub struct State {
     /// Groups of buses adjusted together (empty in protocol 1 servers; reserved for multi-speaker rooms).
     #[serde(default)]
     pub zones: Vec<Zone>,
+    /// Computers that dialled in and carry their own system volume (MacBook). Additive: older clients ignore it.
+    #[serde(default)]
+    pub hosts: Vec<Host>,
+}
+
+/// A computer whose own output volume the mixer drives (its system volume, not a PipeWire node).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Host {
+    /// Sanitised hostname (`console::sanitize_host_id`), the key.
+    pub id: String,
+    pub label: String,
+    /// 0..=100, the host's own output volume.
+    pub volume: u8,
+    pub mute: bool,
+    /// False while the host's console is not connected.
+    pub online: bool,
+}
+
+/// What a host sends in Hello to register itself with its current volume.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct HostHello {
+    pub id: String,
+    pub label: String,
+    pub volume: u8,
+    pub mute: bool,
 }
 
 /// One channel strip.
@@ -144,6 +169,12 @@ pub struct Zone {
     pub buses: Vec<String>,
 }
 
+/// A host's output volume is 0..=100. Every place that writes one (diff, apply, commands) clamps through here
+/// so the client and the server always agree on the value.
+fn clamp_host_volume(v: u8) -> u8 {
+    v.min(100)
+}
+
 impl State {
     pub fn input(&self, id: &str) -> Option<&Input> {
         self.inputs.iter().find(|i| i.id == id)
@@ -156,6 +187,12 @@ impl State {
     }
     fn bus_mut(&mut self, id: &str) -> Option<&mut Bus> {
         self.buses.iter_mut().find(|b| b.id == id)
+    }
+    pub fn host(&self, id: &str) -> Option<&Host> {
+        self.hosts.iter().find(|h| h.id == id)
+    }
+    fn host_mut(&mut self, id: &str) -> Option<&mut Host> {
+        self.hosts.iter_mut().find(|h| h.id == id)
     }
 
     /// Apply one delta (client side). False if it names something this state does not have.
@@ -173,6 +210,9 @@ impl State {
                 .is_some(),
             Delta::BusGain { bus, db } => self.bus_mut(bus).map(|b| b.gain_db = *db).is_some(),
             Delta::BusMute { bus, mute } => self.bus_mut(bus).map(|b| b.mute = *mute).is_some(),
+            Delta::HostVolume { host, volume } => self.host_mut(host).map(|h| h.volume = clamp_host_volume(*volume)).is_some(),
+            Delta::HostMute { host, mute } => self.host_mut(host).map(|h| h.mute = *mute).is_some(),
+            Delta::HostOnline { host, online } => self.host_mut(host).map(|h| h.online = *online).is_some(),
         }
     }
 
@@ -180,7 +220,8 @@ impl State {
     pub fn same_structure(&self, o: &State) -> bool {
         let ins = |s: &State| s.inputs.iter().map(|i| (i.id.clone(), i.name.clone(), i.color.clone(), i.source.clone())).collect::<Vec<_>>();
         let bus = |s: &State| s.buses.iter().map(|b| (b.id.clone(), b.name.clone(), b.color.clone(), b.kind, b.outputs.clone(), b.max_db, b.ceiling_db)).collect::<Vec<_>>();
-        ins(self) == ins(o) && bus(self) == bus(o) && self.zones == o.zones && self.server == o.server
+        let hosts = |s: &State| s.hosts.iter().map(|h| (h.id.clone(), h.label.clone())).collect::<Vec<_>>();
+        ins(self) == ins(o) && bus(self) == bus(o) && self.zones == o.zones && self.server == o.server && hosts(self) == hosts(o)
     }
 
     /// Deltas that turn `self` into `new`; None when the structure changed (send a full State instead).
@@ -215,6 +256,17 @@ impl State {
                 v.push(Delta::BusMute { bus: b.id.clone(), mute: b.mute });
             }
         }
+        for (a, b) in self.hosts.iter().zip(&new.hosts) {
+            if clamp_host_volume(a.volume) != clamp_host_volume(b.volume) {
+                v.push(Delta::HostVolume { host: b.id.clone(), volume: clamp_host_volume(b.volume) });
+            }
+            if a.mute != b.mute {
+                v.push(Delta::HostMute { host: b.id.clone(), mute: b.mute });
+            }
+            if a.online != b.online {
+                v.push(Delta::HostOnline { host: b.id.clone(), online: b.online });
+            }
+        }
         Some(v)
     }
 }
@@ -241,6 +293,9 @@ pub enum Delta {
     Normalize { input: String, on: bool, target_db: Option<f64> },
     BusGain { bus: String, db: f64 },
     BusMute { bus: String, mute: bool },
+    HostVolume { host: String, volume: u8 },
+    HostMute { host: String, mute: bool },
+    HostOnline { host: String, online: bool },
 }
 
 // ---------------------------------------------------------------- commands
@@ -276,6 +331,9 @@ pub enum Command {
         unlock: bool,
     },
     SetBusMute { bus: String, mute: bool },
+    /// A host's own output volume (0..=100). Raises are limited to `safety::MAX_HOST_STEP` per command.
+    SetHostVolume { host: String, volume: u8 },
+    SetHostMute { host: String, mute: bool },
 }
 
 // ---------------------------------------------------------------- meters
@@ -306,6 +364,9 @@ pub struct Hello {
     /// Start meters right away.
     #[serde(default)]
     pub meters: bool,
+    /// Set by a computer that owns a host (its system volume). Absent for plain clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostHello>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -318,6 +379,8 @@ pub enum ClientMsg {
     /// Lift (`on`) or restore a bus's soft cap for THIS connection only. The server expires it after
     /// `safety::UNLOCK_S` seconds and on disconnect, and logs it. The hard ceiling always stays.
     Unlock { bus: String, on: bool },
+    /// A host reports its system volume/mute after a change it saw itself (volume keys). Host connections only.
+    HostState { volume: u8, mute: bool },
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -391,6 +454,8 @@ pub mod safety {
     pub const SPEAKER_CAP_DB: f64 = -20.0;
     /// How long a `ClientMsg::Unlock` lasts.
     pub const UNLOCK_S: u64 = 60;
+    /// A host's output volume may rise at most this much (percentage points) per SetHostVolume. Lowering is never limited.
+    pub const MAX_HOST_STEP: u8 = 25;
 
     /// Time-based raise limit for one physical bus: the gain may never be more than
     /// MAX_RAISE_PER_WINDOW_DB above the lowest level it had within the last RAISE_WINDOW_S seconds.
@@ -420,6 +485,8 @@ pub mod safety {
     pub enum Reject {
         UnknownInput(String),
         UnknownBus(String),
+        UnknownHost(String),
+        HostOffline(String),
         NotFinite,
         Empty,
     }
@@ -429,6 +496,8 @@ pub mod safety {
             match self {
                 Reject::UnknownInput(i) => write!(f, "unknown input '{i}'"),
                 Reject::UnknownBus(b) => write!(f, "unknown bus '{b}'"),
+                Reject::UnknownHost(h) => write!(f, "unknown host '{h}'"),
+                Reject::HostOffline(h) => write!(f, "host '{h}' is offline"),
                 Reject::NotFinite => write!(f, "value is not a finite number"),
                 Reject::Empty => write!(f, "nothing to change"),
             }
@@ -466,6 +535,11 @@ pub mod safety {
     pub fn check(cmd: &Command, state: &State, unlocked: &dyn Fn(&str) -> bool) -> Result<Checked, Reject> {
         let input = |id: &str| state.input(id).ok_or_else(|| Reject::UnknownInput(id.into()));
         let bus = |id: &str| state.bus(id).ok_or_else(|| Reject::UnknownBus(id.into()));
+        let host = |id: &str| match state.host(id) {
+            None => Err(Reject::UnknownHost(id.into())),
+            Some(h) if !h.online => Err(Reject::HostOffline(id.into())),
+            Some(h) => Ok(h),
+        };
         let mut note = None;
         let cmds = match cmd {
             Command::SetInputGain { input: i, db } => {
@@ -537,6 +611,20 @@ pub mod safety {
                 }
                 v.push(Command::SetBusMute { bus: b.clone(), mute: *mute });
                 v
+            }
+            Command::SetHostVolume { host: h, volume } => {
+                let hs = host(h)?;
+                let mut got = clamp_host_volume(*volume);
+                let ceil = hs.volume.saturating_add(MAX_HOST_STEP).min(100);
+                if got > hs.volume && got > ceil {
+                    got = ceil;
+                    note = Some(format!("raised at most {MAX_HOST_STEP} per step"));
+                }
+                vec![Command::SetHostVolume { host: h.clone(), volume: got }]
+            }
+            Command::SetHostMute { host: h, mute } => {
+                host(h)?;
+                vec![Command::SetHostMute { host: h.clone(), mute: *mute }]
             }
         };
         Ok(Checked { cmds, note })
