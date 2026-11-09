@@ -724,3 +724,104 @@ fn r2_probe_auto_gain_loses_to_remote_on_save() {
     assert_eq!(disk.inputs[0].eq[2], 3.0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ####################################################################### ROUND 3 (b90a883)
+
+fn ip4(a: u8, b: u8, c: u8, d: u8) -> std::net::IpAddr {
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d))
+}
+
+/// R3-1 (LOW). Eviction picks the oldest socket that has waited >= 100 ms *since accept*, regardless of IP.
+/// A real client whose TCP + WebSocket handshake + Hello takes > 100 ms (Meshnet, a Mac's Wi-Fi power
+/// save: ~2.5 RTT, so RTT > 40 ms) is the evictee whenever an attacker on two LAN IPs keeps 3 fresh
+/// sockets open and adds a 4th: each IP stays within its cap of 2, and the attacker's sockets are never
+/// idle. Expected: evict from the IP holding the most pending sockets first (never the only socket of an
+/// IP while another IP holds MAX_PREAUTH_PER_IP), and/or measure idleness from the end of the handshake
+/// with a longer threshold (~1 s).
+#[test]
+fn r3_real_client_mid_handshake_is_not_evicted_for_a_two_ip_flood() {
+    use super::server::{admit_policy, Admit};
+    let (real, a, b) = (ip4(192, 168, 1, 20), ip4(192, 168, 1, 66), ip4(192, 168, 1, 67));
+    let fresh = Duration::from_millis(10);
+    let pending = [(real, Duration::from_millis(150)), (a, fresh), (a, fresh), (b, fresh)];
+    let got = admit_policy(&pending, b);
+    assert_ne!(got, Admit::Evict(0), "the real client's only socket (150 ms into its handshake) is closed to admit the attacker's 4th");
+}
+
+/// R3-2 (LOW). Fresh sockets are never evicted and the overall hard cap is 2 x MAX_PREAUTH = 8, so an
+/// attacker holding 2 fresh (< 100 ms) sockets on each of 4 LAN IPs, recycling them every ~90 ms (no
+/// WebSocket needed, plain TCP), gets every newcomer refused, including the real client from an IP with
+/// nothing pending. (From loopback, which is exempt from the per-IP cap, one local process can do the
+/// same; see the round-3 comment for why that part is acceptable.) Expected: a newcomer from an IP with
+/// no pending socket is admitted while some IP holds MAX_PREAUTH_PER_IP (evict that IP's oldest).
+#[test]
+fn r3_fresh_flood_from_four_ips_does_not_refuse_a_new_ip() {
+    use super::server::{admit_policy, Admit};
+    let fresh = Duration::from_millis(20);
+    let pending: Vec<_> = (0..4u8).flat_map(|k| [(ip4(192, 168, 1, 70 + k), fresh), (ip4(192, 168, 1, 70 + k), fresh)]).collect();
+    assert_eq!(pending.len(), 2 * super::server::MAX_PREAUTH);
+    assert_ne!(admit_policy(&pending, ip4(192, 168, 1, 20)), Admit::Refuse, "real client refused by a fresh-socket flood from 4 IPs");
+}
+
+/// Probe: the loopback flood (documents current, accepted behaviour): 8 fresh loopback sockets refuse
+/// a 9th loopback newcomer. Any same-user process can read remote.json anyway, so this is no new power.
+#[test]
+fn r3_probe_loopback_fresh_flood_refuses() {
+    use super::server::{admit_policy, Admit, MAX_PREAUTH};
+    let lo = ip4(127, 0, 0, 1);
+    let flood: Vec<_> = (0..2 * MAX_PREAUTH).map(|_| (lo, Duration::from_millis(20))).collect();
+    assert_eq!(admit_policy(&flood, lo), Admit::Refuse);
+}
+
+/// Probe: rotation drops an *idle* old session by itself (the watcher, no command needed), within ~0.6 s,
+/// with error{auth}; a session that authed with the new token survives.
+#[test]
+fn r3_probe_rotate_drops_idle_old_session() {
+    let r = rig("rot3");
+    let tf = r.dir.join("remote.json");
+    std::fs::write(&tf, format!(r#"{{"token":"{TOKEN}"}}"#)).unwrap();
+    r.run.token_file(tf.clone());
+    let (mut old, _) = join(&r);
+    std::thread::sleep(Duration::from_millis(400)); // let the watcher record the file's inode/mtime
+    let new = super::settings::rotate(&tf).unwrap();
+    let t0 = Instant::now();
+    let mut got_auth = false;
+    while t0.elapsed() < Duration::from_secs(2) {
+        match recv(&mut old) {
+            Some(ServerMsg::Error { code: ErrorCode::Auth, .. }) => {
+                got_auth = true;
+                break;
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    assert!(got_auth && t0.elapsed() < Duration::from_millis(900), "old session not dropped promptly ({:?})", t0.elapsed());
+    let mut ws = connect(&r);
+    hello(&mut ws, &new, false);
+    assert!(matches!(recv_np(&mut ws), Some(ServerMsg::Welcome { .. })));
+    let _ = recv_np(&mut ws); // state
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(cmd(&mut ws, 1, Command::SetInputMute { input: "mic".into(), mute: true }).0, "new-token session survives");
+}
+
+/// Probe: the allowlist rejects names that only look physical when sysfs says otherwise, and the
+/// predictable-name fallback applies only to names sysfs doesn't list at all.
+#[test]
+fn r3_probe_allowlist_sysfs_wins_over_name() {
+    let sys = std::env::temp_dir().join(format!("wavelink-b36r3-sys-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&sys);
+    for (n, ty, dev) in [("eth0", "1", false), ("wlan_vpn", "65534", false), ("enp5s0", "1", true)] {
+        std::fs::create_dir_all(sys.join(n)).unwrap();
+        std::fs::write(sys.join(n).join("type"), ty).unwrap();
+        if dev {
+            std::fs::create_dir_all(sys.join(n).join("device")).unwrap();
+        }
+    }
+    assert!(!super::settings::is_physical_nic_in(&sys, "eth0"), "a veth-like eth0 (no device) is not physical");
+    assert!(!super::settings::is_physical_nic_in(&sys, "wlan_vpn"));
+    assert!(super::settings::is_physical_nic_in(&sys, "enp5s0"));
+    // not in sysfs: name fallback (broad but only reachable for names the kernel doesn't show)
+    assert!(super::settings::is_physical_nic_in(&sys, "enwhatever"));
+    let _ = std::fs::remove_dir_all(&sys);
+}
