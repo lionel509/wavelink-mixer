@@ -726,10 +726,10 @@ pub fn cli(args: Vec<String>) -> i32 {
         };
         let x = piano::to_rate(&pcm, rate);
         let t = Instant::now();
-        let notes = crate::spectral::notes(&x);
+        let (notes, kpf) = crate::spectral::notes_stats(&x);
         let secs = x.len() as f64 / piano::RATE as f64;
         println!(
-            "talking piano: {} strikes over {secs:.1} s ({:.0} note-ons/s, period {:.0} ms) in {:.2} ms per 0.5 s",
+            "talking piano: {} strikes over {secs:.1} s ({:.0} note-ons/s, {kpf:.1} keys per frame, period {:.0} ms) in {:.2} ms per 0.5 s",
             notes.len(),
             notes.len() as f64 / secs,
             crate::spectral::period_s() * 1000.0,
