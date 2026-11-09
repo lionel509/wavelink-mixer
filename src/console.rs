@@ -398,6 +398,8 @@ struct Console {
     /// CoreAudio watch wakes, drained on the GTK thread.
     wake: RefCell<Option<mpsc::Receiver<()>>>,
     next_id: Cell<u64>,
+    /// The default width is set once, from the strips present at the first state.
+    sized: Cell<bool>,
 }
 
 impl Console {
@@ -483,6 +485,13 @@ impl Console {
         self.body.append(&outs);
         self.dynamic.load_from_string(&css);
         self.refresh();
+        if !self.sized.get() && st.inputs.len() + st.buses.len() + st.hosts.len() > 0 {
+            self.sized.set(true);
+            // Every strip is in the body, so its natural width is what the window needs.
+            let natural = self.body.measure(gtk::Orientation::Horizontal, -1).1;
+            let w = default_width(natural, monitor_width(&self.win));
+            self.win.set_default_size(w, self.win.default_height());
+        }
     }
 
     fn input_strip(self: &Rc<Self>, inp: &wavelink_proto::Input, buses: &[wavelink_proto::Bus], css: &mut String) -> InputUi {
@@ -711,6 +720,18 @@ impl Console {
     }
 }
 
+/// Default window width: the strips' natural width, never under the old 1100, never over the monitor (1800 when GTK can't tell).
+fn default_width(natural: i32, monitor: Option<i32>) -> i32 {
+    natural.max(1100).min(monitor.unwrap_or(1800))
+}
+
+/// Width of the monitor the window is on, in logical pixels.
+fn monitor_width(win: &adw::ApplicationWindow) -> Option<i32> {
+    let surface = win.surface()?;
+    let mon = gdk::Display::default()?.monitor_at_surface(&surface)?;
+    Some(mon.geometry().width())
+}
+
 fn section(text: &str) -> gtk::Label {
     let l = ui::label(text, "section");
     l.set_xalign(0.0);
@@ -798,6 +819,7 @@ fn activate(app: &adw::Application, o: Opts) {
         watch: RefCell::new(watch),
         wake: RefCell::new(wake),
         next_id: Cell::new(0),
+        sized: Cell::new(false),
     });
     let c = console.clone();
     glib::timeout_add_local(TICK, move || {
