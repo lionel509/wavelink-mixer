@@ -1,12 +1,14 @@
 //! wavelink-mixer: a Voicemeeter-style mixer for PipeWire.
 //!   wavelink-mixer           open the mixer window
 //!   wavelink-mixer engine    run the routing engine (systemd user service)
+//!   wavelink-mixer piano     song -> piano MIDI (offline --wav, live --source, --bench)
 mod config;
 mod dash;
 mod dsp;
 mod models;
 mod notes;
 mod piano;
+mod piano_live;
 mod sep;
 mod stemcfg;
 mod stems;
@@ -74,6 +76,9 @@ fn main() -> glib::ExitCode {
     }
     if std::env::args().nth(1).as_deref() == Some("latency") {
         std::process::exit(latency::run(std::env::args().skip(2).collect()));
+    }
+    if std::env::args().nth(1).as_deref() == Some("piano") {
+        std::process::exit(piano_live::cli(std::env::args().skip(2).collect()));
     }
     if std::env::args().nth(1).as_deref() == Some("stems") {
         std::process::exit(stems::cli(std::env::args().skip(2).collect()));
