@@ -23,10 +23,14 @@ mod spotify;
 mod sysmon;
 mod pw;
 mod remote;
+mod busvol;
 mod ui;
 #[cfg(test)]
 #[path = "breaker_front.rs"]
 mod breaker_front;
+#[cfg(test)]
+#[path = "breaker_busvol.rs"]
+mod breaker_busvol;
 
 use adw::prelude::*;
 use gtk::glib;

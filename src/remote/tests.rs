@@ -31,7 +31,7 @@ fn rig(tag: &str) -> Rig {
     let mut c = Config::default_config();
     c.buses.insert(
         2,
-        Bus { id: "a3".into(), name: "Sonos".into(), color: "#ff9f0a".into(), kind: BusKind::Hardware { target: "raop_sonos_test".into() }, gain_db: -30.0, mute: false },
+        Bus { id: "a3".into(), name: "Sonos".into(), color: "#ff9f0a".into(), kind: BusKind::Hardware { target: "raop_sonos_test".into() }, gain_db: -30.0, mute: false, max_db: None },
     );
     assert!(c.save_to(&cfg_path));
     let fake = Arc::new(FakeBackend::default());

@@ -14,8 +14,14 @@ pub struct Node {
     pub desc: String,
     pub app: String,
     pub media: String,
+    /// wpctl volume (cube root of the mean linear channelVolume); 1.0 when `has_vol` is false
     pub vol: f64,
     pub mute: bool,
+    /// whether the node reported channelVolumes at all (a node whose Props are not enumerated yet
+    /// must not read as 0 dB, #33)
+    pub has_vol: bool,
+    /// an AirPlay/RAOP sink by its props (factory/media.class/device.api/raop.* keys), whatever its name (#33)
+    pub raop: bool,
     pub owned: bool,
 }
 
@@ -25,6 +31,8 @@ pub struct Graph {
     by_name: HashMap<String, usize>,
     /// (output node id, input node id)
     pub links: HashSet<(u64, u64)>,
+    /// the daemon's random core cookie: changes on every PipeWire restart (object serials may repeat)
+    pub cookie: u64,
 }
 
 impl Graph {
@@ -38,13 +46,14 @@ impl Graph {
                 Some("PipeWire:Interface:Node") => {
                     let p = &o["info"]["props"];
                     let s = |k: &str| p[k].as_str().unwrap_or("").to_string();
-                    let (mut vol, mut mute) = (1.0, false);
+                    let (mut vol, mut mute, mut has_vol) = (1.0, false, false);
                     if let Some(props) = o["info"]["params"]["Props"].as_array() {
                         for pr in props {
                             if let Some(cv) = pr["channelVolumes"].as_array() {
                                 let v: Vec<f64> = cv.iter().filter_map(|x| x.as_f64()).collect();
                                 if !v.is_empty() {
                                     vol = (v.iter().sum::<f64>() / v.len() as f64).cbrt();
+                                    has_vol = true;
                                 }
                                 mute = pr["mute"].as_bool().unwrap_or(false);
                                 break;
@@ -61,12 +70,17 @@ impl Graph {
                         media: s("media.name"),
                         vol,
                         mute,
+                        has_vol,
+                        raop: props_say_raop(p),
                         owned: p["wavelink.owned"].as_bool() == Some(true) || s("wavelink.owned") == "true",
                     };
                     if !n.name.is_empty() {
                         g.by_name.insert(n.name.clone(), g.nodes.len());
                     }
                     g.nodes.push(n);
+                }
+                Some("PipeWire:Interface:Core") if o["id"].as_u64() == Some(0) => {
+                    g.cookie = o["info"]["cookie"].as_u64().unwrap_or(0);
                 }
                 Some("PipeWire:Interface:Link") => {
                     let i = &o["info"];
@@ -78,6 +92,11 @@ impl Graph {
             }
         }
         Some(g)
+    }
+
+    /// One node's identity across polls: a re-created node, or the same serial after a PipeWire restart, is a new instance.
+    pub fn instance(&self, n: &Node) -> u64 {
+        (self.cookie << 32) ^ if n.serial != 0 { n.serial } else { n.id }
     }
 
     pub fn node(&self, name: &str) -> Option<&Node> {
@@ -105,6 +124,18 @@ impl Graph {
     pub fn sources(&self) -> Vec<&Node> {
         self.nodes.iter().filter(|n| n.class.starts_with("Audio/Source") && !n.owned && !n.name.ends_with(".monitor")).collect()
     }
+}
+
+/// Whether a node's props mark it as an AirPlay/RAOP sink: its name, factory.name, media.class,
+/// device.api or node.driver mentions raop/airplay (any case), or it carries raop.* / api.raop.* keys.
+pub fn props_say_raop(p: &serde_json::Value) -> bool {
+    let Some(o) = p.as_object() else { return false };
+    o.iter().any(|(k, v)| {
+        let k = k.to_ascii_lowercase();
+        k.starts_with("raop.") || k.starts_with("api.raop")
+            || (["node.name", "factory.name", "media.class", "device.api", "node.driver", "node.group", "media.name"].contains(&k.as_str())
+                && v.as_str().map_or(false, crate::config::is_raop_name))
+    })
 }
 
 /// Run a command and collect stdout, killing it if it takes longer than `limit`.
@@ -242,8 +273,25 @@ pub fn quantum_confirmed(q: u32, meta: &str) -> bool {
     }
 }
 
+/// `v` is the wpctl (cubic) volume, `config::db_to_vol(dB)`. Six decimals keep the dB round trip
+/// within 0.01 dB down to -59.9 dB (four decimals drifted ~0.1 dB at the bottom).
 pub fn set_volume(id: u64, v: f64) {
-    spawn("wpctl", &["set-volume", &id.to_string(), &format!("{v:.4}")]);
+    spawn("wpctl", &["set-volume", &id.to_string(), &format!("{v:.6}")]);
+}
+/// The wpctl calls that set a volume and a mute, in the order that never plays the wrong level:
+/// mute before the volume change, the volume before any unmute (#33: a3 Sonos must not unmute at 100 %).
+pub fn volume_mute_cmds(id: u64, v: f64, mute: bool) -> Vec<Vec<String>> {
+    let vol = vec!["set-volume".to_string(), id.to_string(), format!("{v:.6}")];
+    let m = vec!["set-mute".to_string(), id.to_string(), if mute { "1" } else { "0" }.to_string()];
+    if mute { vec![m, vol] } else { vec![vol, m] }
+}
+/// Volume and mute in one ordered child (`wpctl a && wpctl b`): separate spawns may land in any order.
+pub fn set_volume_mute(id: u64, v: f64, mute: bool) {
+    let c = volume_mute_cmds(id, v, mute);
+    let mut args = vec!["-c".to_string(), "wpctl \"$1\" \"$2\" \"$3\" && wpctl \"$4\" \"$5\" \"$6\"".to_string(), "sh".to_string()];
+    args.extend(c.into_iter().flatten());
+    let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    spawn("sh", &a);
 }
 pub fn set_mute(id: u64, m: bool) {
     spawn("wpctl", &["set-mute", &id.to_string(), if m { "1" } else { "0" }]);
@@ -312,6 +360,29 @@ pub fn meta_value(meta: &str, key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raop_detected_from_props() {
+        let j = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        assert!(props_say_raop(&j(r#"{"node.name":"sonos_room","raop.hostname":"Sonos-1.local"}"#)));
+        assert!(props_say_raop(&j(r#"{"node.name":"sonos_room","factory.name":"support.RAOP-sink"}"#)));
+        assert!(props_say_raop(&j(r#"{"node.name":"x","api.raop.ip":"192.168.1.64"}"#)));
+        assert!(props_say_raop(&j(r#"{"node.name":"x","device.api":"airplay"}"#)));
+        assert!(props_say_raop(&j(r#"{"node.name":"RAOP_kitchen"}"#)));
+        assert!(!props_say_raop(&j(r#"{"node.name":"alsa_output.usb-Focusrite","factory.name":"api.alsa.pcm.sink","media.class":"Audio/Sink"}"#)));
+        assert!(!props_say_raop(&j(r#"{"node.description":"my raop notes"}"#)));
+        assert!(!props_say_raop(&j("null")));
+    }
+
+    #[test]
+    fn volume_goes_in_before_an_unmute_and_after_a_mute() {
+        let c = volume_mute_cmds(42, 0.25, false);
+        assert_eq!(c[0], vec!["set-volume", "42", "0.250000"]);
+        assert_eq!(c[1], vec!["set-mute", "42", "0"]);
+        let c = volume_mute_cmds(42, 0.25, true);
+        assert_eq!(c[0], vec!["set-mute", "42", "1"]);
+        assert_eq!(c[1], vec!["set-volume", "42", "0.250000"]);
+    }
 
     #[test]
     fn meta_value_reads_keys() {
