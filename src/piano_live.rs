@@ -405,6 +405,7 @@ struct Worker<'a> {
     shared: &'a Shared,
     port: Option<Port>,
     tr: PianoTracker,
+    pianist: crate::pianist::Pianist,
     audio_s: f64,
     busy_s: f64,
 }
@@ -413,7 +414,9 @@ impl Worker<'_> {
     /// Runs mono samples at RATE through the tracker, the port and the shared roll.
     fn feed(&mut self, mono: &[f32], busy: Duration) {
         let t = Instant::now();
-        let evs = self.tr.push(mono);
+        let raw = self.tr.push(mono);
+        let mut evs = Vec::with_capacity(raw.len() + 4);
+        self.pianist.push(&raw, self.tr.now(), &mut evs);
         self.busy_s += (t.elapsed() + busy).as_secs_f64();
         self.audio_s += mono.len() as f64 / piano::RATE as f64;
         if let Some(p) = &self.port {
@@ -437,7 +440,10 @@ impl Worker<'_> {
     /// End of the session: every sounding note off on the port and in the roll.
     fn finish(&mut self) {
         let end = self.tr.now();
-        let evs = self.tr.all_off(end);
+        let raw = self.tr.all_off(end);
+        let mut evs = Vec::with_capacity(raw.len() + 8);
+        self.pianist.push(&raw, end, &mut evs);
+        self.pianist.finish(end, &mut evs);
         if let Some(p) = &self.port {
             if let Some(m) = lock(p).as_mut() {
                 m.all_off();
@@ -454,7 +460,7 @@ fn run(o: &Opts, shared: &Shared, stop: &AtomicBool, child: &Mutex<Option<Child>
         None => None,
     };
     shared.get().port = port.as_ref().and_then(port_address);
-    let mut w = Worker { shared, port, tr: PianoTracker::new(), audio_s: 0.0, busy_s: 0.0 };
+    let mut w = Worker { shared, port, tr: PianoTracker::new(), pianist: crate::pianist::Pianist::new(), audio_s: 0.0, busy_s: 0.0 };
     if let Some(path) = &o.wav {
         let r = replay(path, &mut w, stop);
         w.finish();
@@ -582,9 +588,15 @@ fn offline(wav: &str, out: Option<&str>, merged: bool, reference: Option<&str>) 
         }
     };
     let t = Instant::now();
-    let notes = piano::transcribe(&pcm, rate);
+    let raw = piano::transcribe(&pcm, rate);
+    let notes = if std::env::var_os("PIANO_RAW").is_some() { raw } else { crate::pianist::perform(&raw) };
     let secs = pcm.len() as f64 / rate as f64;
     let el = t.elapsed().as_secs_f64();
+    if std::env::var_os("PIANO_DUMP").is_some() {
+        for n in notes.iter() {
+            println!("N {:8.3} {:6.3} {:3} {:3}", n.t, n.dur, n.pitch, n.vel);
+        }
+    }
     let lanes = piano::split_lanes(&notes);
     println!(
         "{} notes from {secs:.1} s of audio in {:.2} s ({:.2} ms per 0.5 s, incl. resampling) — Bass {} / Mid {} / High {}",

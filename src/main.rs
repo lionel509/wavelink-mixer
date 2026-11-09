@@ -9,6 +9,7 @@ mod models;
 mod notes;
 mod piano;
 mod piano_live;
+mod pianist;
 mod sep;
 mod stemcfg;
 mod stems;
