@@ -593,15 +593,25 @@ mod tests {
     fn transcriber_finds_a2() {
         let m = models::ensure(&["basic-pitch-nmp.onnx"], &|s: String| println!("{s}")).unwrap();
         let mut tr = Transcriber::load(&m).unwrap();
-        // 1 s silence, then 1 s of A2: the attack sits at ~0.988 s (the model window starts 0.012 s in)
-        let x: Vec<f32> = (0..88200)
-            .map(|i| if i < 44100 { 0.0 } else { ((2.0 * std::f64::consts::PI * 110.0 * i as f64 / 44100.0).sin() as f32) * 0.4 })
-            .collect();
-        let t0 = Instant::now();
-        let ns = tr.notes(&x).unwrap();
-        println!("notes ms {:.1}", t0.elapsed().as_secs_f64() * 1000.0);
-        println!("notes {ns:?}");
-        assert!(ns.iter().any(|n| (44..=46).contains(&n.pitch) && (n.t - 0.988).abs() < 0.06), "{ns:?}");
+        // 1 s silence, then 1 s of A2. Sweep the attack over one model hop (256 samples at 22.05 kHz is 512 at
+        // 44.1 kHz). The model window starts 256/22050 s in; the note lands up to ~0.07 s late (CQT latency)
+        // and never more than one frame early.
+        let mut bad = Vec::new();
+        for shift in (0..512usize).step_by(64) {
+            let attack = 44100 + shift;
+            let x: Vec<f32> = (0..88200)
+                .map(|i| if i < attack { 0.0 } else { ((2.0 * std::f64::consts::PI * 110.0 * i as f64 / 44100.0).sin() as f32) * 0.4 })
+                .collect();
+            let t0 = Instant::now();
+            let ns = tr.notes(&x).unwrap();
+            let expect = attack as f64 / 44100.0 - 256.0 / 22050.0;
+            let lags: Vec<f64> = ns.iter().filter(|n| (44..=46).contains(&n.pitch)).map(|n| n.t - expect).collect();
+            println!("shift {shift:3} expect {expect:.4} lag(s) {lags:?} ({:.1} ms)", t0.elapsed().as_secs_f64() * 1000.0);
+            if !lags.iter().any(|l| (-1.0 / FPS..=0.10).contains(l)) {
+                bad.push((shift, lags));
+            }
+        }
+        assert!(bad.is_empty(), "no A2 note within [-1/FPS, 0.10] s of the attack at (shift, lags): {bad:?}");
     }
 
     fn names(v: &[&str]) -> Vec<String> {
