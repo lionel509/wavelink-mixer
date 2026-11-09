@@ -248,8 +248,8 @@ pub fn apply_levels(cfg: &Config, g: &Graph) {
     }
     for b in &cfg.buses {
         if let Some(n) = g.node(&bus_fader_node(b)) {
-            pw::set_volume(n.id, db_to_vol(b.gain_db));
-            pw::set_mute(n.id, b.mute);
+            // never above the bus ceiling (a3 Sonos), volume before any unmute (#33)
+            pw::set_volume_mute(n.id, db_to_vol(b.effective_db()), b.mute);
         }
     }
 }

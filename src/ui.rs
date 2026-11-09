@@ -162,6 +162,8 @@ struct Fader {
     auto: Cell<bool>,
     /// Some(bus id) for a physical output bus: it shows the saved gain, never the device's (#33)
     bus: RefCell<Option<String>>,
+    /// the loudest this fader may set (bus ceiling, #33; MAX_DB elsewhere)
+    max_db: Cell<f64>,
 }
 
 impl Fader {
@@ -181,6 +183,17 @@ impl Fader {
             m.set_active(mute);
         }
         self.updating.set(false);
+    }
+
+    /// Saved gain on the slider, the node's mute on M.
+    fn sync_saved(&self, g: &Graph, db: f64) {
+        if self.busy.get() > 0 {
+            self.busy.set(self.busy.get() - 1);
+            return;
+        }
+        let mute = g.node(&self.node.borrow()).filter(|n| n.has_vol).map(|n| n.mute);
+        let m_now = self.mute.as_ref().map(|m| m.is_active()).unwrap_or(false);
+        self.show(db, mute.unwrap_or(m_now));
     }
 
     fn sync(&self, g: &Graph) {
@@ -1042,6 +1055,19 @@ impl App {
         self.dirty.set(true);
     }
 
+    /// The saved gain behind an input strip or virtual bus fader node.
+    fn saved_gain(&self, node: &str) -> Option<f64> {
+        let c = self.cfg.borrow();
+        c.inputs.iter().find(|i| names::strip_in(&i.id) == node).map(|i| i.gain_db)
+            .or_else(|| c.buses.iter().find(|b| matches!(b.kind, BusKind::Virtual { .. }) && bus_fader_node(b) == node).map(|b| b.effective_db()))
+    }
+
+    /// A hardware bus fader's saved gain, capped at its ceiling (None for other faders).
+    fn bus_effective_db(&self, f: &Fader) -> Option<f64> {
+        let id = f.bus.borrow().clone()?;
+        self.cfg.borrow().buses.iter().find(|b| b.id == id).map(|b| b.effective_db())
+    }
+
     /// His fader / mute move on a physical bus just went to the device: it is settling, not drifting.
     fn bus_wrote(&self, f: &Fader) {
         if let Some(id) = f.bus.borrow().as_ref() {
@@ -1059,24 +1085,30 @@ impl App {
         let node = g.node(&bus_fader_node(&b));
         let seen = node.map(|n| (g.instance(n), n.has_vol.then_some(crate::busvol::Reading { vol: n.vol, mute: n.mute })));
         let now = glib::monotonic_time() as f64 / 1e6;
-        let step = self.bus_guard.borrow_mut().entry(id.to_string()).or_default().observe(now, seen, b.gain_db, b.mute);
+        let ceil = b.ceiling_db();
+        let saved = b.effective_db();
+        let step = {
+            let mut guards = self.bus_guard.borrow_mut();
+            let t = guards.entry(id.to_string()).or_default();
+            t.set_ceiling(ceil);
+            t.observe(now, seen, saved, b.mute)
+        };
         match step {
             crate::busvol::Step::Nothing => {}
             crate::busvol::Step::Push => {
                 if let Some(n) = node {
-                    if n.has_vol && (n.mute != b.mute || (config::vol_to_db(n.vol) - b.gain_db).abs() > crate::busvol::TOL_DB) {
+                    if n.has_vol && (n.mute != b.mute || (config::vol_to_db(n.vol) - saved).abs() > crate::busvol::TOL_DB) {
                         eprintln!("wavelink: bus {id}: device {} reads {}{}, re-applying saved {}{}", n.name, fmt_db(config::vol_to_db(n.vol)),
-                                  if n.mute { " muted" } else { "" }, fmt_db(b.gain_db), if b.mute { " muted" } else { "" });
+                                  if n.mute { " muted" } else { "" }, fmt_db(saved), if b.mute { " muted" } else { "" });
                     }
-                    pw::set_volume(n.id, db_to_vol(b.gain_db));
-                    pw::set_mute(n.id, b.mute);
+                    pw::set_volume_mute(n.id, db_to_vol(saved), b.mute);
                 }
             }
             crate::busvol::Step::Adopt { gain_db, mute } => {
                 eprintln!("wavelink: bus {id}: external change kept: gain {:?} mute {:?} (was {} {})", gain_db, mute, fmt_db(b.gain_db), b.mute);
                 if let Some(bu) = self.cfg.borrow_mut().buses.iter_mut().find(|x| x.id == id) {
                     if let Some(d) = gain_db {
-                        bu.gain_db = d;
+                        bu.gain_db = bu.clamp_db(d);
                     }
                     if let Some(m) = mute {
                         bu.mute = m;
@@ -1090,7 +1122,7 @@ impl App {
             f.busy.set(f.busy.get() - 1);
             return;
         }
-        let (db, mute) = self.cfg.borrow().buses.iter().find(|x| x.id == id).map(|x| (x.gain_db, x.mute)).unwrap_or((b.gain_db, b.mute));
+        let (db, mute) = self.cfg.borrow().buses.iter().find(|x| x.id == id).map(|x| (x.effective_db(), x.mute)).unwrap_or((saved, b.mute));
         f.show(db, mute);
     }
     fn node_id(&self, name: &str) -> Option<u64> {
@@ -1138,7 +1170,7 @@ impl App {
         if let Some(m) = &mute {
             btns.append(m);
         }
-        let f = Rc::new(Fader { node: RefCell::new(node), scale, label: lab, mute, btns, updating: Cell::new(false), busy: Cell::new(0), auto: Cell::new(false), bus: RefCell::new(None) });
+        let f = Rc::new(Fader { node: RefCell::new(node), scale, label: lab, mute, btns, updating: Cell::new(false), busy: Cell::new(0), auto: Cell::new(false), bus: RefCell::new(None), max_db: Cell::new(config::MAX_DB) });
         // double-click the dB label area resets to 0 dB
         let gest = gtk::GestureClick::new();
         let fw = Rc::downgrade(&f);
@@ -1167,11 +1199,17 @@ impl App {
         let (fw, app) = (Rc::downgrade(&f), self.clone());
         f.scale.connect_value_changed(move |s| {
             let Some(f) = fw.upgrade() else { return };
-            let db = pos_to_db(s.value());
-            let db = if db.abs() < 0.25 { 0.0 } else { (db * 10.0).round() / 10.0 }; // snap to unity
+            // snap to unity, then the bus ceiling (#33: drag, scroll, double-click 0 dB and the SL MkIII all land here)
+            let db = crate::busvol::write_db(pos_to_db(s.value()), f.max_db.get());
             f.label.set_label(&fmt_db(db));
             if f.updating.get() {
                 return;
+            }
+            if db_to_pos(db) + 1e-6 < s.value() {
+                // above the ceiling: the cap stops at it
+                f.updating.set(true);
+                s.set_value(db_to_pos(db));
+                f.updating.set(false);
             }
             f.busy.set(6);
             apply(&app, db);
@@ -1200,7 +1238,11 @@ impl App {
                 app.mark_dirty();
                 let node = f.node.borrow().clone();
                 if let Some(id) = app.node_id(&node) {
-                    pw::set_mute(id, b.is_active());
+                    match app.bus_effective_db(&f) {
+                        // hardware bus: the saved (capped) volume goes in before the unmute (#33)
+                        Some(db) => pw::set_volume_mute(id, db_to_vol(db), b.is_active()),
+                        None => pw::set_mute(id, b.is_active()),
+                    }
                 }
                 app.bus_wrote(&f);
             });
@@ -1711,6 +1753,12 @@ impl App {
             // the fader is the device volume: config is the source of truth (#33)
             *bus_fader.bus.borrow_mut() = Some(bus.id.clone());
         }
+        let ceil = bus.ceiling_db();
+        bus_fader.max_db.set(ceil);
+        if ceil < config::MAX_DB {
+            bus_fader.scale.add_mark(db_to_pos(ceil), gtk::PositionType::Right, Some("max"));
+            bus_fader.scale.set_tooltip_text(Some(&format!("Ceiling {} (this output never goes louder)", fmt_db(ceil))));
+        }
         row.append(&fb);
         // meter sits beside the fader slot (clear of the dB readout + mute below it)
         led.area.set_margin_top(8);
@@ -1911,7 +1959,7 @@ impl App {
                 } else {
                     BusKind::Virtual { node: format!("wavelink_{id}"), description: name.clone() }
                 };
-                c.buses.push(Bus { id, name, color: if hw { "#64d2ff".into() } else { "#ffd60a".into() }, kind, gain_db: 0.0, mute: false });
+                c.buses.push(Bus::new(id, name, if hw { "#64d2ff".into() } else { "#ffd60a".into() }, kind));
                 c.buses.sort_by(|a, b| a.id.cmp(&b.id));
             }
             entry.set_text("");
@@ -2086,7 +2134,15 @@ impl App {
             let bus = f.bus.borrow().clone();
             match bus {
                 Some(id) => self.sync_bus(f, g, &id),
-                None => f.sync(g),
+                None => {
+                    // inputs and virtual buses: the slider shows the saved gain too, so a click/scroll never
+                    // saves a device artefact (#33); mute still shows the node's (solo / stems mute it)
+                    let saved = self.saved_gain(&f.node.borrow());
+                    match saved {
+                        Some(db) => f.sync_saved(g, db),
+                        None => f.sync(g),
+                    }
+                }
             }
         }
         for (node, t, guard) in self.routes.borrow().iter() {

@@ -12,7 +12,7 @@
 //! wpctl volume `v` (cubic, what `wpctl get-volume` prints) = 10^(dB/60), dB = 60·log10(v);
 //! the node's linear channelVolume is v³, so dB is also 20·log10(channelVolume).
 
-use crate::config::{vol_to_db, MIN_DB};
+use crate::config::{db_to_vol, vol_to_db, MAX_DB, MIN_DB};
 
 /// After a node appears (or the GUI starts, or we write to it) device values are artefacts for this long.
 pub const SETTLE_S: f64 = 5.0;
@@ -29,6 +29,8 @@ pub const ZERO_VOL: f64 = 1e-6;
 pub const FULL_VOL: f64 = 0.999;
 /// ... and is not adopted this soon after the node appeared, however stable.
 pub const ARTEFACT_S: f64 = 30.0;
+/// The value we have been overriding stays refused until the device has matched the config this long.
+pub const PIN_CLEAR_S: f64 = 5.0;
 
 /// What the device reports: wpctl volume (cubic, 0..) and mute.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -59,6 +61,13 @@ pub fn adopted_db(vol: f64) -> f64 {
     if db <= MIN_DB { MIN_DB } else { (db * 10.0).round() / 10.0 }
 }
 
+/// The dB a fader position writes: snapped to unity within 0.25 dB, else 0.1 dB steps, then capped at
+/// the bus ceiling. Every slider write goes through it: drag, scroll, double-click 0 dB, SL MkIII.
+pub fn write_db(pos_db: f64, ceiling_db: f64) -> f64 {
+    let db = if pos_db.is_nan() { MIN_DB } else if pos_db.abs() < 0.25 { 0.0 } else { (pos_db * 10.0).round() / 10.0 };
+    db.min(ceiling_db)
+}
+
 /// Everything the adopt-vs-re-apply decision looks at, for one physical bus.
 #[derive(Clone, Copy, Debug)]
 pub struct Obs {
@@ -78,10 +87,22 @@ pub struct Obs {
 pub fn decide(o: Obs) -> Decision {
     let Some(d) = o.dev else { return Decision::Wait };
     let mute_ok = d.mute == o.saved_mute;
-    // muted means mute: a muted node's volume is not read as a level (raop can report 0 while muted)
-    let vol_ok = (d.mute && o.saved_mute) || same_db(vol_to_db(d.vol), o.saved_db);
+    // NaN / negative / non-finite readings are not levels (`!(x >= y)` is true for NaN)
+    let zero = !(d.vol >= ZERO_VOL);
+    // above the +12 dB the fader can show: compare linearly, before vol_to_db clamps it to +12
+    let over = d.vol.is_finite() && d.vol > db_to_vol(MAX_DB) * (1.0 + 1e-6) || d.vol == f64::INFINITY;
+    let vol_ok = !over && same_db(vol_to_db(d.vol), o.saved_db);
     if mute_ok && vol_ok {
         return Decision::InSync;
+    }
+    if d.mute && o.saved_mute {
+        // both muted, volume differs: re-apply it behind the mute so an unmute never plays the wrong
+        // level; a muted node's volume is never adopted (muted means mute, not volume 0)
+        return Decision::Reapply;
+    }
+    if over {
+        // louder than any level the config can hold: never adopted, always brought back
+        return Decision::Reapply;
     }
     if o.age_s < SETTLE_S || o.quiet_s < SETTLE_S {
         // just appeared / restarted / we just wrote: whatever it reports is a reset or in flight, not his choice
@@ -90,9 +111,8 @@ pub fn decide(o: Obs) -> Decision {
     if o.stable_s < STABLE_S {
         return Decision::Wait;
     }
-    // exactly silent (an AirPlay sink reads 0 while muted or idle); quiet but audible levels below
-    // the fader's -60 dB floor are adopted as -∞ like any other level
-    let zero = d.vol < ZERO_VOL;
+    // `zero`: exactly silent (an AirPlay sink reads 0 while muted or idle); quiet but audible levels
+    // below the fader's -60 dB floor are adopted as -∞ like any other level
     // a full-scale reading soon after the node appeared is a reset default (AirPlay: 100 % = full blast)
     if !d.mute && d.vol >= FULL_VOL && o.age_s < ARTEFACT_S && !vol_ok {
         return Decision::Reapply;
@@ -120,31 +140,57 @@ pub enum Step {
 /// Per-bus state across graph polls. Times are seconds on any monotonic clock.
 #[derive(Clone, Debug, Default)]
 pub struct Tracker {
-    /// node instance (object.serial, else id); None while absent
+    /// node instance (object.serial, else id, keyed by the daemon cookie); None while absent
     inst: Option<u64>,
+    /// whether this instance has reported a volume yet (its first reading is an appearance too)
+    had_reading: bool,
     appeared: f64,
     last_write: f64,
     reading: Option<Reading>,
     reading_since: f64,
     last_reapply: f64,
     tries: u32,
-    /// we pushed and the device reading has not changed since: that reading is not an external change
-    pushed: bool,
+    /// the device value we have been pushing over: never adopted, until the device has matched the
+    /// config for PIN_CLEAR_S (a missing reading or a one-poll flap does not clear it)
+    overridden: Option<Reading>,
+    /// per-bus ceiling (dB); None = MAX_DB. Saved gains are clamped to it; louder device values are never adopted.
+    ceiling: Option<f64>,
 }
 
 fn same_reading(a: Option<Reading>, b: Option<Reading>) -> bool {
     match (a, b) {
-        (Some(a), Some(b)) => a.mute == b.mute && same_db(vol_to_db(a.vol), vol_to_db(b.vol)),
+        (Some(a), Some(b)) => a.mute == b.mute && same_db(vol_to_db(a.vol), vol_to_db(b.vol)) && (a.vol > db_to_vol(MAX_DB)) == (b.vol > db_to_vol(MAX_DB)),
         (None, None) => true,
         _ => false,
     }
 }
 
 impl Tracker {
+    /// The bus's ceiling (e.g. -20 dB for an AirPlay speaker).
+    pub fn set_ceiling(&mut self, db: f64) {
+        self.ceiling = Some(db);
+    }
+    pub fn ceiling(&self) -> f64 {
+        self.ceiling.unwrap_or(MAX_DB)
+    }
+
     /// We (or he, through the fader) just wrote to the device: what it reports next is settling.
     pub fn wrote(&mut self, now: f64) {
         self.last_write = now;
         self.tries = REAPPLY_TRIES;
+    }
+
+    fn appear(&mut self, now: f64, reading: Option<Reading>) -> Step {
+        self.appeared = now;
+        self.reading = reading;
+        self.reading_since = now;
+        self.last_reapply = now;
+        self.had_reading = reading.is_some();
+        if reading.is_some() {
+            self.overridden = reading;
+        }
+        self.wrote(now);
+        Step::Push
     }
 
     /// One graph poll. `node`: (instance, reading) when the device exists.
@@ -153,17 +199,20 @@ impl Tracker {
             self.inst = None;
             return Step::Nothing;
         };
+        let saved_db = saved_db.min(self.ceiling());
         if self.inst != Some(inst) {
             // appeared, re-appeared after a restart, or first seen by this GUI: the config wins
-            *self = Tracker { inst: Some(inst), appeared: now, reading, reading_since: now, last_reapply: now, pushed: true, ..Default::default() };
-            self.wrote(now);
-            return Step::Push;
+            *self = Tracker { inst: Some(inst), ceiling: self.ceiling, ..Default::default() };
+            return self.appear(now, reading);
+        }
+        if !self.had_reading && reading.is_some() {
+            // Props enumerated only now: the node's first real level is a restore/reset, not his
+            return self.appear(now, reading);
         }
         if !same_reading(self.reading, reading) {
             self.reading = reading;
             self.reading_since = now;
             self.tries = REAPPLY_TRIES;
-            self.pushed = false;
         }
         let o = Obs {
             saved_db,
@@ -173,11 +222,18 @@ impl Tracker {
             quiet_s: now - self.last_write,
             stable_s: now - self.reading_since,
         };
-        let push = match decide(o) {
+        let d = decide(o);
+        if d == Decision::InSync && now - self.reading_since >= PIN_CLEAR_S {
+            self.overridden = None;
+        }
+        let pinned = self.reading.is_some() && self.overridden.is_some() && same_reading(self.reading, self.overridden);
+        let push = match d {
             Decision::InSync | Decision::Wait => false,
             Decision::Reapply => true,
-            // the device is still on the value we have been overriding: it ignores us, it is not his
-            Decision::Adopt { .. } if self.pushed => true,
+            // still the value we have been overriding: it ignores us, it is not his
+            Decision::Adopt { .. } if pinned => true,
+            // louder than this bus may ever be: brought back, never saved
+            Decision::Adopt { gain_db: Some(g), .. } if g > self.ceiling() + TOL_DB => true,
             Decision::Adopt { gain_db, mute } => return Step::Adopt { gain_db, mute },
         };
         if !push || self.tries == 0 || now - self.last_reapply < REAPPLY_EVERY_S {
@@ -186,7 +242,9 @@ impl Tracker {
         self.tries -= 1;
         self.last_reapply = now;
         self.last_write = now;
-        self.pushed = true;
+        if self.reading.is_some() {
+            self.overridden = self.reading;
+        }
         Step::Push
     }
 }
@@ -242,9 +300,10 @@ mod tests {
 
     #[test]
     fn muted_volume_is_not_read_as_a_level() {
-        // both muted: whatever volume the muted node reports, it is in sync
-        assert_eq!(decide(-37.3, true, r(0.0, true), LATE, LATE), Decision::InSync);
-        assert_eq!(decide(-37.3, true, r(1.0, true), LATE, LATE), Decision::InSync);
+        // both muted, other volume: re-applied behind the mute (so unmute plays the saved level), never adopted
+        assert_eq!(decide(-37.3, true, r(0.0, true), LATE, LATE), Decision::Reapply);
+        assert_eq!(decide(-37.3, true, r(1.0, true), LATE, LATE), Decision::Reapply);
+        assert_eq!(decide(-37.3, true, r(db_to_vol(-37.3), true), LATE, LATE), Decision::InSync);
         // external mute with some volume: only the mute is adopted
         assert_eq!(decide(-37.3, false, r(0.7, true), LATE, LATE), Decision::Adopt { gain_db: None, mute: Some(true) });
     }
@@ -341,6 +400,58 @@ mod tests {
             let s = t.observe(20.0 + k as f64 * 0.5, Some((3, r(db_to_vol(-15.3), false))), -10.0, false);
             assert!(!matches!(s, Step::Adopt { .. }), "adopted the old device value at {k}");
         }
+    }
+
+    #[test]
+    fn fader_writes_are_capped_at_the_ceiling() {
+        use crate::dash::{db_to_pos, pos_to_db};
+        let ceil = crate::config::RAOP_MAX_DB;
+        // double-click "0 dB" on the Sonos fader
+        assert_eq!(write_db(pos_to_db(db_to_pos(0.0)), ceil), ceil);
+        // SL MkIII fader at the top (CC 127 -> position 1.0 = +12 dB)
+        assert_eq!(write_db(pos_to_db(1.0), ceil), ceil);
+        // a drag below the ceiling is untouched, snapping still works
+        assert_eq!(write_db(-37.34, ceil), -37.3);
+        assert_eq!(write_db(0.2, MAX_DB), 0.0);
+        assert_eq!(write_db(pos_to_db(1.0), MAX_DB), MAX_DB);
+        assert_eq!(write_db(f64::NAN, ceil), MIN_DB);
+    }
+
+    #[test]
+    fn tracker_never_adopts_above_the_ceiling() {
+        let mut t = Tracker::default();
+        t.set_ceiling(-20.0);
+        t.observe(0.0, Some((3, r(db_to_vol(-37.3), false))), -37.3, false);
+        // long after appear, someone sets the Sonos to -10 dB (above its -20 ceiling) and leaves it
+        let mut steps = vec![];
+        for k in 0..60 {
+            steps.push(t.observe(60.0 + k as f64 * 0.5, Some((3, r(db_to_vol(-10.0), false))), -37.3, false));
+        }
+        assert!(!steps.iter().any(|s| matches!(s, Step::Adopt { gain_db: Some(_), .. })), "{steps:?}");
+        assert!(steps.contains(&Step::Push));
+        // below the ceiling: adopted as usual
+        let mut t = Tracker::default();
+        t.set_ceiling(-20.0);
+        t.observe(0.0, Some((3, r(db_to_vol(-37.3), false))), -37.3, false);
+        let adopt = (0..20).map(|k| t.observe(60.0 + k as f64 * 0.5, Some((3, r(db_to_vol(-25.0), false))), -37.3, false))
+            .find(|s| matches!(s, Step::Adopt { .. }));
+        assert_eq!(adopt, Some(Step::Adopt { gain_db: Some(-25.0), mute: None }));
+    }
+
+    #[test]
+    fn tracker_reapply_targets_the_capped_gain() {
+        // saved 0 dB on a bus with a -20 ceiling: a device at -20 is in sync (the push sends -20), 0 dB is not
+        let mut t = Tracker::default();
+        t.set_ceiling(-20.0);
+        assert_eq!(t.observe(0.0, Some((3, r(db_to_vol(-20.0), false))), 0.0, false), Step::Push);
+        for k in 1..40 {
+            assert_eq!(t.observe(k as f64 * 0.5, Some((3, r(db_to_vol(-20.0), false))), 0.0, false), Step::Nothing, "at {k}");
+        }
+        let mut t = Tracker::default();
+        t.set_ceiling(-20.0);
+        t.observe(0.0, Some((3, r(1.0, false))), 0.0, false);
+        let steps: Vec<_> = (1..200).map(|k| t.observe(k as f64 * 0.5, Some((3, r(1.0, false))), 0.0, false)).collect();
+        assert!(!steps.iter().any(|s| matches!(s, Step::Adopt { .. })), "{steps:?}");
     }
 
     #[test]

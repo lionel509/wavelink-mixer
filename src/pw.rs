@@ -263,6 +263,21 @@ pub fn quantum_confirmed(q: u32, meta: &str) -> bool {
 pub fn set_volume(id: u64, v: f64) {
     spawn("wpctl", &["set-volume", &id.to_string(), &format!("{v:.6}")]);
 }
+/// The wpctl calls that set a volume and a mute, in the order that never plays the wrong level:
+/// mute before the volume change, the volume before any unmute (#33: a3 Sonos must not unmute at 100 %).
+pub fn volume_mute_cmds(id: u64, v: f64, mute: bool) -> Vec<Vec<String>> {
+    let vol = vec!["set-volume".to_string(), id.to_string(), format!("{v:.6}")];
+    let m = vec!["set-mute".to_string(), id.to_string(), if mute { "1" } else { "0" }.to_string()];
+    if mute { vec![m, vol] } else { vec![vol, m] }
+}
+/// Volume and mute in one ordered child (`wpctl a && wpctl b`): separate spawns may land in any order.
+pub fn set_volume_mute(id: u64, v: f64, mute: bool) {
+    let c = volume_mute_cmds(id, v, mute);
+    let mut args = vec!["-c".to_string(), "wpctl \"$1\" \"$2\" \"$3\" && wpctl \"$4\" \"$5\" \"$6\"".to_string(), "sh".to_string()];
+    args.extend(c.into_iter().flatten());
+    let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    spawn("sh", &a);
+}
 pub fn set_mute(id: u64, m: bool) {
     spawn("wpctl", &["set-mute", &id.to_string(), if m { "1" } else { "0" }]);
 }
@@ -330,6 +345,16 @@ pub fn meta_value(meta: &str, key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volume_goes_in_before_an_unmute_and_after_a_mute() {
+        let c = volume_mute_cmds(42, 0.25, false);
+        assert_eq!(c[0], vec!["set-volume", "42", "0.250000"]);
+        assert_eq!(c[1], vec!["set-mute", "42", "0"]);
+        let c = volume_mute_cmds(42, 0.25, true);
+        assert_eq!(c[0], vec!["set-mute", "42", "1"]);
+        assert_eq!(c[1], vec!["set-volume", "42", "0.250000"]);
+    }
 
     #[test]
     fn meta_value_reads_keys() {

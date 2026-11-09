@@ -201,6 +201,39 @@ pub struct Bus {
     pub kind: BusKind,
     pub gain_db: f64,
     pub mute: bool,
+    /// Loudest this bus may ever be set (#33). None = the default for its destination:
+    /// RAOP_MAX_DB for an AirPlay speaker (`raop_*`, where 0 dB is the speaker at 100 %), else MAX_DB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_db: Option<f64>,
+}
+
+/// Default ceiling of a bus that drives an AirPlay (RAOP) speaker's own volume.
+pub const RAOP_MAX_DB: f64 = -20.0;
+
+impl Bus {
+    /// A new bus: unity gain, or its ceiling when that is lower (a new Sonos bus never starts at 100 %).
+    pub fn new(id: String, name: String, color: String, kind: BusKind) -> Bus {
+        let mut b = Bus { id, name, color, kind, gain_db: 0.0, mute: false, max_db: None };
+        b.gain_db = b.clamp_db(0.0);
+        b
+    }
+    /// The ceiling every write to this bus is clamped to.
+    pub fn ceiling_db(&self) -> f64 {
+        match self.max_db {
+            Some(m) if m.is_finite() => m.clamp(MIN_DB, MAX_DB),
+            _ => match &self.kind {
+                BusKind::Hardware { target } if target.starts_with("raop_") => RAOP_MAX_DB,
+                _ => MAX_DB,
+            },
+        }
+    }
+    pub fn clamp_db(&self, db: f64) -> f64 {
+        if db.is_nan() { MIN_DB } else { db.min(self.ceiling_db()) }
+    }
+    /// The gain to push to the device: the saved one, never above the ceiling.
+    pub fn effective_db(&self) -> f64 {
+        self.clamp_db(self.gain_db)
+    }
 }
 
 /// Piano synth settings (FluidSynth playing your MIDI keyboard into the Piano channel).
@@ -403,15 +436,15 @@ impl Config {
             ],
             buses: vec![
                 Bus { id: "a1".into(), name: "Headphones".into(), color: "#64d2ff".into(),
-                      kind: BusKind::Hardware { target: SCARLETT.into() }, gain_db: -4.2, mute: false },
+                      kind: BusKind::Hardware { target: SCARLETT.into() }, gain_db: -4.2, mute: false, max_db: None },
                 Bus { id: "a2".into(), name: "Monitor".into(), color: "#30d158".into(),
-                      kind: BusKind::Hardware { target: HDMI.into() }, gain_db: -23.9, mute: false },
+                      kind: BusKind::Hardware { target: HDMI.into() }, gain_db: -23.9, mute: false, max_db: None },
                 Bus { id: "b1".into(), name: "Stream".into(), color: "#ff453a".into(),
                       kind: BusKind::Virtual { node: "mix_recording.src".into(), description: "Recording Mix".into() },
-                      gain_db: 0.0, mute: false },
+                      gain_db: 0.0, mute: false, max_db: None },
                 Bus { id: "b2".into(), name: "Voice Chat".into(), color: "#ffd60a".into(),
                       kind: BusKind::Virtual { node: "voice_chat_mix".into(), description: "Voice Chat Mix".into() },
-                      gain_db: 0.0, mute: false },
+                      gain_db: 0.0, mute: false, max_db: None },
             ],
         }
     }
@@ -446,6 +479,39 @@ mod tests {
         assert!((db_to_vol(-6.0).powi(3) - 10f64.powf(-6.0 / 20.0)).abs() < 1e-12);
         assert_eq!(db_to_vol(0.0), 1.0);
         assert_eq!(vol_to_db(1.0), 0.0);
+    }
+
+    #[test]
+    fn bus_ceiling_defaults_and_clamps() {
+        let hw = |t: &str| BusKind::Hardware { target: t.into() };
+        // new-bus creation: an AirPlay bus starts at its ceiling, never 0 dB (= the speaker at 100 %)
+        let sonos = Bus::new("a3".into(), "Sonos".into(), "#fff".into(), hw("raop_sonos_lionels_room"));
+        assert_eq!(sonos.ceiling_db(), RAOP_MAX_DB);
+        assert_eq!(sonos.gain_db, RAOP_MAX_DB);
+        let scarlett = Bus::new("a1".into(), "Headphones".into(), "#fff".into(), hw(SCARLETT));
+        assert_eq!(scarlett.ceiling_db(), MAX_DB);
+        assert_eq!(scarlett.gain_db, 0.0);
+        let virt = Bus::new("b3".into(), "V".into(), "#fff".into(), BusKind::Virtual { node: "v".into(), description: "V".into() });
+        assert_eq!(virt.ceiling_db(), MAX_DB);
+        // a saved gain above the ceiling is pushed (engine initial push, GUI re-apply) at the ceiling
+        let mut b = sonos.clone();
+        b.gain_db = 0.0;
+        assert_eq!(b.effective_db(), RAOP_MAX_DB);
+        b.gain_db = -37.3;
+        assert_eq!(b.effective_db(), -37.3);
+        assert_eq!(b.clamp_db(f64::NAN), MIN_DB);
+        // explicit max_db wins (clamped to the fader range); missing field = destination default
+        b.max_db = Some(-30.0);
+        assert_eq!(b.ceiling_db(), -30.0);
+        assert_eq!(b.effective_db(), -37.3);
+        b.max_db = Some(40.0);
+        assert_eq!(b.ceiling_db(), MAX_DB);
+        let j = r##"{"id":"a3","name":"Sonos","color":"#fff","kind":{"type":"hardware","target":"raop_x"},"gain_db":0.0,"mute":false}"##;
+        let old: Bus = serde_json::from_str(j).unwrap();
+        assert_eq!(old.max_db, None);
+        assert_eq!(old.effective_db(), RAOP_MAX_DB);
+        // round trip without a max_db does not write one
+        assert!(!serde_json::to_string(&old).unwrap().contains("max_db"));
     }
 
     #[test]
