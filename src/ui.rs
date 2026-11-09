@@ -144,6 +144,9 @@ scale.vertical slider, scale.vertical slider:hover, scale.vertical slider:active
   min-width: 26px; min-height: 40px; margin: -18px -11px; border-radius: 3px; border: 1px solid #000; outline: none;
   background-image: linear-gradient(to bottom, #4a4a50 0%, #2c2c31 18%, #3a3a40 30%, #2a2a2f 47%, #f2f2f2 47%, #f2f2f2 53%, #2a2a2f 53%, #3a3a40 70%, #2c2c31 82%, #1c1c20 100%);
   box-shadow: 0 3px 6px rgba(0,0,0,.75), inset 0 1px 0 rgba(255,255,255,.15); }
+/* #28 split cap: with N on the gain cap is the left half; the Target half is drawn on the right */
+scale.vertical.split slider, scale.vertical.split slider:hover, scale.vertical.split slider:active {
+  min-width: 12px; margin: -18px 2px -18px -11px; border-radius: 3px 0 0 3px; }
 scale marks indicator { color: #4a4a52; min-height: 1px; min-width: 6px; }
 scale marks label { font-size: 9px; color: #6a6a72; font-feature-settings: "tnum"; }
 "#;
@@ -156,8 +159,8 @@ struct Fader {
     mute: Option<gtk::ToggleButton>,
     /// row holding M (strips add S next to it)
     btns: gtk::Box,
-    /// holds the fader; #28 adds the Target half next to it when N is on
-    pair: gtk::Box,
+    /// overlay on the fader; #28 draws the Target half of the split cap on it when N is on
+    ov: gtk::Overlay,
     updating: Cell<bool>,
     busy: Cell<u32>,
     /// true while auto-normalize moves the slider (its moves are not his, so they are not saved at once)
@@ -1065,11 +1068,10 @@ impl App {
             m
         });
         // the fader sits in a row so normalize can split it into two halves (#28)
-        let pair = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        pair.set_halign(gtk::Align::Center);
-        pair.set_vexpand(true);
-        pair.append(&scale);
-        b.append(&pair);
+        let ov = gtk::Overlay::new();
+        ov.set_vexpand(true);
+        ov.set_child(Some(&scale));
+        b.append(&ov);
         b.append(&lab);
         let btns = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         btns.set_halign(gtk::Align::Center);
@@ -1077,7 +1079,7 @@ impl App {
         if let Some(m) = &mute {
             btns.append(m);
         }
-        let f = Rc::new(Fader { node: RefCell::new(node), scale, label: lab, mute, btns, pair, updating: Cell::new(false), busy: Cell::new(0), auto: Cell::new(false) });
+        let f = Rc::new(Fader { node: RefCell::new(node), scale, label: lab, mute, btns, ov, updating: Cell::new(false), busy: Cell::new(0), auto: Cell::new(false) });
         // double-click the dB label area resets to 0 dB
         let gest = gtk::GestureClick::new();
         let fw = Rc::downgrade(&f);
@@ -1338,33 +1340,56 @@ impl App {
             self.norm.borrow_mut().insert(id.clone(), ch);
             self.norm_store(&id);
         }
-        // #28: with N on the fader splits in two: the left half is the gain (auto moves it), the right
-        // half is the Target, the loudness he wants. Same console fader look, side by side.
-        let tgt = gtk::Scale::with_range(gtk::Orientation::Vertical, crate::norm::TARGET_MIN_DB, crate::norm::TARGET_MAX_DB, 0.5);
-        tgt.set_inverted(true);
-        tgt.set_draw_value(false);
-        tgt.set_vexpand(true);
-        tgt.add_css_class("console");
-        for (d, t) in [(-6.0, "6"), (-10.0, "10"), (-20.0, "20"), (-30.0, "30"), (-45.0, "45")] {
-            tgt.add_mark(d, gtk::PositionType::Right, Some(t));
-        }
-        tgt.set_tooltip_text(Some("Normalize target: the loudness N keeps this channel at (short-term dBFS). Drag to set it."));
-        tgt.update_property(&[gtk::accessible::Property::Label(&format!("{} normalize target", inp.name))]);
-        // one line under the dB readout: target and what it measures now
+        // #28: with N on the fader cap splits in two on the same track: the left half is the gain (auto
+        // moves it), the right half is the Target, the loudness he wants. Drag the right half to set it.
+        let lo_t = crate::norm::TARGET_MIN_DB;
+        let hi_t = crate::norm::TARGET_MAX_DB;
+        let target = Rc::new(Cell::new(self.norm.borrow().get(&id).map(|c| c.out).unwrap_or(crate::norm::TARGET_DB).clamp(lo_t, hi_t)));
         let tgt_val = label("", "small");
         let tgt_now = tgt_val.clone();
-        let start = self.norm.borrow().get(&id).map(|c| c.out).unwrap_or(crate::norm::TARGET_DB);
-        tgt.set_value(start.clamp(crate::norm::TARGET_MIN_DB, crate::norm::TARGET_MAX_DB));
-        tgt_val.set_label(&format!("target {:.0}", tgt.value()));
-        fader_rc.pair.append(&tgt);
+        tgt_val.set_label(&format!("target {:.0}", target.get()));
         fb.insert_child_after(&tgt_val, Some(&fader_rc.label));
-        tgt.set_visible(inp.normalize);
-        tgt_val.set_visible(inp.normalize);
-        let tgt_col = (tgt.clone(), tgt_val.clone());
+        let cap = gtk::DrawingArea::new();
+        cap.set_can_target(false);
+        fader_rc.ov.add_overlay(&cap);
+        // slider travel on the scale: 40 px cap, centre runs the trough minus the cap length
+        const CAP_H: f64 = 40.0;
+        let geom = |sc: &gtk::Scale| {
+            let r = sc.range_rect();
+            let (x, y, w, h) = (r.x() as f64, r.y() as f64, r.width() as f64, r.height() as f64);
+            (x + w / 2.0, y + CAP_H / 2.0, (h - CAP_H).max(1.0))
+        };
         {
-            let (app, id2, val) = (self.clone(), id.clone(), tgt_val.clone());
-            tgt.connect_value_changed(move |sc| {
-                let v = (sc.value() * 2.0).round() / 2.0;
+            let (sc, t) = (fader_rc.scale.clone(), target.clone());
+            cap.set_draw_func(move |_, cr, _, _| {
+                let (cx, top, span) = geom(&sc);
+                let frac = (t.get() - lo_t) / (hi_t - lo_t);
+                let yc = top + (1.0 - frac) * span;
+                let (x0, w, y0, h) = (cx + 2.0, 12.0, yc - CAP_H / 2.0, CAP_H);
+                let g = gtk::cairo::LinearGradient::new(0.0, y0, 0.0, y0 + h);
+                for (o, c) in [(0.0, 0.29), (0.18, 0.17), (0.30, 0.23), (0.47, 0.16), (0.53, 0.16), (0.70, 0.23), (0.82, 0.17), (1.0, 0.11)] {
+                    g.add_color_stop_rgb(o, c, c, c + 0.02);
+                }
+                cr.rectangle(x0, y0, w, h);
+                let _ = cr.set_source(&g);
+                let _ = cr.fill();
+                // index line in the N colour, so the target half reads apart from the gain half
+                cr.set_source_rgb(0.35, 0.78, 0.98);
+                cr.rectangle(x0, yc - 1.5, w, 3.0);
+                let _ = cr.fill();
+                cr.set_source_rgb(0.0, 0.0, 0.0);
+                cr.set_line_width(1.0);
+                cr.rectangle(x0 + 0.5, y0 + 0.5, w - 1.0, h - 1.0);
+                let _ = cr.stroke();
+            });
+        }
+        // drag on the right half of the track moves the Target; the left half stays the gain fader
+        let set_target = {
+            let (app, id2, val, t, cap2) = (self.clone(), id.clone(), tgt_val.clone(), target.clone(), cap.clone());
+            Rc::new(move |v: f64| {
+                let v = ((v * 2.0).round() / 2.0).clamp(lo_t, hi_t);
+                t.set(v);
+                cap2.queue_draw();
                 if let Some(c) = app.norm.borrow_mut().get_mut(&id2) {
                     c.set_target(v);
                 }
@@ -1374,15 +1399,48 @@ impl App {
                 app.norm_store(&id2);
                 val.set_label(&format!("target {v:.0}"));
                 app.mark_dirty();
+            })
+        };
+        {
+            let drag = gtk::GestureDrag::new();
+            drag.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let (sc, cap3, st, start_y) = (fader_rc.scale.clone(), cap.clone(), set_target.clone(), Rc::new(Cell::new(0.0)));
+            let pos_db = move |sc: &gtk::Scale, y: f64| {
+                let (_, top, span) = geom(sc);
+                lo_t + (1.0 - ((y - top) / span).clamp(0.0, 1.0)) * (hi_t - lo_t)
+            };
+            {
+                let (sc, cap3, st, sy) = (sc.clone(), cap3.clone(), st.clone(), start_y.clone());
+                drag.connect_drag_begin(move |g, x, y| {
+                    let (cx, _, _) = geom(&sc);
+                    if !cap3.is_visible() || x < cx + 1.0 {
+                        g.set_state(gtk::EventSequenceState::Denied);
+                        return;
+                    }
+                    g.set_state(gtk::EventSequenceState::Claimed);
+                    sy.set(y);
+                    st(pos_db(&sc, y));
+                });
+            }
+            drag.connect_drag_update(move |_, _, dy| {
+                st(pos_db(&sc, start_y.get() + dy));
             });
+            fader_rc.ov.add_controller(drag);
         }
+        let on0 = inp.normalize;
+        cap.set_visible(on0);
+        tgt_val.set_visible(on0);
+        if on0 {
+            fader_rc.scale.add_css_class("split");
+        }
+        let tgt_col = (cap.clone(), tgt_val.clone(), fader_rc.scale.clone());
         if let Some(pre) = self.levels.borrow().get(&format!("pre:{id}")).cloned() {
             let (w, id2, fw, nw) = (Rc::downgrade(self), id.clone(), Rc::downgrade(&fader_rc), tgt_now.downgrade());
             self.console_ticks.borrow_mut().push(Box::new(move |dt| {
                 let (Some(app), Some(f)) = (w.upgrade(), fw.upgrade()) else { return };
                 if let Some(n) = nw.upgrade() {
                     if n.is_mapped() {
-                        let t = app.norm.borrow().get(&id2).map(|c| match c.loud_db() {
+                        let t = app.norm.borrow().get(&id2).filter(|_| app.cfg.borrow().inputs.iter().any(|i| i.id == id2 && i.normalize)).map(|c| match c.loud_db() {
                             Some(l) => format!("target {:.0} · now {l:.0}", c.out),
                             None => format!("target {:.0}", c.out),
                         }).unwrap_or_default();
@@ -1538,6 +1596,11 @@ impl App {
                     let on = b.is_active();
                     tc.0.set_visible(on);
                     tc.1.set_visible(on);
+                    if on {
+                        tc.2.add_css_class("split");
+                    } else {
+                        tc.2.remove_css_class("split");
+                    }
                     {
                         let mut c = app.cfg.borrow_mut();
                         if let Some(i) = c.inputs.iter_mut().find(|i| i.id == id2) {
