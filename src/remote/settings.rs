@@ -119,11 +119,18 @@ pub fn load_or_create(p: &Path) -> std::io::Result<RemoteCfg> {
     for _ in 0..5 {
         match std::fs::read(p) {
             Ok(b) => {
-                let mut c = parse(p, &b)?;
+                let c = parse(p, &b)?;
                 if c.token.trim().len() < 16 {
-                    // a hand-edited file without a usable token: give it one (replace, keep the other keys)
-                    c.token = new_token();
-                    write_600(p, &serde_json::to_vec_pretty(&c).unwrap())?;
+                    // a hand-edited file without a usable token: give it one (replace, keep the other keys),
+                    // under the same lock as rotate, re-checking once it is held
+                    let _lock = lock_file(p);
+                    if let Ok(b2) = std::fs::read(p) {
+                        let mut c2 = parse(p, &b2)?;
+                        if c2.token.trim().len() < 16 {
+                            c2.token = new_token();
+                            write_600(p, &serde_json::to_vec_pretty(&c2).unwrap())?;
+                        }
+                    }
                     continue; // re-read whatever is there now
                 }
                 if let Ok(m) = std::fs::metadata(p) {
@@ -161,8 +168,15 @@ pub fn load_or_create(p: &Path) -> std::io::Result<RemoteCfg> {
 
 /// `remote-token --rotate`: a new token in remote.json (other keys kept). The engine picks it up on the
 /// next Hello (it re-reads the file when it changes); clients must be given the new token.
+/// Exclusive lock on remote.lock (released on drop); None if it can't be taken (then unlocked).
+fn lock_file(p: &Path) -> Option<std::fs::File> {
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(p.with_extension("lock")).ok()?;
+    f.lock().ok()?;
+    Some(f)
+}
+
 pub fn rotate(p: &Path) -> std::io::Result<String> {
-    let _lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(p.with_extension("lock")).and_then(|f| f.lock().map(|_| f));
+    let _lock = lock_file(p);
     let mut c = match std::fs::read(p) {
         Ok(b) => parse(p, &b)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => RemoteCfg::default(),
@@ -179,15 +193,31 @@ pub fn read_token(p: &Path) -> Option<String> {
     (c.token.trim().len() >= 16).then(|| c.token.trim().to_string())
 }
 
-/// Interface kinds for the "auto" bind.
-fn is_container_if(dev: &str) -> bool {
-    ["podman", "docker", "veth", "virbr", "br-", "cni", "flannel", "lxc", "vnet"].iter().any(|p| dev.starts_with(p))
-}
+/// Meshnet-style VPNs that `allow_meshnet` opts into.
 fn is_meshnet_if(dev: &str) -> bool {
     ["nordlynx", "tailscale"].iter().any(|p| dev.starts_with(p))
 }
-fn is_vpn_if(dev: &str) -> bool {
-    is_meshnet_if(dev) || ["tun", "tap", "wg", "zt", "utun", "ppp", "nordtun"].iter().any(|p| dev.starts_with(p))
+
+/// A physical Ethernet or Wi-Fi NIC (an allowlist, not a VPN denylist, breaker #36 R2-3): the kernel
+/// shows it with a backing device (`/sys/class/net/<if>/device`) and link type 1 (ARPHRD_ETHER, which
+/// Wi-Fi uses too). Bridges, veths, podman, WireGuard/OpenVPN/AnyConnect/... have no device. An
+/// interface the kernel doesn't list (tests, another machine's names) falls back to the predictable
+/// physical names: en*, eth*, wl*.
+pub fn is_physical_nic(dev: &str) -> bool {
+    is_physical_nic_in(std::path::Path::new("/sys/class/net"), dev)
+}
+
+pub fn is_physical_nic_in(sys: &Path, dev: &str) -> bool {
+    let dev = dev.split('@').next().unwrap_or(dev);
+    if dev.is_empty() || dev.contains('/') || dev.contains("..") {
+        return false;
+    }
+    let base = sys.join(dev);
+    if base.exists() {
+        let ether = std::fs::read_to_string(base.join("type")).map(|t| t.trim() == "1").unwrap_or(false);
+        return ether && base.join("device").exists();
+    }
+    ["en", "eth", "wl"].iter().any(|p| dev.starts_with(p))
 }
 
 /// (interface, IPv4) from `ip -4 -o addr show scope global`.
@@ -202,9 +232,9 @@ pub fn parse_ip_addrs(out: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The LAN addresses (Wi-Fi, Ethernet): no container bridges, no VPNs (Meshnet only with `meshnet`).
+/// The addresses of physical NICs (Wi-Fi, Ethernet), plus Meshnet/Tailscale with `meshnet`.
 pub fn lan_addrs(ifs: &[(String, String)], meshnet: bool) -> Vec<(String, String)> {
-    ifs.iter().filter(|(d, _)| !is_container_if(d) && (!is_vpn_if(d) || (meshnet && is_meshnet_if(d)))).cloned().collect()
+    ifs.iter().filter(|(d, _)| is_physical_nic(d) || (meshnet && is_meshnet_if(d))).cloned().collect()
 }
 
 /// Addresses to listen on for a `bind` setting; `ifs` = the machine's interfaces (parse_ip_addrs).
@@ -267,6 +297,33 @@ mod tests {
         assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
         assert_ne!(new_token(), new_token());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn physical_nic_allowlist() {
+        let sys = std::env::temp_dir().join(format!("wavelink-sysnet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sys);
+        let mk = |n: &str, ty: &str, dev: bool| {
+            std::fs::create_dir_all(sys.join(n)).unwrap();
+            std::fs::write(sys.join(n).join("type"), ty).unwrap();
+            if dev {
+                std::fs::create_dir_all(sys.join(n).join("device")).unwrap();
+            }
+        };
+        mk("eno1", "1\n", true);
+        mk("wlan0", "1\n", true);
+        mk("enx_usb_vpn", "1\n", false); // named like a NIC, but virtual
+        mk("podman0", "1\n", false);
+        mk("proton0", "65534\n", false);
+        mk("ib0", "32\n", true); // a real device, not Ethernet/Wi-Fi
+        for (n, want) in [("eno1", true), ("wlan0", true), ("enx_usb_vpn", false), ("podman0", false), ("proton0", false), ("ib0", false), ("veth1@if3", false), ("../etc", false)] {
+            assert_eq!(is_physical_nic_in(&sys, n), want, "{n}");
+        }
+        // unknown to the kernel: the predictable physical names only
+        for (n, want) in [("enp3s0", true), ("eth1", true), ("wlp2s0", true), ("cscotun0", false), ("gpd0", false), ("mullvad-se1", false), ("ipsec0", false)] {
+            assert_eq!(is_physical_nic_in(&sys, n), want, "{n}");
+        }
+        let _ = std::fs::remove_dir_all(&sys);
     }
 
     #[test]

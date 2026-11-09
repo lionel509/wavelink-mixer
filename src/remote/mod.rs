@@ -40,29 +40,30 @@ pub fn start() {
     match server::serve(opts, std::sync::Arc::new(backend::PwBackend::default())) {
         Ok(run) => {
             run.token_file(p.clone());
-            eprintln!("wavelink remote: listening on {} port {} (token in {})", addrs.join(", "), rc.port, p.display());
+            let ok: Vec<&String> = addrs.iter().filter(|a| !run.failed.contains(a)).collect();
+            eprintln!("wavelink remote: listening on {} port {} (token in {})", ok.iter().map(|a| a.as_str()).collect::<Vec<_>>().join(", "), rc.port, p.display());
             if rc.mdns {
                 mdns::advertise(format!("Wavelink Mixer on {name}"), run.addr.port());
             }
-            if auto {
-                // LAN addresses that appear later (Wi-Fi up after login, a new DHCP lease) get a listener too
-                let (meshnet, port) = (rc.allow_meshnet, rc.port);
-                let mut have: std::collections::HashSet<String> = addrs.into_iter().collect();
-                let _ = std::thread::Builder::new().name("remote-bind".into()).spawn(move || loop {
-                    std::thread::sleep(std::time::Duration::from_secs(30));
-                    for a in settings::bind_addrs("auto", meshnet, &settings::interfaces()) {
-                        if !have.contains(&a) {
-                            match run.listen(&a, port) {
-                                Ok(_) => eprintln!("wavelink remote: now also listening on {a}:{port}"),
-                                Err(e) => eprintln!("wavelink remote: can't listen on {a}:{port}: {e}"),
+            // bound addresses; failed ones are retried every 30 s, and with "auto" new LAN addresses are
+            // added (an address that goes away keeps its idle listener, which works again when it returns)
+            let (meshnet, port, bind) = (rc.allow_meshnet, rc.port, rc.bind.clone());
+            let mut have: std::collections::HashSet<String> = addrs.into_iter().filter(|a| !run.failed.contains(a)).collect();
+            let _ = std::thread::Builder::new().name("remote-bind".into()).spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                let want = if auto { settings::bind_addrs("auto", meshnet, &settings::interfaces()) } else { settings::bind_addrs(&bind, meshnet, &[]) };
+                for a in want {
+                    if !have.contains(&a) {
+                        match run.listen(&a, port) {
+                            Ok(_) => {
+                                eprintln!("wavelink remote: now also listening on {a}:{port}");
+                                have.insert(a);
                             }
-                            have.insert(a); // tried once per address; an address that goes away just stays idle
+                            Err(e) => eprintln!("wavelink remote: can't listen on {a}:{port}: {e} (retrying in 30 s)"),
                         }
                     }
-                });
-            } else {
-                std::mem::forget(run); // lives as long as the engine
-            }
+                }
+            });
         }
         Err(e) => eprintln!("wavelink remote: can't listen on {}:{}: {e}", addrs.join(","), rc.port),
     }
