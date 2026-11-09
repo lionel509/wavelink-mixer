@@ -278,6 +278,11 @@ impl Transcriber {
     }
 }
 
+/// Indices (note, onset) into the model's output names. Stub: positional, to be replaced.
+pub fn pick_grids(names: &[String]) -> Result<(usize, usize), String> {
+    Ok((1, 2))
+}
+
 /// note and onset are [frame][pitch] grids (172 x 88).
 pub fn frames_to_notes(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<Note> {
     let frames = note.len();
@@ -548,5 +553,28 @@ mod tests {
         let ns = tr.notes(&x).unwrap();
         println!("notes ms {:.1}", t0.elapsed().as_secs_f64() * 1000.0);
         assert!(ns.iter().any(|n| (44..=46).contains(&n.pitch) && n.t < 0.2), "{ns:?}");
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn pick_grids_by_name() {
+        let n = names(&["StatefulPartitionedCall:0", "StatefulPartitionedCall:1", "StatefulPartitionedCall:2"]);
+        assert_eq!(pick_grids(&n), Ok((1, 2)));
+        // the same names in another order: note is still `:1`, onset `:2`
+        let n = names(&["StatefulPartitionedCall:2", "StatefulPartitionedCall:0", "StatefulPartitionedCall:1"]);
+        assert_eq!(pick_grids(&n), Ok((2, 0)));
+        let n = names(&["StatefulPartitionedCall:1", "StatefulPartitionedCall:2", "StatefulPartitionedCall:0"]);
+        assert_eq!(pick_grids(&n), Ok((0, 1)));
+    }
+
+    #[test]
+    fn pick_grids_missing_name_is_error() {
+        let n = names(&["StatefulPartitionedCall:0", "StatefulPartitionedCall:1"]);
+        let e = pick_grids(&n).unwrap_err();
+        assert!(e.contains("unexpected Basic Pitch outputs"), "{e}");
+        assert!(pick_grids(&[]).is_err());
     }
 }
