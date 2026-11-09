@@ -616,6 +616,12 @@ impl PianoTracker {
         }
     }
 
+    /// Per key (A0..C8), the harmonic salience of the last analysed frame on the whitened spectrum
+    /// (before cancellation): the raw material for a per-key spectrogram.
+    pub fn key_salience(&self) -> &[f32] {
+        &self.sal0
+    }
+
     /// Seconds of input consumed so far.
     pub fn now(&self) -> f64 {
         self.n_in as f64 / RATE as f64

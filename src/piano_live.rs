@@ -5,6 +5,7 @@ use crate::notes::Note;
 use crate::piano::{self, lane, Downmix, Ev, PianoTracker};
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -246,10 +247,36 @@ pub struct Inner {
     /// Attack -> NoteOn on the analysis stream, ms (smoothed over recent notes).
     pub latency_ms: f64,
     pub port: Option<String>,
+    /// The arrangement's parts: name and colour. Index 0 is "Piano" (what the live tracker plays).
+    pub parts: Vec<(String, (u8, u8, u8))>,
+    /// Part index of each note in `roll` (same length and order as `roll`).
+    pub roll_part: Vec<u8>,
+    /// Part index of each sounding note in `open` (same length and order as `open`).
+    pub open_part: Vec<u8>,
+    /// Per-key spectrogram, last SPEC_KEEP_S seconds: (take time, 88 values 0..1, A0..C8), the
+    /// tracker's harmonic salience on the whitened spectrum, square-root scaled against a peak
+    /// that falls 3 dB/s.
+    pub spec: VecDeque<(f64, Vec<f32>)>,
+    /// The detected chord right now, e.g. "F", "Bbmaj7", "Dm7"; empty when there is none.
+    pub chord: String,
 }
 
-#[derive(Clone, Default)]
+/// Seconds of `Inner::spec` kept.
+pub const SPEC_KEEP_S: f64 = 8.0;
+
+/// The live tracker's single part.
+pub fn default_parts() -> Vec<(String, (u8, u8, u8))> {
+    vec![("Piano".to_string(), (0xc8, 0xd6, 0xe5))]
+}
+
+#[derive(Clone)]
 pub struct Shared(pub Arc<Mutex<Inner>>);
+
+impl Default for Shared {
+    fn default() -> Self {
+        Shared(Arc::new(Mutex::new(Inner { parts: default_parts(), ..Inner::default() })))
+    }
+}
 
 impl Shared {
     pub fn new() -> Shared {
@@ -270,6 +297,7 @@ impl Inner {
                 Ev::On { t, pitch, vel } => {
                     self.close(pitch, t + b);
                     self.open.push((t + b, pitch, vel, false));
+                    self.open_part.push(0);
                     let lat = (fed - t) * 1000.0;
                     self.latency_ms = if self.latency_ms == 0.0 { lat } else { self.latency_ms * 0.9 + lat * 0.1 };
                 }
@@ -278,14 +306,29 @@ impl Inner {
         }
         self.now = fed + b;
         let keep = self.now - ROLL_KEEP_S;
-        self.roll.retain(|n| n.t + n.dur >= keep);
+        if self.roll.iter().any(|n| n.t + n.dur < keep) {
+            let parts = std::mem::take(&mut self.roll_part);
+            let mut it = parts.into_iter();
+            let mut kept = Vec::with_capacity(self.roll.len());
+            self.roll.retain(|n| {
+                let part = it.next().unwrap_or(0);
+                let k = n.t + n.dur >= keep;
+                if k {
+                    kept.push(part);
+                }
+                k
+            });
+            self.roll_part = kept;
+        }
     }
 
     fn close(&mut self, pitch: u8, t: f64) {
         if let Some(i) = self.open.iter().position(|o| o.1 == pitch) {
             let (t0, p, v, handed) = self.open.swap_remove(i);
+            let part = if i < self.open_part.len() { self.open_part.swap_remove(i) } else { 0 };
             let n = Note { t: t0, dur: (t - t0).max(0.0), pitch: p, vel: v };
             self.roll.push(n.clone());
+            self.roll_part.push(part);
             if !handed {
                 self.all.push(n);
             }
@@ -301,6 +344,8 @@ impl Inner {
     pub fn new_take(&mut self) {
         self.all.clear();
         self.roll.clear();
+        self.roll_part.clear();
+        self.spec.clear();
         for o in self.open.iter_mut() {
             o.3 = false;
         }
@@ -361,6 +406,7 @@ impl Session {
             let mut g = shared.get();
             g.base = g.now;
             g.open.clear();
+            g.open_part.clear();
             g.status = "starting…".into();
         }
         let (s2, c2) = (stop.clone(), child.clone());
@@ -406,6 +452,8 @@ struct Worker<'a> {
     port: Option<Port>,
     tr: PianoTracker,
     pianist: crate::pianist::Pianist,
+    /// The spectrogram's running peak (falls 3 dB/s).
+    spec_peak: f32,
     audio_s: f64,
     busy_s: f64,
 }
@@ -427,8 +475,23 @@ impl Worker<'_> {
                 }
             }
         }
+        let sal = self.tr.key_salience();
+        let dt = mono.len() as f32 / piano::RATE as f32;
+        let mx = sal.iter().fold(0f32, |a, &v| a.max(v));
+        self.spec_peak = (self.spec_peak * 10f32.powf(-0.15 * dt)).max(mx).max(1e-6);
         let mut g = self.shared.get();
         g.apply(&evs, self.tr.now());
+        let now = g.now;
+        let mut row = match g.spec.front() {
+            Some(&(t, _)) if now - t > SPEC_KEEP_S => g.spec.pop_front().map(|x| x.1).unwrap_or_default(),
+            _ => Vec::with_capacity(sal.len()),
+        };
+        row.clear();
+        row.extend(sal.iter().map(|&v| (v.max(0.0) / self.spec_peak).sqrt().min(1.0)));
+        g.spec.push_back((now, row));
+        while g.spec.front().is_some_and(|&(t, _)| now - t > SPEC_KEEP_S + 0.5) {
+            g.spec.pop_front();
+        }
         if self.audio_s >= 0.5 {
             let ms = self.busy_s * 1000.0 / self.audio_s * 0.5;
             g.cpu_ms = if g.cpu_ms == 0.0 { ms } else { g.cpu_ms * 0.8 + ms * 0.2 };
@@ -460,7 +523,7 @@ fn run(o: &Opts, shared: &Shared, stop: &AtomicBool, child: &Mutex<Option<Child>
         None => None,
     };
     shared.get().port = port.as_ref().and_then(port_address);
-    let mut w = Worker { shared, port, tr: PianoTracker::new(), pianist: crate::pianist::Pianist::new(), audio_s: 0.0, busy_s: 0.0 };
+    let mut w = Worker { shared, port, tr: PianoTracker::new(), pianist: crate::pianist::Pianist::new(), spec_peak: 0.0, audio_s: 0.0, busy_s: 0.0 };
     if let Some(path) = &o.wav {
         let r = replay(path, &mut w, stop);
         w.finish();
