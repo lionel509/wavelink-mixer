@@ -21,6 +21,7 @@ mod player;
 mod spotify;
 mod sysmon;
 mod pw;
+mod busvol;
 mod ui;
 #[cfg(test)]
 #[path = "breaker_front.rs"]

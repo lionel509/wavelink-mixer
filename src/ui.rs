@@ -160,6 +160,8 @@ struct Fader {
     busy: Cell<u32>,
     /// true while auto-normalize moves the slider (its moves are not his, so they are not saved at once)
     auto: Cell<bool>,
+    /// Some(bus id) for a physical output bus: it shows the saved gain, never the device's (#33)
+    bus: RefCell<Option<String>>,
 }
 
 impl Fader {
@@ -170,12 +172,24 @@ impl Fader {
         self.auto.set(false);
     }
 
+    /// Show a saved level (physical buses: the config, not the device).
+    fn show(&self, db: f64, mute: bool) {
+        self.updating.set(true);
+        self.scale.set_value(db_to_pos(db));
+        self.label.set_label(&fmt_db(db));
+        if let Some(m) = &self.mute {
+            m.set_active(mute);
+        }
+        self.updating.set(false);
+    }
+
     fn sync(&self, g: &Graph) {
         if self.busy.get() > 0 {
             self.busy.set(self.busy.get() - 1);
             return;
         }
-        if let Some(n) = g.node(&self.node.borrow()) {
+        // a node whose Props are not enumerated yet has no volume to show (it is not 0 dB)
+        if let Some(n) = g.node(&self.node.borrow()).filter(|n| n.has_vol) {
             self.updating.set(true);
             let db = config::vol_to_db(n.vol);
             self.scale.set_value(db_to_pos(db));
@@ -335,6 +349,8 @@ pub struct App {
     /// system gauges, shown under the output strips
     sys_panel: gtk::Box,
     faders: RefCell<Vec<Rc<Fader>>>,
+    /// #33: per physical bus, adopt-vs-re-apply state across graph polls (survives rebuilds)
+    bus_guard: RefCell<HashMap<String, crate::busvol::Tracker>>,
     routes: RefCell<Vec<(String, gtk::ToggleButton, Rc<Cell<bool>>)>>,
     meters: RefCell<Vec<Meter>>,
     /// rack-page only: input-level taps, gauge animations, and whether the page is showing
@@ -1025,6 +1041,58 @@ impl App {
     fn mark_dirty(&self) {
         self.dirty.set(true);
     }
+
+    /// His fader / mute move on a physical bus just went to the device: it is settling, not drifting.
+    fn bus_wrote(&self, f: &Fader) {
+        if let Some(id) = f.bus.borrow().as_ref() {
+            if let Some(t) = self.bus_guard.borrow_mut().get_mut(id) {
+                t.wrote(glib::monotonic_time() as f64 / 1e6);
+            }
+        }
+    }
+
+    /// One graph poll for a physical bus fader (#33): the saved gain is the truth. Re-apply it when the
+    /// device (re)appears or drifts right after; take a device value only when it is a deliberate
+    /// external change (crate::busvol::decide). The fader always shows the config.
+    fn sync_bus(&self, f: &Fader, g: &Graph, id: &str) {
+        let Some(b) = self.cfg.borrow().buses.iter().find(|b| b.id == id).cloned() else { return };
+        let node = g.node(&bus_fader_node(&b));
+        let seen = node.map(|n| (g.instance(n), n.has_vol.then_some(crate::busvol::Reading { vol: n.vol, mute: n.mute })));
+        let now = glib::monotonic_time() as f64 / 1e6;
+        let step = self.bus_guard.borrow_mut().entry(id.to_string()).or_default().observe(now, seen, b.gain_db, b.mute);
+        match step {
+            crate::busvol::Step::Nothing => {}
+            crate::busvol::Step::Push => {
+                if let Some(n) = node {
+                    if n.has_vol && (n.mute != b.mute || (config::vol_to_db(n.vol) - b.gain_db).abs() > crate::busvol::TOL_DB) {
+                        eprintln!("wavelink: bus {id}: device {} reads {}{}, re-applying saved {}{}", n.name, fmt_db(config::vol_to_db(n.vol)),
+                                  if n.mute { " muted" } else { "" }, fmt_db(b.gain_db), if b.mute { " muted" } else { "" });
+                    }
+                    pw::set_volume(n.id, db_to_vol(b.gain_db));
+                    pw::set_mute(n.id, b.mute);
+                }
+            }
+            crate::busvol::Step::Adopt { gain_db, mute } => {
+                eprintln!("wavelink: bus {id}: external change kept: gain {:?} mute {:?} (was {} {})", gain_db, mute, fmt_db(b.gain_db), b.mute);
+                if let Some(bu) = self.cfg.borrow_mut().buses.iter_mut().find(|x| x.id == id) {
+                    if let Some(d) = gain_db {
+                        bu.gain_db = d;
+                    }
+                    if let Some(m) = mute {
+                        bu.mute = m;
+                    }
+                }
+                self.mark_dirty();
+            }
+        }
+        if f.busy.get() > 0 {
+            // his drag is in flight: leave the slider alone
+            f.busy.set(f.busy.get() - 1);
+            return;
+        }
+        let (db, mute) = self.cfg.borrow().buses.iter().find(|x| x.id == id).map(|x| (x.gain_db, x.mute)).unwrap_or((b.gain_db, b.mute));
+        f.show(db, mute);
+    }
     fn node_id(&self, name: &str) -> Option<u64> {
         self.graph.borrow().node(name).map(|n| n.id)
     }
@@ -1070,7 +1138,7 @@ impl App {
         if let Some(m) = &mute {
             btns.append(m);
         }
-        let f = Rc::new(Fader { node: RefCell::new(node), scale, label: lab, mute, btns, updating: Cell::new(false), busy: Cell::new(0), auto: Cell::new(false) });
+        let f = Rc::new(Fader { node: RefCell::new(node), scale, label: lab, mute, btns, updating: Cell::new(false), busy: Cell::new(0), auto: Cell::new(false), bus: RefCell::new(None) });
         // double-click the dB label area resets to 0 dB
         let gest = gtk::GestureClick::new();
         let fw = Rc::downgrade(&f);
@@ -1118,6 +1186,7 @@ impl App {
             if let Some(id) = app.node_id(&node) {
                 pw::set_volume(id, db_to_vol(db));
             }
+            app.bus_wrote(&f);
         });
         if let Some(m) = &f.mute {
             let (fw, app) = (Rc::downgrade(&f), self.clone());
@@ -1133,6 +1202,7 @@ impl App {
                 if let Some(id) = app.node_id(&node) {
                     pw::set_mute(id, b.is_active());
                 }
+                app.bus_wrote(&f);
             });
         }
         self.faders.borrow_mut().push(f.clone());
@@ -1630,13 +1700,17 @@ impl App {
             self.meters.borrow_mut().push(m);
         }
         let (b1, b2) = (bus.id.clone(), bus.id.clone());
-        let (fb, _) = self.fader(
+        let (fb, bus_fader) = self.fader(
             bus_fader_node(&bus),
             220,
             true,
             move |a, db| a.cfg.borrow_mut().buses.iter_mut().find(|b| b.id == b1).unwrap().gain_db = db,
             move |a, m| a.cfg.borrow_mut().buses.iter_mut().find(|b| b.id == b2).unwrap().mute = m,
         );
+        if matches!(bus.kind, BusKind::Hardware { .. }) {
+            // the fader is the device volume: config is the source of truth (#33)
+            *bus_fader.bus.borrow_mut() = Some(bus.id.clone());
+        }
         row.append(&fb);
         // meter sits beside the fader slot (clear of the dB readout + mute below it)
         led.area.set_margin_top(8);
@@ -2009,7 +2083,11 @@ impl App {
 
     fn sync(&self, g: &Graph) {
         for f in self.faders.borrow().iter() {
-            f.sync(g);
+            let bus = f.bus.borrow().clone();
+            match bus {
+                Some(id) => self.sync_bus(f, g, &id),
+                None => f.sync(g),
+            }
         }
         for (node, t, guard) in self.routes.borrow().iter() {
             if let Some(n) = g.node(node) {
@@ -2402,6 +2480,7 @@ pub fn activate(app: &adw::Application) {
         rack_page: rack_page.clone(),
         sys_panel: sys_panel.clone(),
         faders: RefCell::new(vec![]),
+        bus_guard: RefCell::new(HashMap::new()),
         routes: RefCell::new(vec![]),
         meters: RefCell::new(vec![]),
         rack_meters: RefCell::new(vec![]),

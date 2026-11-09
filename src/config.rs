@@ -271,11 +271,14 @@ fn lenient_quantum<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Err
     Ok(normalize_quantum(&v))
 }
 
+/// dB <-> wpctl volume, the one mapping used in both directions (#33).
+/// wpctl volumes are cubic: v = 10^(dB/60) and dB = 60·log10(v); the node's linear channelVolume
+/// is v³, so dB = 20·log10(channelVolume). Both ends clamp to [MIN_DB, MAX_DB]; MIN_DB is -∞ (v = 0).
 pub fn db_to_vol(db: f64) -> f64 {
-    if db <= MIN_DB { 0.0 } else { 10f64.powf(db / 60.0) } // wpctl volumes are cubic
+    if db.is_nan() || db <= MIN_DB { 0.0 } else { 10f64.powf(db.min(MAX_DB) / 60.0) }
 }
 pub fn vol_to_db(v: f64) -> f64 {
-    if v <= 0.0 { MIN_DB } else { (60.0 * v.log10()).clamp(MIN_DB, MAX_DB) }
+    if v.is_nan() || v <= 0.0 { MIN_DB } else { (60.0 * v.log10()).clamp(MIN_DB, MAX_DB) }
 }
 pub fn fmt_db(db: f64) -> String {
     if db <= MIN_DB { "-∞".into() } else { format!("{:+.1} dB", db) }
@@ -421,6 +424,43 @@ pub fn glib_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn db_vol_round_trip() {
+        // every 0.1 dB fader step, through the exact value and through what wpctl is given (6 decimals)
+        let mut db = MIN_DB + 0.1;
+        while db <= MAX_DB + 1e-9 {
+            let v = db_to_vol(db);
+            assert!((vol_to_db(v) - db).abs() < 1e-9, "exact {db}");
+            let sent: f64 = format!("{v:.6}").parse().unwrap();
+            assert!((vol_to_db(sent) - db).abs() < 0.01, "6 decimals {db}: {}", vol_to_db(sent));
+            db += 0.1;
+        }
+        // and back: wpctl volume -> dB -> volume
+        for v in [0.1001, 0.15, 0.24, 0.25, 0.5, 0.75, 1.0, 1.25, 10f64.powf(MAX_DB / 60.0)] {
+            assert!((db_to_vol(vol_to_db(v)) - v).abs() < 1e-12, "vol {v}");
+        }
+        // the formula: v = 10^(dB/60), linear channelVolume v³ = 10^(dB/20)
+        assert!((db_to_vol(-37.3) - 0.238964).abs() < 1e-5);
+        assert!((db_to_vol(-36.1) - 0.25).abs() < 1e-3);
+        assert!((db_to_vol(-6.0).powi(3) - 10f64.powf(-6.0 / 20.0)).abs() < 1e-12);
+        assert_eq!(db_to_vol(0.0), 1.0);
+        assert_eq!(vol_to_db(1.0), 0.0);
+    }
+
+    #[test]
+    fn db_vol_edges() {
+        assert_eq!(db_to_vol(MIN_DB), 0.0);
+        assert_eq!(db_to_vol(-200.0), 0.0);
+        assert_eq!(db_to_vol(f64::NAN), 0.0);
+        assert_eq!(vol_to_db(0.0), MIN_DB);
+        assert_eq!(vol_to_db(-1.0), MIN_DB);
+        assert_eq!(vol_to_db(f64::NAN), MIN_DB);
+        assert_eq!(vol_to_db(db_to_vol(MIN_DB)), MIN_DB);
+        // both ends clamp to MAX_DB
+        assert_eq!(vol_to_db(10.0), MAX_DB);
+        assert!((db_to_vol(40.0) - db_to_vol(MAX_DB)).abs() < 1e-12);
+    }
 
     #[test]
     fn config_quantum_defaults_to_256() {
