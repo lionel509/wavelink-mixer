@@ -622,8 +622,10 @@ pub fn screw_row() -> gtk::DrawingArea {
 
 // ---------- RGB spectrum analyser ----------
 
+/// FFT size for channel/rack analysers; the bus spectrum uses `FFT_HI` (`Fft::hires`).
 const FFT_N: usize = 4096;
-pub const BANDS: usize = 72;
+const FFT_HI: usize = 16384;
+pub const BANDS: usize = 432;
 const F_LO: f64 = 25.0;
 const F_HI: f64 = 18000.0;
 const RATE: f64 = 48000.0;
@@ -674,6 +676,25 @@ pub struct Spectrum {
     target: std::cell::RefCell<String>,
     born: Instant,
     compact: std::cell::Cell<bool>,
+    /// bands [lo, hi) this view draws, stretched across its width (#23 lanes)
+    range: std::cell::Cell<(usize, usize)>,
+    /// lane name drawn top-left (empty: none)
+    title: std::cell::RefCell<String>,
+    /// MIDI notes overlaid on the bars: (frequency Hz, opacity 0..1, colour, height 0..1 = velocity)
+    marks: std::cell::RefCell<Vec<(f64, f64, (f64, f64, f64), f64)>>,
+    /// Combined view: bars tinted by band zone, (zone start Hz, name, colour), ascending
+    zones: std::cell::RefCell<Vec<(f64, String, (f64, f64, f64))>>,
+}
+
+/// Band index (0..=BANDS) whose lower edge is nearest to `f` Hz on the analyser's log axis.
+pub fn band_of(f: f64) -> usize {
+    let x = (f / F_LO).ln() / (F_HI / F_LO).ln() * BANDS as f64;
+    (x.round().max(0.0) as usize).min(BANDS)
+}
+
+/// Lower edge in Hz of band `i` (i == BANDS gives the top edge).
+fn band_edge(i: usize) -> f64 {
+    F_LO * (F_HI / F_LO).powf(i as f64 / BANDS as f64)
 }
 
 impl Spectrum {
@@ -688,6 +709,10 @@ impl Spectrum {
             target: std::cell::RefCell::new(target.to_string()),
             born: Instant::now(),
             compact: std::cell::Cell::new(false),
+            range: std::cell::Cell::new((0, BANDS)),
+            title: std::cell::RefCell::new(String::new()),
+            marks: std::cell::RefCell::new(Vec::new()),
+            zones: std::cell::RefCell::new(Vec::new()),
         });
         let w = Rc::downgrade(&s);
         area.set_draw_func(move |_, cr, wd, ht| {
@@ -701,6 +726,35 @@ impl Spectrum {
     /// Compact layout for strips: no dB or Hz labels, bars use the whole area.
     pub fn set_compact(&self, on: bool) {
         self.compact.set(on);
+    }
+
+    /// Draw only bands [lo, hi) across the full width, as one lane of a split analyser.
+    pub fn set_range(&self, lo: usize, hi: usize) {
+        let hi = hi.min(BANDS);
+        let lo = lo.min(hi.saturating_sub(1));
+        self.range.set((lo, hi));
+        self.area.queue_draw();
+    }
+
+    /// Notes to overlay as glowing lines at their fundamental (redraws only when they change).
+    pub fn set_marks(&self, m: Vec<(f64, f64, (f64, f64, f64), f64)>) {
+        if *self.marks.borrow() != m {
+            *self.marks.borrow_mut() = m;
+            self.area.queue_draw();
+        }
+    }
+
+    /// Tint the bars by frequency zone and label each zone: one graph showing every band (#23).
+    pub fn set_zones(&self, z: Vec<(f64, String, (f64, f64, f64))>) {
+        *self.zones.borrow_mut() = z;
+        self.area.queue_draw();
+    }
+
+    /// Lane name drawn in the top-left corner.
+    pub fn set_title(&self, t: &str) {
+        *self.title.borrow_mut() = t.to_string();
+        self.area.set_tooltip_text(if t.is_empty() { None } else { Some(t) });
+        self.area.queue_draw();
     }
 
     /// Which bus this spectrum is labelled and keyed by.
@@ -739,29 +793,94 @@ impl Spectrum {
                 cr.move_to(4.0, y + 3.0);
                 let _ = cr.show_text(&if db == 0 { "0".to_string() } else { format!("-{db}") });
             }
-            let fx = |f: f64| lx + lw * (f / F_LO).ln() / (F_HI / F_LO).ln();
+            let (lo, hi) = self.range.get();
+            let (flo, fhi) = (band_edge(lo), band_edge(hi));
+            let fx = |f: f64| lx + lw * (f / flo).ln() / (fhi / flo).ln();
             cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
-            for (f, s) in [(50.0, "50"), (100.0, "100"), (250.0, "250"), (500.0, "500"), (1000.0, "1k"), (2500.0, "2.5k"), (5000.0, "5k"), (10000.0, "10k")] {
-                text_centered(cr, fx(f), ly + lh + 10.0, s);
+            for (f, s) in [(30.0, "30"), (50.0, "50"), (100.0, "100"), (150.0, "150"), (250.0, "250"), (500.0, "500"), (1000.0, "1k"), (2500.0, "2.5k"), (4000.0, "4k"), (5000.0, "5k"), (8000.0, "8k"), (10000.0, "10k"), (15000.0, "15k")] {
+                let x = fx(f);
+                // only labels inside this lane, and not crowding the edges
+                if f > flo && f < fhi && x > lx + 10.0 && x < lx + lw - 10.0 {
+                    text_centered(cr, x, ly + lh + 10.0, s);
+                }
             }
         }
         // bars: hue runs across the frequency range and slowly cycles
         let t = self.born.elapsed().as_secs_f64();
         let sh = self.shown.borrow();
         let pk = self.peaks.borrow();
-        let bw = lw / BANDS as f64;
-        for i in 0..BANDS {
-            let (r, g, b) = hsv(i as f64 / BANDS as f64 * 300.0 + t * 20.0, 0.75, 0.95);
-            let x = lx + i as f64 * bw;
+        let (lo, hi) = self.range.get();
+        let bw = lw / (hi - lo).max(1) as f64;
+        // keep bars readable when there are hundreds of them: the gap shrinks with the bar
+        let gap = (bw * 0.25).min(2.0);
+        for i in lo..hi {
+            // hue keyed by the absolute band, so a frequency has the same colour in every lane;
+            // in the combined view the band's zone colour wins
+            let zones = self.zones.borrow();
+            let centre = (band_edge(i) * band_edge(i + 1)).sqrt();
+            let (r, g, b) = match zones.iter().rev().find(|z| centre >= z.0) {
+                Some(z) => z.2,
+                None => hsv(i as f64 / BANDS as f64 * 300.0 + t * 20.0, 0.75, 0.95),
+            };
+            drop(zones);
+            let x = lx + (i - lo) as f64 * bw;
             let bh = sh[i] * lh;
             cr.set_source_rgba(r, g, b, 0.85);
-            cr.rectangle(x, ly + lh - bh, (bw - 2.0).max(1.0), bh);
+            cr.rectangle(x, ly + lh - bh, (bw - gap).max(1.0), bh);
             let _ = cr.fill();
             // peak line left behind
             let py = (ly + lh - pk[i].0 * lh).min(ly + lh - 1.0);
             cr.set_source_rgba(r, g, b, 1.0);
-            cr.rectangle(x, py - 1.5, (bw - 2.0).max(1.0), 1.5);
+            cr.rectangle(x, py - 1.5, (bw - gap).max(1.0), 1.5);
             let _ = cr.fill();
+        }
+        drop((sh, pk));
+        // zone dividers and names (combined view)
+        {
+            let zones = self.zones.borrow();
+            let (flo, fhi) = (band_edge(lo), band_edge(hi));
+            let fx = |f: f64| lx + lw * (f / flo).ln() / (fhi / flo).ln();
+            for (k, z) in zones.iter().enumerate() {
+                let x0 = fx(z.0.max(flo));
+                let x1 = zones.get(k + 1).map(|n| fx(n.0)).unwrap_or(lx + lw);
+                if z.0 > flo {
+                    cr.set_source_rgba(1.0, 1.0, 1.0, 0.18);
+                    cr.set_line_width(1.0);
+                    cr.move_to(x0.round() + 0.5, ly);
+                    cr.line_to(x0.round() + 0.5, ly + lh);
+                    let _ = cr.stroke();
+                }
+                cr.set_font_size(11.0);
+                cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+                cr.set_source_rgba(z.2 .0, z.2 .1, z.2 .2, 0.9);
+                text_centered(cr, (x0 + x1) / 2.0, ly + 14.0, &z.1);
+            }
+        }
+        // MIDI overlay: one line per note at its fundamental, in its lane colour, fading after note-off
+        let (flo, fhi) = (band_edge(lo), band_edge(hi));
+        for &(f, a, (r, g, b), vh) in self.marks.borrow().iter() {
+            if f < flo || f >= fhi || a <= 0.0 {
+                continue;
+            }
+            let x = lx + lw * (f / flo).ln() / (fhi / flo).ln();
+            cr.set_source_rgba(r, g, b, 0.25 * a);
+            // the line rises as high as the note's velocity: a soft note is a short line
+            let top = ly + lh * (1.0 - vh.clamp(0.05, 1.0));
+            cr.rectangle(x - 3.0, top, 6.0, ly + lh - top);
+            let _ = cr.fill();
+            cr.set_source_rgba(r, g, b, 0.95 * a);
+            cr.rectangle(x - 1.0, top, 2.0, ly + lh - top);
+            let _ = cr.fill();
+            cr.arc(x, top + 3.0, 3.0, 0.0, 2.0 * PI);
+            let _ = cr.fill();
+        }
+        let title = self.title.borrow();
+        if !title.is_empty() {
+            cr.set_font_size(11.0);
+            cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.75);
+            cr.move_to(lx + 6.0, ly + 13.0);
+            let _ = cr.show_text(&title);
         }
     }
 }
@@ -992,6 +1111,7 @@ impl PatchBay {
 /// Rolling FFT over a stereo stream, producing BANDS log bands (0..1 for -72..0 dB).
 /// Fed by the meters' own capture, so analysers never open extra PipeWire streams.
 pub struct Fft {
+    n: usize,
     edges: Vec<f64>,
     window: Vec<f32>,
     ring: Vec<f32>,
@@ -1008,20 +1128,30 @@ impl Fft {
 
     /// Same bands as `new`, for a stream at `rate` Hz.
     pub fn with_rate(rate: f64) -> Fft {
+        Fft::sized(rate, FFT_N)
+    }
+
+    /// The main bus spectrum: a 16384-point FFT, so its BANDS bars carry real detail down low.
+    pub fn hires() -> Fft {
+        Fft::sized(RATE, FFT_HI)
+    }
+
+    fn sized(rate: f64, n: usize) -> Fft {
         Fft {
-            edges: (0..=BANDS).map(|i| F_LO * (F_HI / F_LO).powf(i as f64 / BANDS as f64) * FFT_N as f64 / rate).collect(),
-            window: (0..FFT_N).map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (FFT_N - 1) as f32).cos()).collect(),
-            ring: vec![0.0; FFT_N],
+            n,
+            edges: (0..=BANDS).map(|i| F_LO * (F_HI / F_LO).powf(i as f64 / BANDS as f64) * n as f64 / rate).collect(),
+            window: (0..n).map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (n - 1) as f32).cos()).collect(),
+            ring: vec![0.0; n],
             pos: 0,
             fresh: 0,
-            re: vec![0.0; FFT_N],
-            im: vec![0.0; FFT_N],
+            re: vec![0.0; n],
+            im: vec![0.0; n],
         }
     }
 
     pub fn push(&mut self, l: f32, r: f32) {
         self.ring[self.pos] = 0.5 * (l + r);
-        self.pos = (self.pos + 1) % FFT_N;
+        self.pos = (self.pos + 1) % self.n;
         self.fresh += 1;
     }
 
@@ -1031,17 +1161,17 @@ impl Fft {
             return None;
         }
         self.fresh = 0;
-        for i in 0..FFT_N {
-            self.re[i] = self.ring[(self.pos + i) % FFT_N] * self.window[i];
+        for i in 0..self.n {
+            self.re[i] = self.ring[(self.pos + i) % self.n] * self.window[i];
             self.im[i] = 0.0;
         }
         fft(&mut self.re, &mut self.im);
         let (re, im) = (&self.re, &self.im);
-        let mag = |b: usize| (re[b] * re[b] + im[b] * im[b]).sqrt() * 4.0 / FFT_N as f32;
+        let mag = |b: usize| (re[b] * re[b] + im[b] * im[b]).sqrt() * 4.0 / self.n as f32;
         let mut bands = vec![0.0f32; BANDS];
         for (k, band) in bands.iter_mut().enumerate() {
             let (a, b) = (self.edges[k], self.edges[k + 1]);
-            let (ia, ib) = (a.floor() as usize, (b.ceil() as usize).min(FFT_N / 2 - 1));
+            let (ia, ib) = (a.floor() as usize, (b.ceil() as usize).min(self.n / 2 - 1));
             let m = if ib <= ia + 1 {
                 let c = (a + b) / 2.0;
                 let i0 = c.floor() as usize;
