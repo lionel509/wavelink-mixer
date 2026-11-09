@@ -1081,8 +1081,18 @@ impl App {
     /// device (re)appears or drifts right after; take a device value only when it is a deliberate
     /// external change (crate::busvol::decide). The fader always shows the config.
     fn sync_bus(&self, f: &Fader, g: &Graph, id: &str) {
-        let Some(b) = self.cfg.borrow().buses.iter().find(|b| b.id == id).cloned() else { return };
+        let Some(mut b) = self.cfg.borrow().buses.iter().find(|b| b.id == id).cloned() else { return };
         let node = g.node(&bus_fader_node(&b));
+        // an AirPlay destination (by name or node props) gets its ceiling written into the config once
+        if b.persist_raop_ceiling(node.map_or(false, |n| n.raop)) {
+            if let Some(bu) = self.cfg.borrow_mut().buses.iter_mut().find(|x| x.id == id) {
+                bu.max_db = b.max_db;
+            }
+            self.mark_dirty();
+            eprintln!("wavelink: bus {id}: AirPlay destination, ceiling {} saved", fmt_db(b.ceiling_db()));
+            f.max_db.set(b.ceiling_db());
+            f.scale.add_mark(db_to_pos(b.ceiling_db()), gtk::PositionType::Right, Some("max"));
+        }
         let seen = node.map(|n| (g.instance(n), n.has_vol.then_some(crate::busvol::Reading { vol: n.vol, mute: n.mute })));
         let now = glib::monotonic_time() as f64 / 1e6;
         let ceil = b.ceiling_db();

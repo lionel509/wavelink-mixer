@@ -20,6 +20,8 @@ pub struct Node {
     /// whether the node reported channelVolumes at all (a node whose Props are not enumerated yet
     /// must not read as 0 dB, #33)
     pub has_vol: bool,
+    /// an AirPlay/RAOP sink by its props (factory/media.class/device.api/raop.* keys), whatever its name (#33)
+    pub raop: bool,
     pub owned: bool,
 }
 
@@ -69,6 +71,7 @@ impl Graph {
                         vol,
                         mute,
                         has_vol,
+                        raop: props_say_raop(p),
                         owned: p["wavelink.owned"].as_bool() == Some(true) || s("wavelink.owned") == "true",
                     };
                     if !n.name.is_empty() {
@@ -121,6 +124,18 @@ impl Graph {
     pub fn sources(&self) -> Vec<&Node> {
         self.nodes.iter().filter(|n| n.class.starts_with("Audio/Source") && !n.owned && !n.name.ends_with(".monitor")).collect()
     }
+}
+
+/// Whether a node's props mark it as an AirPlay/RAOP sink: its name, factory.name, media.class,
+/// device.api or node.driver mentions raop/airplay (any case), or it carries raop.* / api.raop.* keys.
+pub fn props_say_raop(p: &serde_json::Value) -> bool {
+    let Some(o) = p.as_object() else { return false };
+    o.iter().any(|(k, v)| {
+        let k = k.to_ascii_lowercase();
+        k.starts_with("raop.") || k.starts_with("api.raop")
+            || (["node.name", "factory.name", "media.class", "device.api", "node.driver", "node.group", "media.name"].contains(&k.as_str())
+                && v.as_str().map_or(false, crate::config::is_raop_name))
+    })
 }
 
 /// Run a command and collect stdout, killing it if it takes longer than `limit`.
@@ -345,6 +360,19 @@ pub fn meta_value(meta: &str, key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raop_detected_from_props() {
+        let j = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        assert!(props_say_raop(&j(r#"{"node.name":"sonos_room","raop.hostname":"Sonos-1.local"}"#)));
+        assert!(props_say_raop(&j(r#"{"node.name":"sonos_room","factory.name":"support.RAOP-sink"}"#)));
+        assert!(props_say_raop(&j(r#"{"node.name":"x","api.raop.ip":"192.168.1.64"}"#)));
+        assert!(props_say_raop(&j(r#"{"node.name":"x","device.api":"airplay"}"#)));
+        assert!(props_say_raop(&j(r#"{"node.name":"RAOP_kitchen"}"#)));
+        assert!(!props_say_raop(&j(r#"{"node.name":"alsa_output.usb-Focusrite","factory.name":"api.alsa.pcm.sink","media.class":"Audio/Sink"}"#)));
+        assert!(!props_say_raop(&j(r#"{"node.description":"my raop notes"}"#)));
+        assert!(!props_say_raop(&j("null")));
+    }
 
     #[test]
     fn volume_goes_in_before_an_unmute_and_after_a_mute() {

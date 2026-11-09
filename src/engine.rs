@@ -249,7 +249,8 @@ pub fn apply_levels(cfg: &Config, g: &Graph) {
     for b in &cfg.buses {
         if let Some(n) = g.node(&bus_fader_node(b)) {
             // never above the bus ceiling (a3 Sonos), volume before any unmute (#33)
-            pw::set_volume_mute(n.id, db_to_vol(b.effective_db()), b.mute);
+            let db = b.gain_db.min(b.ceiling_for(n.raop));
+            pw::set_volume_mute(n.id, db_to_vol(if db.is_nan() { crate::config::MIN_DB } else { db }), b.mute);
         }
     }
 }

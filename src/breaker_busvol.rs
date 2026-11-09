@@ -402,14 +402,21 @@ fn r2_probe_ceiling_hand_edits() {
     assert_eq!(sonos_bus("raop_sink.Sonos-7828CAB27EEC.local.192.168.1.64.7000", 0.0, None).ceiling_db(), RAOP_MAX_DB);
 }
 
-/// Known gap (documented, not a defect of the code as specified): the default ceiling is keyed on the
-/// node *name*. A RAOP sink renamed by a WirePlumber/raop-discover rule (node.name = "sonos_room") or
-/// different case gets no ceiling: +12 dB, i.e. the speaker at 100 % and beyond.
+/// Was a known gap in round 2 (ceiling keyed on the `raop_` prefix only). Fix round 3: the name match
+/// is case-insensitive and anywhere in the name; a renamed sink with no "raop" in its name is detected
+/// from its node props (Bus::ceiling_for) and gets max_db written once (Bus::persist_raop_ceiling).
 #[test]
 fn r2_probe_renamed_raop_destination_has_no_ceiling() {
+    // by name alone a "sonos_room" is indistinguishable from any sink ...
     assert_eq!(sonos_bus("sonos_lionels_room", 0.0, None).ceiling_db(), MAX_DB);
-    assert_eq!(sonos_bus("RAOP_sonos", 0.0, None).ceiling_db(), MAX_DB);
-    assert_eq!(sonos_bus("sonos_lionels_room", 0.0, None).effective_db(), 0.0);
+    // ... but its props say RAOP: ceiling, and it is persisted so later renames keep it
+    let mut b = sonos_bus("sonos_lionels_room", 0.0, None);
+    assert_eq!(b.ceiling_for(true), RAOP_MAX_DB);
+    assert!(b.persist_raop_ceiling(true));
+    assert_eq!(b.ceiling_db(), RAOP_MAX_DB);
+    assert_eq!(b.effective_db(), RAOP_MAX_DB);
+    // different case
+    assert_eq!(sonos_bus("RAOP_sonos", 0.0, None).ceiling_db(), RAOP_MAX_DB);
 }
 
 /// Model of the slider handler in ui.rs (`connect_value_changed`, 91cf4a8): it snaps the slider back

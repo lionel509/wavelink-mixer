@@ -210,6 +210,12 @@ pub struct Bus {
 /// Default ceiling of a bus that drives an AirPlay (RAOP) speaker's own volume.
 pub const RAOP_MAX_DB: f64 = -20.0;
 
+/// A node name that is an AirPlay/RAOP sink ("raop" or "airplay" anywhere, any case).
+pub fn is_raop_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("raop") || n.contains("airplay")
+}
+
 impl Bus {
     /// A new bus: unity gain, or its ceiling when that is lower (a new Sonos bus never starts at 100 %).
     pub fn new(id: String, name: String, color: String, kind: BusKind) -> Bus {
@@ -217,15 +223,30 @@ impl Bus {
         b.gain_db = b.clamp_db(0.0);
         b
     }
-    /// The ceiling every write to this bus is clamped to.
+    /// The ceiling every write to this bus is clamped to (destination detected by name only).
     pub fn ceiling_db(&self) -> f64 {
+        self.ceiling_for(false)
+    }
+    /// Ceiling when the graph says whether the destination node is an AirPlay/RAOP sink (its props).
+    pub fn ceiling_for(&self, node_is_raop: bool) -> f64 {
         match self.max_db {
             Some(m) if m.is_finite() => m.clamp(MIN_DB, MAX_DB),
-            _ => match &self.kind {
-                BusKind::Hardware { target } if target.starts_with("raop_") => RAOP_MAX_DB,
-                _ => MAX_DB,
-            },
+            _ if self.is_raop(node_is_raop) => RAOP_MAX_DB,
+            _ => MAX_DB,
         }
+    }
+    /// A hardware bus whose destination is an AirPlay speaker, by name (case-insensitive) or node props.
+    pub fn is_raop(&self, node_is_raop: bool) -> bool {
+        matches!(&self.kind, BusKind::Hardware { target } if node_is_raop || is_raop_name(target))
+    }
+    /// An AirPlay bus without an explicit ceiling gets RAOP_MAX_DB written into its config once, so it
+    /// survives a rename of the node. Returns whether it changed.
+    pub fn persist_raop_ceiling(&mut self, node_is_raop: bool) -> bool {
+        if self.max_db.map_or(true, |m| !m.is_finite()) && self.is_raop(node_is_raop) {
+            self.max_db = Some(RAOP_MAX_DB);
+            return true;
+        }
+        false
     }
     pub fn clamp_db(&self, db: f64) -> f64 {
         if db.is_nan() { MIN_DB } else { db.min(self.ceiling_db()) }
@@ -512,6 +533,42 @@ mod tests {
         assert_eq!(old.effective_db(), RAOP_MAX_DB);
         // round trip without a max_db does not write one
         assert!(!serde_json::to_string(&old).unwrap().contains("max_db"));
+    }
+
+    #[test]
+    fn raop_detection_and_persisted_ceiling() {
+        let hw = |t: &str| Bus::new("a3".into(), "S".into(), "#fff".into(), BusKind::Hardware { target: t.into() });
+        for t in ["raop_sonos_lionels_room", "RAOP_sonos", "my.Raop.sink", "AirPlay_kitchen", "raop_sink.Sonos-7828CAB27EEC.local.192.168.1.64.7000"] {
+            assert_eq!(hw(t).ceiling_db(), RAOP_MAX_DB, "{t}");
+        }
+        assert_eq!(hw("alsa_output.usb-Focusrite").ceiling_db(), MAX_DB);
+        // renamed AirPlay sink: only its props tell
+        let mut b = hw("sonos_room");
+        b.gain_db = 0.0;
+        assert_eq!(b.ceiling_db(), MAX_DB);
+        assert_eq!(b.ceiling_for(true), RAOP_MAX_DB);
+        assert!(b.persist_raop_ceiling(true));
+        assert_eq!(b.max_db, Some(RAOP_MAX_DB));
+        assert!(!b.persist_raop_ceiling(true), "written once");
+        // survives a later rename to a name with nothing AirPlay in it
+        b.kind = BusKind::Hardware { target: "living_room".into() };
+        assert_eq!(b.ceiling_db(), RAOP_MAX_DB);
+        assert_eq!(b.effective_db(), RAOP_MAX_DB);
+        // an explicit ceiling is never overwritten
+        let mut c = hw("raop_x");
+        c.max_db = Some(-30.0);
+        assert!(!c.persist_raop_ceiling(true));
+        assert_eq!(c.max_db, Some(-30.0));
+        // by name alone it is persisted too
+        let mut d = hw("raop_y");
+        assert!(d.persist_raop_ceiling(false));
+        assert_eq!(d.max_db, Some(RAOP_MAX_DB));
+        // not AirPlay, or a virtual bus: nothing written
+        let mut e = hw("alsa_output.hdmi");
+        assert!(!e.persist_raop_ceiling(false));
+        let mut v = Bus::new("b3".into(), "V".into(), "#fff".into(), BusKind::Virtual { node: "raop_like".into(), description: "V".into() });
+        assert!(!v.persist_raop_ceiling(true));
+        assert_eq!(v.max_db, None);
     }
 
     #[test]
