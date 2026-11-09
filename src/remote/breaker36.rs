@@ -580,7 +580,19 @@ fn r2_auto_bind_excludes_vpn_interfaces_not_named_like_tun_or_wg() {
     .iter()
     .map(|(a, b)| (a.to_string(), b.to_string()))
     .collect();
-    let got = super::settings::bind_addrs("auto", false, &ifs);
+    // hermetic (round 4): a fake sysfs where only enp14s0 is a physical Ethernet NIC and the VPNs are
+    // virtual (no `device`, link type none), instead of reading the host's /sys/class/net
+    let sys = std::env::temp_dir().join(format!("wavelink-b36r2-sys-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&sys);
+    for (n, _) in &ifs {
+        std::fs::create_dir_all(sys.join(n)).unwrap();
+        std::fs::write(sys.join(n).join("type"), if n == "enp14s0" { "1\n" } else { "65534\n" }).unwrap();
+        if n == "enp14s0" {
+            std::fs::create_dir_all(sys.join(n).join("device")).unwrap();
+        }
+    }
+    let got = super::settings::bind_addrs_with("auto", false, &ifs, &|d| super::settings::is_physical_nic_in(&sys, d));
+    let _ = std::fs::remove_dir_all(&sys);
     assert_eq!(got, vec!["192.168.1.231".to_string(), "127.0.0.1".to_string()], "VPN addresses bound: {got:?}");
 }
 
@@ -826,4 +838,99 @@ fn r3_probe_allowlist_sysfs_wins_over_name() {
     // doesn't list is now never physical; this line is inverted on purpose]
     assert!(!super::settings::is_physical_nic_in(&sys, "enwhatever"));
     let _ = std::fs::remove_dir_all(&sys);
+}
+
+// ####################################################################### ROUND 4 (9559bfe)
+
+/// Tiny deterministic PRNG for the policy fuzz (no extra crates).
+struct Lcg(u64);
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 >> 33
+    }
+    fn pick<T: Copy>(&mut self, v: &[T]) -> T {
+        v[(self.next() as usize) % v.len()]
+    }
+}
+
+/// Fuzz of admit_policy against attackers on <= 4 LAN IPs (each within its cap of 2), a local loopback
+/// flood of any size up to the hard cap, handshake-slow sockets (idle time 0 for their whole 5 s) and
+/// idle ones, plus the real client's socket (handshaking or < 1 s after its handshake: a real client
+/// says Hello within one RTT). Invariants, 200k random states:
+/// - a real newcomer from an IP with nothing pending is never refused;
+/// - an attacker newcomer (from an attacker IP, a 5th..nth new attacker IP up to 4 total, or loopback) is
+///   never admitted by evicting the real client's socket.
+#[test]
+fn r4_probe_policy_fuzz_le4_attacker_ips() {
+    use super::server::{admit_policy, Admit, MAX_PREAUTH};
+    let real = ip4(192, 168, 1, 20);
+    let lo = ip4(127, 0, 0, 1);
+    let ages_att = [Duration::ZERO, Duration::from_millis(300), Duration::from_millis(999), Duration::from_millis(1500), Duration::from_secs(4)];
+    let ages_real = [Duration::ZERO, Duration::from_millis(5), Duration::from_millis(80), Duration::from_millis(400)];
+    let mut rng = Lcg(0x5eed_3600);
+    let (mut refused, mut evicted_real) = (0u32, 0u32);
+    for _ in 0..200_000 {
+        let n_ips = 1 + (rng.next() % 4) as u8;
+        let mut pending: Vec<(std::net::IpAddr, Duration)> = vec![];
+        for k in 0..n_ips {
+            for _ in 0..(rng.next() % 3) {
+                pending.push((ip4(192, 168, 1, 100 + k), rng.pick(&ages_att)));
+            }
+        }
+        for _ in 0..(rng.next() % (2 * MAX_PREAUTH as u64 + 1)) {
+            pending.push((lo, rng.pick(&ages_att)));
+        }
+        pending.truncate(2 * MAX_PREAUTH);
+        // shuffle a bit so index order is not insertion order
+        for i in (1..pending.len()).rev() {
+            let j = (rng.next() as usize) % (i + 1);
+            pending.swap(i, j);
+        }
+        // (a) the real client arrives
+        if admit_policy(&pending, real) == Admit::Refuse {
+            refused += 1;
+        }
+        // (b) the real client is pending; an attacker arrives
+        if pending.len() < 2 * MAX_PREAUTH {
+            let pos = (rng.next() as usize) % (pending.len() + 1);
+            pending.insert(pos, (real, rng.pick(&ages_real)));
+            let used: Vec<u8> = (0..n_ips).collect();
+            let newcomer = match rng.next() % 3 {
+                0 => ip4(192, 168, 1, 100 + rng.pick(&used)),
+                1 => ip4(192, 168, 1, 100 + n_ips.min(3)), // a further attacker IP, still <= 4 in total
+                _ => lo,
+            };
+            if admit_policy(&pending, newcomer) == Admit::Evict(pos) {
+                evicted_real += 1;
+            }
+        }
+    }
+    assert_eq!((refused, evicted_real), (0, 0), "real client refused {refused}x / evicted {evicted_real}x");
+}
+
+/// The limit of the guarantee (documents, not a defect at this scale): 8 attacker IPs each holding ONE
+/// handshake-slow socket (never idle, re-opened every 5 s) fill the hard cap with nobody holding 2, so a
+/// newcomer from a 9th IP is refused. Needs 8 addresses on the LAN; out of the <= 4 scope.
+#[test]
+fn r4_probe_eight_ips_one_slow_socket_each_refuse() {
+    use super::server::{admit_policy, Admit};
+    let pending: Vec<_> = (0..8u8).map(|k| (ip4(192, 168, 1, 100 + k), Duration::ZERO)).collect();
+    assert_eq!(admit_policy(&pending, ip4(192, 168, 1, 20)), Admit::Refuse);
+}
+
+/// End to end: 4 silent loopback sockets that never finish the WebSocket handshake (raw TCP, so their
+/// idle time stays 0) plus 4 that finished it and sit silent: the real client (also loopback here) still
+/// gets in, because the handshaken-silent ones turn idle after 1 s and are evicted.
+#[test]
+fn r4_probe_slow_handshake_mix_end_to_end() {
+    let r = rig("r4mix");
+    let _raw: Vec<TcpStream> = (0..4).map(|_| {
+        let mut s = TcpStream::connect(r.run.addr).unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n").unwrap(); // never finishes the upgrade
+        s
+    }).collect();
+    let _silent: Vec<_> = (0..4).map(|_| connect(&r)).collect();
+    std::thread::sleep(Duration::from_millis(1300));
+    assert!(try_join(&r).is_some(), "real client refused behind 4 slow-handshake + 4 idle sockets");
 }
