@@ -116,6 +116,7 @@ fn session(addr: &str, token: &str, meters: bool, orx: &Receiver<Out>, stop: &At
         token: token.trim().to_string(),
         client: format!("Wavelink Remote {} ({})", env!("CARGO_PKG_VERSION"), std::env::consts::OS),
         meters,
+        host: None,
     });
     ws.send(Message::text(hello.to_json())).map_err(|e| r(e.to_string()))?;
     match ws.read() {
