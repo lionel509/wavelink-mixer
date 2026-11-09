@@ -602,8 +602,16 @@ fn host_state_report_overrides_and_broadcasts() {
     let mut host = join_host(&r, "macbook", "MacBook", 50, false);
     let (mut c, _) = join(&r);
     send(&mut host, &ClientMsg::HostState { volume: 12, mute: true });
-    assert_eq!(wait_delta(&mut c, |d| matches!(d, Delta::HostVolume { .. })), Some(Delta::HostVolume { host: "macbook".into(), volume: 12 }));
-    assert_eq!(wait_delta(&mut c, |d| matches!(d, Delta::HostMute { .. })), Some(Delta::HostMute { host: "macbook".into(), mute: true }));
+    // both changes arrive in one Delta frame: collect across frames (wait_delta would drop the second)
+    let mut seen: Vec<Delta> = vec![];
+    let t0 = Instant::now();
+    while seen.len() < 2 && t0.elapsed() < Duration::from_secs(3) {
+        if let Some(ServerMsg::Delta { changes, .. }) = recv_np(&mut c) {
+            seen.extend(changes);
+        }
+    }
+    assert!(seen.contains(&Delta::HostVolume { host: "macbook".into(), volume: 12 }), "{seen:?}");
+    assert!(seen.contains(&Delta::HostMute { host: "macbook".into(), mute: true }), "{seen:?}");
     let (_, st) = join(&r);
     assert_eq!((st.hosts[0].volume, st.hosts[0].mute), (12, true));
 }
