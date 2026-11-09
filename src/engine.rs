@@ -730,6 +730,21 @@ mod breaker27 {
         assert!(next <= fresh, "new structure stuck for {next:.0}s before its first restart; a fresh graph should get ~{:.0}s", fresh - 3.0);
     }
 
+    /// F0 (live-confirmed): in the #22 failure mode itself (child still at 1024 fds, e.g. hard ==
+    /// soft so the pre_exec raise is a no-op, or the server's own limit at large sizes) every node
+    /// first APPEARS (graph complete ~2 s after spawn), then the fd-starved ones die. The brief
+    /// complete graph resets stuck_restarts, so the x2..x16 backoff never engages: a restart every
+    /// ~18 s at 8x5 forever, each one "attempt 1". Private PipeWire, `ulimit -n 1024`, 90 s:
+    /// 58/58 nodes present at t=2,20,39,57,77 s, 4 restarts all "(stuck, attempt 1)".
+    #[test]
+    fn red_transient_complete_graph_defeats_backoff() {
+        let n = expected(&cfg_nxm(8, 5)).len();
+        let ev = sim(n, 600.0, &[], |_, since, _| if since < 1.0 { n } else if since < 3.5 { 0 } else { 7 });
+        let stuck = ev.iter().filter(|e| e.stuck).count();
+        // with the intended backoff (17, 34, 68, 120, 120 ...) 10 min holds at most ~7 restarts
+        assert!(stuck <= 7, "{stuck} restarts in 10 min; intervals {:?}", ev.windows(2).map(|w| (w[1].t - w[0].t).round()).collect::<Vec<_>>());
+    }
+
     // ---------------- green probes (regression tests) ----------------
 
     #[test]
