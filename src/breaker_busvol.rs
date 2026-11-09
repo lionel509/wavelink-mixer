@@ -224,3 +224,233 @@ fn probe_wrote_during_reset_never_adopts() {
     assert!(first_adopt(&steps).is_none());
     assert!(steps.iter().filter(|(_, s)| *s == Step::Push).count() <= 5);
 }
+
+// ================================================================ Round 2 (91cf4a8 + ef80635)
+
+use crate::busvol::{write_db, PIN_CLEAR_S, TOL_DB};
+use crate::config::{Bus, BusKind, RAOP_MAX_DB};
+use crate::dash::{db_to_pos, pos_to_db};
+
+fn sonos_bus(target: &str, gain_db: f64, max_db: Option<f64>) -> Bus {
+    let mut b = Bus::new("a3".into(), "Sonos".into(), "#fff".into(), BusKind::Hardware { target: target.into() });
+    b.gain_db = gain_db;
+    b.max_db = max_db;
+    b
+}
+
+/// Round-1 reds, harder variants (the fixes must not be fitted to the exact sequences of round 1).
+#[test]
+fn r2_probe_round1_fixes_hold_on_variants() {
+    // R1/R2: Props arrive late, muted at full scale, after 40 s; then unmute at full scale
+    let mut t = Tracker::default();
+    t.observe(0.0, Some((4, None)), SONOS, false);
+    run(&mut t, 0.5, 40.0, Some((4, None)), SONOS, false);
+    let mut steps = run(&mut t, 40.5, 50.0, Some((4, r(1.0, true))), SONOS, false);
+    steps.extend(run(&mut t, 50.5, 70.0, Some((4, r(1.0, false))), SONOS, false));
+    assert!(!steps.iter().any(|(_, s)| is_gain_adopt(s)), "{:?}", first_adopt(&steps));
+    // R3: a 3-poll (1.5 s) Props gap, twice
+    let mut t = stuck_full_scale_tracker();
+    let mut steps = run(&mut t, 45.5, 46.5, Some((9, None)), SONOS, false);
+    steps.extend(run(&mut t, 47.0, 50.0, Some((9, r(1.0, false))), SONOS, false));
+    steps.extend(run(&mut t, 50.5, 51.5, Some((9, None)), SONOS, false));
+    steps.extend(run(&mut t, 52.0, 70.0, Some((9, r(1.0, false))), SONOS, false));
+    assert!(!steps.iter().any(|(_, s)| is_gain_adopt(s)), "{:?}", first_adopt(&steps));
+    // R4: flap to idle 0 for 1.5 s (just under STABLE_S), then to 0.9995 (still "full scale", within TOL)
+    let mut t = stuck_full_scale_tracker();
+    let mut steps = run(&mut t, 45.5, 47.0, Some((9, r(0.0, false))), SONOS, false);
+    steps.extend(run(&mut t, 47.5, 70.0, Some((9, r(0.9995, false))), SONOS, false));
+    assert!(!steps.iter().any(|(_, s)| is_gain_adopt(s)), "{:?}", first_adopt(&steps));
+}
+
+/// The override pin clears after exactly PIN_CLEAR_S of InSync, not before (Scarlett: no ceiling).
+/// 4.5 s in sync then a jump back to the overridden 100 %: still refused. 5.0 s: cleared, and a held
+/// 100 % is then a deliberate external change (adopted after STABLE_S) by design.
+#[test]
+fn r2_probe_pin_clears_at_exactly_5s_in_sync() {
+    fn setup() -> Tracker {
+        let mut t = Tracker::default();
+        let s0 = db_to_vol(-4.2);
+        run(&mut t, 0.0, 39.5, Some((1, r(s0, false))), -4.2, false);
+        // he moves the fader to -10 at 40 while the device resets to 100 %: we push over 1.0 (pin = 1.0)
+        t.wrote(40.0);
+        assert_eq!(t.observe(40.0, Some((1, r(1.0, false))), -10.0, false), Step::Push);
+        t
+    }
+    let v10 = db_to_vol(-10.0);
+    for (hold, adopt_expected) in [(4.5, false), (PIN_CLEAR_S - 0.5, false), (PIN_CLEAR_S, true)] {
+        let mut t = setup();
+        // device lands at -10 at 41.0 and stays in sync for `hold` seconds (polls 41.0 ..= 41.0+hold)
+        run(&mut t, 41.0, 41.0 + hold, Some((1, r(v10, false))), -10.0, false);
+        let steps = run(&mut t, 41.5 + hold, 60.0, Some((1, r(1.0, false))), -10.0, false);
+        let a = first_adopt(&steps);
+        assert_eq!(a.is_some(), adopt_expected, "hold {hold}: {a:?}");
+        if let Some((at, s)) = a {
+            assert_eq!(s, Step::Adopt { gain_db: Some(0.0), mute: None });
+            assert!((at - (41.5 + hold + STABLE_S)).abs() < 1e-9, "adopted at {at}");
+        }
+    }
+    // with the AirPlay ceiling the same 5 s clear can never let 100 % in
+    let mut t = Tracker::default();
+    t.set_ceiling(RAOP_MAX_DB);
+    run(&mut t, 0.0, 39.5, Some((1, r(db_to_vol(SONOS), false))), SONOS, false);
+    run(&mut t, 40.0, 50.0, Some((1, r(db_to_vol(SONOS), false))), SONOS, false);
+    let steps = run(&mut t, 50.5, 120.0, Some((1, r(1.0, false))), SONOS, false);
+    assert!(first_adopt(&steps).is_none(), "{:?}", first_adopt(&steps));
+}
+
+/// Deterministic fuzz of the tracker: random readings (None, 0, muted, NaN, > +12, full scale, levels
+/// above/below the ceiling), random instance changes and fader writes. Invariants on every step:
+/// never adopt a gain above the ceiling, never adopt from a NaN / zero / > +12 / muted reading,
+/// never adopt within SETTLE_S of an appearance, never adopt full scale within ARTEFACT_S.
+#[test]
+fn r2_probe_fuzz_tracker_invariants() {
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut rnd = |n: u64| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) % n
+    };
+    let pool = [
+        None, r(0.0, false), r(0.0, true), r(1.0, false), r(1.0, true), r(f64::NAN, false), r(2.0, false),
+        r(db_to_vol(-10.0), false), r(db_to_vol(-25.0), false), r(db_to_vol(SONOS), false), r(db_to_vol(SONOS), true),
+        r(0.9995, false), r(-0.3, false),
+    ];
+    for ceiling in [RAOP_MAX_DB, -30.0, MAX_DB] {
+        for run_no in 0..200 {
+            let mut t = Tracker::default();
+            t.set_ceiling(ceiling);
+            let (mut inst, mut appeared, mut saved, mut saved_mute) = (1u64, 0.0, SONOS.min(ceiling), false);
+            let mut cur = pool[rnd(pool.len() as u64) as usize];
+            let mut had = cur.is_some();
+            let mut now = 0.0;
+            t.observe(now, Some((inst, cur)), saved, saved_mute);
+            for _ in 0..400 {
+                now += 0.5;
+                match rnd(40) {
+                    0 => { inst += 1; appeared = now; had = false; }
+                    1 | 2 => { saved = write_db(pos_to_db(rnd(1001) as f64 / 1000.0), ceiling); t.wrote(now); }
+                    3 => { saved_mute = !saved_mute; t.wrote(now); }
+                    4..=9 => { cur = pool[rnd(pool.len() as u64) as usize]; }
+                    _ => {}
+                }
+                if !had && cur.is_some() { had = true; appeared = now; }
+                let s = t.observe(now, Some((inst, cur)), saved, saved_mute);
+                if let Step::Adopt { gain_db, mute } = s {
+                    let d = cur.expect("adopt without a reading");
+                    let ctx = format!("ceil {ceiling} run {run_no} t {now} saved {saved} reading {d:?} -> {s:?}");
+                    assert!(now - appeared >= SETTLE_S, "adopt inside settle: {ctx}");
+                    if let Some(g) = gain_db {
+                        assert!(g <= ceiling + TOL_DB, "above ceiling: {ctx}");
+                        assert!(!d.mute && d.vol.is_finite() && d.vol >= 1e-6 && d.vol <= db_to_vol(MAX_DB) * 1.000001, "bad source: {ctx}");
+                        assert!(!(d.vol >= 0.999 && now - appeared < ARTEFACT_S), "full scale inside 30 s: {ctx}");
+                        saved = g.min(ceiling);
+                    }
+                    if let Some(m) = mute { saved_mute = m; }
+                }
+            }
+        }
+    }
+}
+
+/// Ceiling: no fader position (drag, scroll, double-click, SL MkIII value/127) writes above it.
+#[test]
+fn r2_probe_write_db_never_exceeds_ceiling() {
+    for ceil in [MIN_DB, -37.3, RAOP_MAX_DB, -0.1, 0.0, 6.0, MAX_DB] {
+        for k in 0..=1000 {
+            let db = write_db(pos_to_db(k as f64 / 1000.0), ceil);
+            assert!(db <= ceil + 1e-12, "pos {k}/1000 ceil {ceil} -> {db}");
+        }
+        for cc in 0..=127u8 {
+            assert!(write_db(pos_to_db(cc as f64 / 127.0), ceil) <= ceil + 1e-12);
+        }
+        assert!(write_db(pos_to_db(db_to_pos(0.0)), ceil) <= ceil);
+        assert!(write_db(pos_to_db(f64::NAN), ceil) <= ceil);
+        assert!(write_db(f64::INFINITY, ceil) <= ceil);
+    }
+}
+
+/// write_db(-inf) returns -inf, which serde_json writes as `null` -> the config no longer parses ->
+/// Config::load backs it up and resets to defaults. Not reachable from the slider today (pos_to_db
+/// floors at -60), so a low-severity robustness probe: it must stay unreachable.
+#[test]
+fn r2_probe_write_db_negative_infinity_not_reachable_from_slider() {
+    for k in 0..=1000 {
+        assert!(pos_to_db(k as f64 / 1000.0).is_finite());
+    }
+    assert!(pos_to_db(-1.0).is_finite() && pos_to_db(2.0).is_finite());
+}
+
+/// Ceiling defaults and hand-edited configs: every push path uses effective_db().
+#[test]
+fn r2_probe_ceiling_hand_edits() {
+    let real = "raop_sonos_lionels_room";
+    // his live target name matches the raop_ default
+    assert_eq!(sonos_bus(real, SONOS, None).ceiling_db(), RAOP_MAX_DB);
+    // hand-edited gain above the ceiling: pushed/shown at the ceiling
+    for g in [0.0, 12.0, 40.0, f64::INFINITY] {
+        assert_eq!(sonos_bus(real, g, None).effective_db(), RAOP_MAX_DB, "gain {g}");
+    }
+    assert_eq!(sonos_bus(real, f64::NAN, None).effective_db(), MIN_DB);
+    // max_db NaN / inf / absurd -> destination default or the fader range, never louder than +12
+    assert_eq!(sonos_bus(real, 0.0, Some(f64::NAN)).ceiling_db(), RAOP_MAX_DB);
+    assert_eq!(sonos_bus(real, 0.0, Some(f64::INFINITY)).ceiling_db(), RAOP_MAX_DB);
+    assert_eq!(sonos_bus(real, 0.0, Some(-500.0)).ceiling_db(), MIN_DB);
+    // JSON: max_db null or missing = default; a string makes the whole config unreadable (backed up, defaults)
+    let j = |m: &str| format!(r##"{{"id":"a3","name":"Sonos","color":"#fff","kind":{{"type":"hardware","target":"{real}"}},"gain_db":0.0,"mute":false{m}}}"##);
+    assert_eq!(serde_json::from_str::<Bus>(&j(r#","max_db":null"#)).unwrap().effective_db(), RAOP_MAX_DB);
+    assert!(serde_json::from_str::<Bus>(&j(r#","max_db":"-30""#)).is_err());
+    // the default raop-discover name also matches
+    assert_eq!(sonos_bus("raop_sink.Sonos-7828CAB27EEC.local.192.168.1.64.7000", 0.0, None).ceiling_db(), RAOP_MAX_DB);
+}
+
+/// Known gap (documented, not a defect of the code as specified): the default ceiling is keyed on the
+/// node *name*. A RAOP sink renamed by a WirePlumber/raop-discover rule (node.name = "sonos_room") or
+/// different case gets no ceiling: +12 dB, i.e. the speaker at 100 % and beyond.
+#[test]
+fn r2_probe_renamed_raop_destination_has_no_ceiling() {
+    assert_eq!(sonos_bus("sonos_lionels_room", 0.0, None).ceiling_db(), MAX_DB);
+    assert_eq!(sonos_bus("RAOP_sonos", 0.0, None).ceiling_db(), MAX_DB);
+    assert_eq!(sonos_bus("sonos_lionels_room", 0.0, None).effective_db(), 0.0);
+}
+
+/// Model of the slider handler in ui.rs (`connect_value_changed`, 91cf4a8): it snaps the slider back
+/// whenever the written dB sits below the position, which is meant for the ceiling but also fires for
+/// the 0.1 dB rounding and the unity snap. A keyboard Up step (step_increment 0.001) is then undone:
+/// the fader cannot be raised with the arrow keys from 0 dB or from most of -10..0 dB.
+#[test]
+fn red_r2_snap_back_also_undoes_rounding_keyboard_up_is_stuck() {
+    // exact copy of the handler's arithmetic
+    fn key_up(pos: f64, ceil: f64) -> f64 {
+        let v = pos + 0.001;
+        let db = write_db(pos_to_db(v), ceil);
+        if db_to_pos(db) + 1e-6 < v { db_to_pos(db) } else { v }
+    }
+    let mut stuck = vec![];
+    for start in [0.0, -10.0, -6.0, -3.0, -30.0] {
+        let mut pos = db_to_pos(start);
+        for _ in 0..20 {
+            pos = key_up(pos, MAX_DB);
+        }
+        let db = write_db(pos_to_db(pos), MAX_DB);
+        if db < start + 0.5 {
+            stuck.push(format!("{start} dB -> {db} dB"));
+        }
+    }
+    assert!(stuck.is_empty(), "20 x Up on a +12 dB-ceiling fader is stuck: {stuck:?}");
+}
+
+/// Ordered wpctl pair: values are always finite plain decimals (no shell metacharacters reach sh; the
+/// script only expands "$1".."$6"), and an unmute never precedes its volume.
+#[test]
+fn r2_probe_volume_mute_cmds_are_safe() {
+    for db in [MIN_DB, -37.3, RAOP_MAX_DB, 0.0, MAX_DB, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let v = db_to_vol(db);
+        for mute in [false, true] {
+            let c = crate::pw::volume_mute_cmds(u64::MAX, v, mute);
+            assert_eq!(c.len(), 2);
+            let vol = c.iter().find(|x| x[0] == "set-volume").unwrap();
+            assert!(vol[2].chars().all(|ch| ch.is_ascii_digit() || ch == '.'), "{vol:?}");
+            assert!(vol[2].parse::<f64>().unwrap() <= db_to_vol(MAX_DB) + 1e-6);
+            assert_eq!(c[if mute { 0 } else { 1 }][0], "set-mute");
+        }
+    }
+}
