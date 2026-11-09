@@ -38,6 +38,7 @@ pub struct Pianist {
     /// MIXER_PIANO_PEDALMERGE: a key re-detected within 300 ms of its release rings on.
     pedal_merge: bool,
     hands: bool,
+    merge_s: f64,
     /// MIXER_PIANO_CC64: a real sustain pedal on the port instead of held notes.
     cc64: bool,
     pedal: bool,
@@ -63,6 +64,7 @@ impl Pianist {
             voices: std::env::var("MIXER_PIANO_VOICES").ok().and_then(|v| v.parse().ok()).unwrap_or(if crate::subtract::legato() || !crate::subtract::precision() { MAX_VOICES } else { 6 }),
             pedal_merge: crate::subtract::env_on("MIXER_PIANO_PEDALMERGE", true),
             hands: crate::subtract::env_on("MIXER_PIANO_HANDS", false),
+            merge_s: std::env::var("MIXER_PIANO_MERGE_S").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3),
             cc64: crate::subtract::env_on("MIXER_PIANO_CC64", false),
             pedal: false,
             held: Vec::with_capacity(16), swallow: [0; 128], recent_ons: Vec::with_capacity(16), vel_avg: [0.0; 3], bass: None }
@@ -114,7 +116,7 @@ impl Pianist {
         if let Some(h) = self.held.iter_mut().find(|h| h.pitch == pitch) {
             // pedal merge: the key came back soon after the tracker let it go, while the pedal
             // still holds it: keep the ringing note instead of striking it again
-            let pedal_merge = self.pedal_merge && h.released.is_some_and(|r| t - r < 0.3);
+            let pedal_merge = self.pedal_merge && h.released.is_some_and(|r| t - r < self.merge_s);
             if t - h.t_on < MERGE_S || pedal_merge {
                 // still held: its pending off ends the merged note; already off: wait for the new off
                 if h.released.take().is_none() {

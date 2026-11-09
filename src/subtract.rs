@@ -211,6 +211,7 @@ pub struct Analyzer {
     long_ok: bool,
     drums: Option<crate::drums::Drums>,
     bass_long: bool,
+    cluster: bool,
     /// The last 16 short frames' per-band (drum energy, total energy), newest first.
     dring: Vec<[[f32; 48]; 2]>,
 }
@@ -259,6 +260,7 @@ impl Analyzer {
             long_ok: false,
             drums: if env_on("MIXER_PIANO_DRUMS", false) { Some(crate::drums::Drums::new()) } else { None },
             bass_long: env_on("MIXER_PIANO_BASSWIN", true),
+            cluster: env_on("MIXER_PIANO_CLUSTER", true),
             dring: vec![[[0.0; 48]; 2]; 16],
         }
     }
@@ -490,8 +492,12 @@ impl Analyzer {
                 }
                 k = bk.1;
             }
-            for j in k.saturating_sub(1)..=(k + 1).min(KEYS - 1) {
-                taken[j] = true;
+            // semitone neighbours: below CLUSTER_HZ they are leakage of this note (the bins cannot
+            // separate them); above, a 9th/cluster voicing (D#4 + E4) is real and both may sound
+            if !self.cluster || key_hz(k) < tun("CLUSTER_HZ", 150.0) {
+                for j in k.saturating_sub(1)..=(k + 1).min(KEYS - 1) {
+                    taken[j] = true;
+                }
             }
             taken[best.1] = true;
             got[k] = true;
@@ -964,7 +970,9 @@ pub struct SubTracker {
     onset_lock: bool,
     oct: bool,
     holdkey: bool,
+    debug_key: Option<usize>,
     decode: bool,
+    pump: bool,
     dedouble: bool,
     poly: bool,
     /// Per key: the start frame of its last note.
@@ -1019,6 +1027,8 @@ impl SubTracker {
             oct: env_on("MIXER_PIANO_OCT", false),
             holdkey: env_on("MIXER_PIANO_HOLDKEY", false),
             decode: env_on("MIXER_PIANO_DECODE", true),
+            debug_key: std::env::var("SUB_DEBUG_KEY").ok().and_then(|v| v.parse::<usize>().ok()).map(|m| m.saturating_sub(LOW_KEY as usize)),
+            pump: env_on("MIXER_PIANO_PUMP", false),
             dedouble: env_on("MIXER_PIANO_DEDOUBLE", true),
             poly: env_on("MIXER_PIANO_POLY", false),
             last_on: vec![0; KEYS],
@@ -1167,6 +1177,20 @@ impl SubTracker {
             }
         }
         self.flux_prev = flux;
+        let gshift = if self.pump {
+            let mut d: Vec<f32> = (0..KEYS)
+                .filter(|&k| matches!(self.seg[k], KeySeg::On { .. }))
+                .map(|k| db((self.ring[0][k] + self.ring[1][k] + self.ring[2][k]) / 3.0) - self.gref - self.hist[k][0])
+                .collect();
+            if d.len() >= 2 {
+                d.sort_by(|a, b| a.total_cmp(b));
+                d[d.len() / 2].max(0.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
         for k in 0..KEYS {
             self.rawh[k][(i % 16) as usize] = fo.act[k];
             self.raw_view[k] = (fo.raw[k] / self.raw_peak).sqrt().min(1.0);
@@ -1176,7 +1200,22 @@ impl SubTracker {
             let v3 = h[0];
             h.rotate_left(1);
             h[3] = v;
-            let rise = v - v3 > 5.0;
+            if self.debug_key == Some(k) {
+                eprintln!(
+                    "f{i} t{:.2} act {:.1} v {v:.1} st {}",
+                    Self::t(i),
+                    db(fo.act[k]) - self.gref,
+                    match self.seg[k] {
+                        KeySeg::Idle => "idle",
+                        KeySeg::Pending { .. } => "pend",
+                        KeySeg::On { .. } => "ON",
+                        KeySeg::Blocked => "blk",
+                    }
+                );
+            }
+            // pumping (sidechain, compressor): a rise every sounding key shares is not an attack
+            let kr = v - v3 - gshift;
+            let rise = kr > 5.0;
             let pitch = (LOW_KEY as usize + k) as u8;
             // the smoothed value is centred one frame back
             let at = i.saturating_sub(1);
@@ -1184,9 +1223,9 @@ impl SubTracker {
                 KeySeg::Idle => {
                     // hold: coming back within 300 ms of its own off is the same note decaying,
                     // not a new strike, unless it is a clear attack
-                    let fresh = !(self.holdkey || self.decode) || i.saturating_sub(self.last_off[k]) > 26 || v - v3 >= tun("REBIRTH_DB", 9.0);
+                    let fresh = !(self.holdkey || self.decode) || i.saturating_sub(self.last_off[k]) > 26 || kr >= tun("REBIRTH_DB", 9.0);
                     if fresh && v > on_db && (rise || v3 < on_db) {
-                        KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i, rise: v - v3 }
+                        KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i, rise: kr }
                     } else {
                         KeySeg::Idle
                     }
@@ -1196,7 +1235,7 @@ impl SubTracker {
                         KeySeg::Idle
                     } else if rise && v > on_db {
                         // a fresh attack on a blocked key gets a new chance
-                        KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i, rise: v - v3 }
+                        KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i, rise: kr }
                     } else {
                         KeySeg::Blocked
                     }
@@ -1231,16 +1270,16 @@ impl SubTracker {
                     let (rs_ok, drop, nbelow) = if self.decode {
                         // interval decoding (fixed lag): the note holds while the key comes back above
                         // its floor within DECODE_LAG frames; it ends where it last was above
-                        (v - v3 >= tun("RESTRIKE_DB", 6.0) && at > s + 21, tun("OFF_DROP", 24.0), tun("DECODE_LAG", if legato() { 40.0 } else { 26.0 }) as u8)
+                        (kr >= tun("RESTRIKE_DB", 6.0) && at > s + 21, tun("OFF_DROP", 24.0), tun("DECODE_LAG", if legato() { 40.0 } else { 26.0 }) as u8)
                     } else if self.holdkey {
                         // hold: a re-strike needs a clear new attack on this key, 250 ms after the last
-                        (v - v3 >= tun("RESTRIKE_DB", 6.0) && at > s + 21, tun("OFF_DROP", 24.0), tun("HOLD_BELOW", 8.0) as u8)
+                        (kr >= tun("RESTRIKE_DB", 6.0) && at > s + 21, tun("OFF_DROP", 24.0), tun("HOLD_BELOW", 8.0) as u8)
                     } else {
                         (rise && at > s + 8, 18.0, 3)
                     };
                     if rs_ok && v > on_db {
                         evs.push(Ev::Off { t: Self::t(at.saturating_sub(1)), pitch });
-                        KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i, rise: v - v3 }
+                        KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i, rise: kr }
                     } else {
                         let below = if v < off_db || v < pk - drop { below + 1 } else { 0 };
                         if below >= nbelow {

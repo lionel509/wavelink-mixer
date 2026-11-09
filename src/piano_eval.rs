@@ -253,7 +253,76 @@ pub fn eval(mono: &[f32], sections: &[(String, f64, f64)]) -> String {
         eprintln!("bass notes played: {bass:?}");
         eprintln!("unexplained by pitch class: {:?}", pcs.iter().map(|v| (v / pcs.iter().sum::<f32>().max(1e-12) * 100.0).round()).collect::<Vec<_>>());
     }
+    let mut gt_line = String::new();
+    if let Ok(r) = std::env::var("PIANO_EVAL_REF") {
+        if let Ok(gt) = std::fs::read(&r).map_err(|e| e.to_string()).and_then(|b| crate::notes::parse_smf(&b)) {
+            let gt: Vec<Note> = gt.into_iter().filter(|p| p.ch != 9).map(|p| p.note).collect();
+            let (p1, r1, f1) = piano::note_f1(&notes, &gt, 0.05);
+            let (p2, r2, f2) = piano::note_f1(&notes, &gt, 0.10);
+            // frame level, 50 ms: active pitch sets
+            let nf = (secs * 20.0) as usize;
+            let act = |ns: &[Note]| {
+                let mut a = vec![[false; 128]; nf];
+                for n in ns {
+                    for f in ((n.t * 20.0) as usize)..(((n.t + n.dur) * 20.0) as usize).min(nf) {
+                        a[f][n.pitch as usize] = true;
+                    }
+                }
+                a
+            };
+            let (ea, ga) = (act(&notes), act(&gt));
+            let (mut tp, mut fp, mut fneg) = (0f64, 0f64, 0f64);
+            for f in 0..nf {
+                for p in 0..128 {
+                    match (ea[f][p], ga[f][p]) {
+                        (true, true) => tp += 1.0,
+                        (true, false) => fp += 1.0,
+                        (false, true) => fneg += 1.0,
+                        _ => {}
+                    }
+                }
+            }
+            let ff1 = 2.0 * tp / (2.0 * tp + fp + fneg).max(1.0);
+            if std::env::var_os("PIANO_EVAL_FP").is_some() {
+                // unmatched estimates: interval to the nearest reference note sounding at their onset
+                let mut hist: std::collections::BTreeMap<i32, usize> = Default::default();
+                let mut late = Vec::new();
+                for n in &notes {
+                    if gt.iter().any(|g| g.pitch == n.pitch && (g.t - n.t).abs() <= 0.05) {
+                        continue;
+                    }
+                    if let Some(g) = gt.iter().filter(|g| g.pitch == n.pitch).min_by(|a, b| (a.t - n.t).abs().total_cmp(&(b.t - n.t).abs())) {
+                        if (g.t - n.t).abs() < 0.3 {
+                            late.push(((n.t - g.t) * 1000.0) as i32);
+                            continue;
+                        }
+                    }
+                    let near = gt.iter().filter(|g| g.t <= n.t + 0.05 && g.t + g.dur >= n.t).map(|g| n.pitch as i32 - g.pitch as i32).min_by_key(|d| d.abs());
+                    *hist.entry(near.unwrap_or(999)).or_default() += 1;
+                }
+                if let Ok(pp) = std::env::var("PIANO_EVAL_PITCH") {
+                    let pp: u8 = pp.parse().unwrap_or(63);
+                    for g in gt.iter().filter(|g| g.pitch == pp) {
+                        eprintln!("ref {pp}: {:.2}+{:.2}", g.t, g.dur);
+                    }
+                    for n in notes.iter().filter(|n| n.pitch == pp) {
+                        eprintln!("est {pp}: {:.2}+{:.2} v{}", n.t, n.dur, n.vel);
+                    }
+                }
+                late.sort();
+                eprintln!("FP: same pitch, onset off by (ms): {late:?}");
+                eprintln!("FP: interval to the nearest sounding reference note (999 = none): {hist:?}");
+            }
+            gt_line = format!(
+                "vs reference ({} notes): onset+-50ms P {p1:.2} R {r1:.2} F1 {f1:.2} | +-100ms P {p2:.2} R {r2:.2} F1 {f2:.2} | frame F1 {ff1:.2} (P {:.2} R {:.2})\n",
+                gt.len(),
+                tp / (tp + fp).max(1.0),
+                tp / (tp + fneg).max(1.0)
+            );
+        }
+    }
     let mut rep = format!("live path: {} notes over {secs:.0} s, {ms:.1} ms CPU per 0.5 s\n", notes.len());
+    rep += &gt_line;
     rep += "section          notes  len_s  high/s  chroma  meldist  peakcov  extra/s  poly  restrk/s  oct/s\n";
     let mut all = vec![("all".to_string(), 0.0, secs)];
     all.extend(sections.iter().cloned());
