@@ -887,4 +887,16 @@ mod tests {
         assert_eq!(fader_pos(50), 0.5);
         assert_eq!(fader_pos(100), 1.0);
     }
+
+    #[test]
+    fn default_width_fits_the_strips_and_respects_the_caps() {
+        // Few strips keep the old 1100 default.
+        assert_eq!(default_width(900, Some(2560)), 1100);
+        // A natural width wider than 1100 is used so the last strip is not clipped.
+        assert_eq!(default_width(1300, Some(2560)), 1300);
+        // Capped at the monitor width when GTK can tell it.
+        assert_eq!(default_width(2400, Some(1728)), 1728);
+        // Without a monitor, the sane max applies.
+        assert_eq!(default_width(2400, None), 1800);
+    }
 }
