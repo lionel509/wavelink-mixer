@@ -576,4 +576,27 @@ mod tests {
         assert!(e.contains("unexpected Basic Pitch outputs"), "{e}");
         assert!(pick_grids(&[]).is_err());
     }
+
+    #[test]
+    fn frames_to_notes_infers_onset_from_note_rise() {
+        let mut note = vec![vec![0f32; 88]; 172];
+        let mut onset = vec![vec![0f32; 88]; 172];
+        // a strong note with a real onset peak: sets the global onset max
+        for f in 100..130 {
+            note[f][30] = 0.9;
+        }
+        onset[100][30] = 0.9;
+        // a note whose onset grid never passes 0.3: only the rise of the note grid shows it
+        for f in 20..60 {
+            note[f][48] = 0.9;
+        }
+        for f in 0..172 {
+            onset[f][48] = 0.3f32.min(onset[f][48] + 0.1);
+        }
+        let ns = frames_to_notes(&note, &onset);
+        assert_eq!(ns.len(), 2, "{ns:?}");
+        assert!(ns.iter().any(|n| n.pitch == 51), "{ns:?}");
+        let n = ns.iter().find(|n| n.pitch == 69).unwrap_or_else(|| panic!("no pitch 69: {ns:?}"));
+        assert!((n.t - 20.0 / FPS).abs() < 3.0 / FPS, "{ns:?}");
+    }
 }
