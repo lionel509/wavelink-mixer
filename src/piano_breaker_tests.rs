@@ -870,3 +870,6 @@ fn brk_repeats_with_realistic_attack() {
     }
     assert!(fails.is_empty(), "{}", fails.join("\n"));
 }
+
+#[path = "piano_breaker2_tests.rs"]
+mod round2;
