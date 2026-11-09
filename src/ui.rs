@@ -2259,7 +2259,22 @@ pub fn activate(app: &adw::Application) {
 
     // RGB spectrum analyser across the bottom, tapping a chosen bus
     let spec_buses: Vec<(String, String)> = Config::load().buses.iter().map(|b| (names::bus(&b.id), b.name.clone())).collect();
-    let spectrum = Spectrum::new(spec_buses.first().map(|b| b.0.as_str()).unwrap_or("bus_a1"));
+    // #23: the analyser is split into four lanes over the same bus tap (no extra FFT): Piano is the
+    // whole range, Bass / Mid / High are its bands below 250 Hz, 250 Hz-4 kHz and above 4 kHz
+    let first_bus = spec_buses.first().map(|b| b.0.as_str()).unwrap_or("bus_a1").to_string();
+    let (b_lo, b_hi) = (crate::dash::band_of(250.0), crate::dash::band_of(4000.0));
+    let lanes: Vec<Rc<Spectrum>> = [("Piano", 0, crate::dash::BANDS, 130), ("Bass  < 250 Hz", 0, b_lo, 80), ("Mid  250 Hz - 4 kHz", b_lo, b_hi, 80), ("High  > 4 kHz", b_hi, crate::dash::BANDS, 80)]
+        .into_iter()
+        .map(|(name, lo, hi, h)| {
+            let s = Spectrum::new(&first_bus);
+            s.set_range(lo, hi);
+            s.set_title(name);
+            s.area.set_content_height(h);
+            s.area.update_property(&[gtk::accessible::Property::Label(&format!("{name} spectrum"))]);
+            s
+        })
+        .collect();
+    let spectrum = lanes[0].clone();
     let spec_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
     spec_box.set_margin_start(12);
     spec_box.set_margin_end(12);
@@ -2273,10 +2288,12 @@ pub fn activate(app: &adw::Application) {
     let dd = gtk::DropDown::from_strings(&names_);
     dd.set_tooltip_text(Some("Which output to analyse"));
     {
-        let (sp, sb) = (spectrum.clone(), spec_buses.clone());
+        let (lanes2, sb) = (lanes.clone(), spec_buses.clone());
         dd.connect_selected_notify(move |d| {
             if let Some(b) = sb.get(d.selected() as usize) {
-                sp.set_target(&b.0);
+                for l in lanes2.iter() {
+                    l.set_target(&b.0);
+                }
             }
         });
     }
@@ -2284,7 +2301,9 @@ pub fn activate(app: &adw::Application) {
     let stack = gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).build();
     let spec_panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
     spec_panel.add_css_class("spectrum");
-    spec_panel.append(&spectrum.area);
+    for l in lanes.iter() {
+        spec_panel.append(&l.area);
+    }
     let patch_panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
     patch_panel.add_css_class("spectrum");
     patch_panel.append(&patch.area);
@@ -2550,7 +2569,7 @@ pub fn activate(app: &adw::Application) {
         std::thread::sleep(Duration::from_millis(500));
     });
     // animate needles and spectrum on the frame clock (never starves redraws, pauses when hidden)
-    let (st3, sp3) = (st.clone(), spectrum.clone());
+    let (st3, sp3, lanes3) = (st.clone(), spectrum.clone(), lanes.clone());
     let last_frame = Cell::new(0i64);
     // meters and the spectrum animate at 30 Hz, not at the refresh rate
     let cap = crate::dash::FrameCap::new();
@@ -2574,7 +2593,9 @@ pub fn activate(app: &adw::Application) {
         }
         // the bottom spectrum reads the bus tap's bands (no pw-record of its own)
         let src = st3.spectra.borrow().get(&format!("bus:{}", sp3.target())).cloned();
-        sp3.step(dt, src.as_ref());
+        for l in lanes3.iter() {
+            l.step(dt, src.as_ref());
+        }
         stems_view::step(&st3, dt);
         piano_view::step(&st3, dt);
         glib::ControlFlow::Continue

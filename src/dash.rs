@@ -674,6 +674,21 @@ pub struct Spectrum {
     target: std::cell::RefCell<String>,
     born: Instant,
     compact: std::cell::Cell<bool>,
+    /// bands [lo, hi) this view draws, stretched across its width (#23 lanes)
+    range: std::cell::Cell<(usize, usize)>,
+    /// lane name drawn top-left (empty: none)
+    title: std::cell::RefCell<String>,
+}
+
+/// Band index (0..=BANDS) whose lower edge is nearest to `f` Hz on the analyser's log axis.
+pub fn band_of(f: f64) -> usize {
+    let x = (f / F_LO).ln() / (F_HI / F_LO).ln() * BANDS as f64;
+    (x.round().max(0.0) as usize).min(BANDS)
+}
+
+/// Lower edge in Hz of band `i` (i == BANDS gives the top edge).
+fn band_edge(i: usize) -> f64 {
+    F_LO * (F_HI / F_LO).powf(i as f64 / BANDS as f64)
 }
 
 impl Spectrum {
@@ -688,6 +703,8 @@ impl Spectrum {
             target: std::cell::RefCell::new(target.to_string()),
             born: Instant::now(),
             compact: std::cell::Cell::new(false),
+            range: std::cell::Cell::new((0, BANDS)),
+            title: std::cell::RefCell::new(String::new()),
         });
         let w = Rc::downgrade(&s);
         area.set_draw_func(move |_, cr, wd, ht| {
@@ -701,6 +718,21 @@ impl Spectrum {
     /// Compact layout for strips: no dB or Hz labels, bars use the whole area.
     pub fn set_compact(&self, on: bool) {
         self.compact.set(on);
+    }
+
+    /// Draw only bands [lo, hi) across the full width, as one lane of a split analyser.
+    pub fn set_range(&self, lo: usize, hi: usize) {
+        let hi = hi.min(BANDS);
+        let lo = lo.min(hi.saturating_sub(1));
+        self.range.set((lo, hi));
+        self.area.queue_draw();
+    }
+
+    /// Lane name drawn in the top-left corner.
+    pub fn set_title(&self, t: &str) {
+        *self.title.borrow_mut() = t.to_string();
+        self.area.set_tooltip_text(if t.is_empty() { None } else { Some(t) });
+        self.area.queue_draw();
     }
 
     /// Which bus this spectrum is labelled and keyed by.
@@ -739,20 +771,28 @@ impl Spectrum {
                 cr.move_to(4.0, y + 3.0);
                 let _ = cr.show_text(&if db == 0 { "0".to_string() } else { format!("-{db}") });
             }
-            let fx = |f: f64| lx + lw * (f / F_LO).ln() / (F_HI / F_LO).ln();
+            let (lo, hi) = self.range.get();
+            let (flo, fhi) = (band_edge(lo), band_edge(hi));
+            let fx = |f: f64| lx + lw * (f / flo).ln() / (fhi / flo).ln();
             cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
-            for (f, s) in [(50.0, "50"), (100.0, "100"), (250.0, "250"), (500.0, "500"), (1000.0, "1k"), (2500.0, "2.5k"), (5000.0, "5k"), (10000.0, "10k")] {
-                text_centered(cr, fx(f), ly + lh + 10.0, s);
+            for (f, s) in [(30.0, "30"), (50.0, "50"), (100.0, "100"), (150.0, "150"), (250.0, "250"), (500.0, "500"), (1000.0, "1k"), (2500.0, "2.5k"), (4000.0, "4k"), (5000.0, "5k"), (8000.0, "8k"), (10000.0, "10k"), (15000.0, "15k")] {
+                let x = fx(f);
+                // only labels inside this lane, and not crowding the edges
+                if f > flo && f < fhi && x > lx + 10.0 && x < lx + lw - 10.0 {
+                    text_centered(cr, x, ly + lh + 10.0, s);
+                }
             }
         }
         // bars: hue runs across the frequency range and slowly cycles
         let t = self.born.elapsed().as_secs_f64();
         let sh = self.shown.borrow();
         let pk = self.peaks.borrow();
-        let bw = lw / BANDS as f64;
-        for i in 0..BANDS {
+        let (lo, hi) = self.range.get();
+        let bw = lw / (hi - lo).max(1) as f64;
+        for i in lo..hi {
+            // hue keyed by the absolute band, so a frequency has the same colour in every lane
             let (r, g, b) = hsv(i as f64 / BANDS as f64 * 300.0 + t * 20.0, 0.75, 0.95);
-            let x = lx + i as f64 * bw;
+            let x = lx + (i - lo) as f64 * bw;
             let bh = sh[i] * lh;
             cr.set_source_rgba(r, g, b, 0.85);
             cr.rectangle(x, ly + lh - bh, (bw - 2.0).max(1.0), bh);
@@ -762,6 +802,15 @@ impl Spectrum {
             cr.set_source_rgba(r, g, b, 1.0);
             cr.rectangle(x, py - 1.5, (bw - 2.0).max(1.0), 1.5);
             let _ = cr.fill();
+        }
+        drop((sh, pk));
+        let title = self.title.borrow();
+        if !title.is_empty() {
+            cr.set_font_size(11.0);
+            cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.75);
+            cr.move_to(lx + 6.0, ly + 13.0);
+            let _ = cr.show_text(&title);
         }
     }
 }
