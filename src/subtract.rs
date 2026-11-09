@@ -958,6 +958,7 @@ pub struct SubTracker {
     onset_lock: bool,
     oct: bool,
     holdkey: bool,
+    decode: bool,
     dedouble: bool,
     poly: bool,
     /// Per key: the start frame of its last note.
@@ -1011,7 +1012,8 @@ impl SubTracker {
             onset_lock: env_on("MIXER_PIANO_ONSET", true),
             oct: env_on("MIXER_PIANO_OCT", false),
             holdkey: env_on("MIXER_PIANO_HOLDKEY", false),
-            dedouble: env_on("MIXER_PIANO_DEDOUBLE", false),
+            decode: env_on("MIXER_PIANO_DECODE", true),
+            dedouble: env_on("MIXER_PIANO_DEDOUBLE", true),
             poly: env_on("MIXER_PIANO_POLY", false),
             last_on: vec![0; KEYS],
             last_off: vec![0; KEYS],
@@ -1176,7 +1178,7 @@ impl SubTracker {
                 KeySeg::Idle => {
                     // hold: coming back within 300 ms of its own off is the same note decaying,
                     // not a new strike, unless it is a clear attack
-                    let fresh = !self.holdkey || i.saturating_sub(self.last_off[k]) > 26 || v - v3 >= tun("REBIRTH_DB", 9.0);
+                    let fresh = !(self.holdkey || self.decode) || i.saturating_sub(self.last_off[k]) > 26 || v - v3 >= tun("REBIRTH_DB", 9.0);
                     if fresh && v > on_db && (rise || v3 < on_db) {
                         KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i, rise: v - v3 }
                     } else {
@@ -1220,7 +1222,11 @@ impl SubTracker {
                 }
                 KeySeg::On { s, pk, below } => {
                     let pk = pk.max(v);
-                    let (rs_ok, drop, nbelow) = if self.holdkey {
+                    let (rs_ok, drop, nbelow) = if self.decode {
+                        // interval decoding (fixed lag): the note holds while the key comes back above
+                        // its floor within DECODE_LAG frames; it ends where it last was above
+                        (v - v3 >= tun("RESTRIKE_DB", 6.0) && at > s + 21, tun("OFF_DROP", 24.0), tun("DECODE_LAG", 26.0) as u8)
+                    } else if self.holdkey {
                         // hold: a re-strike needs a clear new attack on this key, 250 ms after the last
                         (v - v3 >= tun("RESTRIKE_DB", 6.0) && at > s + 21, tun("OFF_DROP", 24.0), tun("HOLD_BELOW", 8.0) as u8)
                     } else {
@@ -1233,7 +1239,8 @@ impl SubTracker {
                         let below = if v < off_db || v < pk - drop { below + 1 } else { 0 };
                         if below >= nbelow {
                             self.last_off[k] = i;
-                            evs.push(Ev::Off { t: Self::t(at.saturating_sub(2)), pitch });
+                            let back = if self.decode { below as u64 } else { 2 };
+                            evs.push(Ev::Off { t: Self::t(at.saturating_sub(back).max(s + 1)), pitch });
                             KeySeg::Idle
                         } else {
                             KeySeg::On { s, pk, below }
