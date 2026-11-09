@@ -94,8 +94,10 @@ pub fn serve(opts: Opts, backend: Arc<dyn Backend>) -> std::io::Result<Running> 
                     Ok((s, peer)) => {
                         let inner = inner.clone();
                         let _ = std::thread::Builder::new().name("remote-client".into()).spawn(move || {
-                            if let Err(e) = inner.conn(s) {
-                                eprintln!("wavelink remote: {peer}: {e}");
+                            match inner.conn(s) {
+                                Err(e) if e.contains("without closing handshake") => {}
+                                Err(e) => eprintln!("wavelink remote: {peer}: {e}"),
+                                Ok(()) => {}
                             }
                         });
                     }
