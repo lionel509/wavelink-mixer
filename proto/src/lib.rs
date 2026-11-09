@@ -169,6 +169,12 @@ pub struct Zone {
     pub buses: Vec<String>,
 }
 
+/// A host's output volume is 0..=100. Every place that writes one (diff, apply, commands) clamps through here
+/// so the client and the server always agree on the value.
+fn clamp_host_volume(v: u8) -> u8 {
+    v.min(100)
+}
+
 impl State {
     pub fn input(&self, id: &str) -> Option<&Input> {
         self.inputs.iter().find(|i| i.id == id)
@@ -204,7 +210,7 @@ impl State {
                 .is_some(),
             Delta::BusGain { bus, db } => self.bus_mut(bus).map(|b| b.gain_db = *db).is_some(),
             Delta::BusMute { bus, mute } => self.bus_mut(bus).map(|b| b.mute = *mute).is_some(),
-            Delta::HostVolume { host, volume } => self.host_mut(host).map(|h| h.volume = (*volume).min(100)).is_some(),
+            Delta::HostVolume { host, volume } => self.host_mut(host).map(|h| h.volume = clamp_host_volume(*volume)).is_some(),
             Delta::HostMute { host, mute } => self.host_mut(host).map(|h| h.mute = *mute).is_some(),
             Delta::HostOnline { host, online } => self.host_mut(host).map(|h| h.online = *online).is_some(),
         }
@@ -251,8 +257,8 @@ impl State {
             }
         }
         for (a, b) in self.hosts.iter().zip(&new.hosts) {
-            if a.volume != b.volume {
-                v.push(Delta::HostVolume { host: b.id.clone(), volume: b.volume });
+            if clamp_host_volume(a.volume) != clamp_host_volume(b.volume) {
+                v.push(Delta::HostVolume { host: b.id.clone(), volume: clamp_host_volume(b.volume) });
             }
             if a.mute != b.mute {
                 v.push(Delta::HostMute { host: b.id.clone(), mute: b.mute });
@@ -608,7 +614,7 @@ pub mod safety {
             }
             Command::SetHostVolume { host: h, volume } => {
                 let hs = host(h)?;
-                let mut got = (*volume).min(100);
+                let mut got = clamp_host_volume(*volume);
                 let ceil = hs.volume.saturating_add(MAX_HOST_STEP).min(100);
                 if got > hs.volume && got > ceil {
                     got = ceil;
