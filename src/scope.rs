@@ -41,7 +41,15 @@ pub struct NoteScope {
     target: RefCell<String>,
     /// (zone start Hz, name, colour) ascending
     zones: RefCell<Vec<(f64, String, (f64, f64, f64))>>,
+    /// COLS x 88 per-key spectrogram from the piano tracker (one row per key, A0..C8)
+    kimg: RefCell<cairo::ImageSurface>,
+    /// per column: did it get a key frame (the piano tracker was running)?
+    kvalid: RefCell<Vec<bool>>,
+    know: RefCell<Vec<f32>>,
+    chord: RefCell<String>,
 }
+
+const KEYS: usize = 88;
 
 fn hz(p: f64) -> f64 {
     440.0 * 2f64.powf((p - 69.0) / 12.0)
@@ -71,6 +79,10 @@ impl NoteScope {
             notes: RefCell::new(Vec::new()),
             target: RefCell::new(target.to_string()),
             zones: RefCell::new(Vec::new()),
+            kimg: RefCell::new(cairo::ImageSurface::create(cairo::Format::ARgb32, COLS as i32, KEYS as i32).expect("scope key surface")),
+            kvalid: RefCell::new(vec![false; COLS]),
+            know: RefCell::new(Vec::new()),
+            chord: RefCell::new(String::new()),
         });
         let w = Rc::downgrade(&s);
         area.set_draw_func(move |_, cr, wd, ht| {
@@ -131,6 +143,41 @@ impl NoteScope {
         now.extend((0..BANDS).map(|i| bands.get(i).copied().unwrap_or(0.0)));
     }
 
+    /// One frame of the piano tracker's per-key salience (88 values, A0..C8, 0..1), or None when the
+    /// tracker isn't running. Call right after `push_bands` (it fills the column that call wrote).
+    pub fn push_keys(&self, keys: Option<&[f32]>) {
+        let col = (self.head.get() + COLS - 1) % COLS;
+        self.kvalid.borrow_mut()[col] = keys.is_some();
+        let mut know = self.know.borrow_mut();
+        know.clear();
+        let Some(keys) = keys else { return };
+        know.extend_from_slice(&keys[..keys.len().min(KEYS)]);
+        let mut img = self.kimg.borrow_mut();
+        img.flush();
+        let stride = img.stride() as usize;
+        let tints: Vec<(f64, f64, f64)> = (0..KEYS).map(|k| self.zone_rgb(hz(21.0 + k as f64))).collect();
+        if let Ok(mut data) = img.data() {
+            for k in 0..KEYS {
+                let v = keys.get(k).copied().unwrap_or(0.0).clamp(0.0, 1.0) as f64;
+                let a = v.powf(0.8);
+                let (r, g, b) = tints[k];
+                let o = (KEYS - 1 - k) * stride + col * 4;
+                data[o] = (b * a * 255.0) as u8;
+                data[o + 1] = (g * a * 255.0) as u8;
+                data[o + 2] = (r * a * 255.0) as u8;
+                data[o + 3] = 255;
+            }
+        }
+        img.mark_dirty();
+    }
+
+    /// Detected chord name shown top-left (empty: none).
+    pub fn set_chord(&self, c: &str) {
+        if *self.chord.borrow() != c {
+            *self.chord.borrow_mut() = c.to_string();
+        }
+    }
+
     pub fn set_notes(&self, n: Vec<Mark>) {
         *self.notes.borrow_mut() = n;
     }
@@ -168,6 +215,39 @@ impl NoteScope {
                 cr.source().set_filter(cairo::Filter::Good);
                 let _ = cr.paint();
                 cr.restore().ok();
+            }
+        }
+
+        // per-key spectrogram over the piano range (one row per key), where the tracker ran
+        {
+            let kimg = self.kimg.borrow();
+            let valid = self.kvalid.borrow();
+            let head = self.head.get();
+            let cw = gw / COLS as f64;
+            let (ytop, ybot) = (py(108.5), py(20.5));
+            let mut i = 0;
+            while i < COLS {
+                let c = (head + i) % COLS;
+                if !valid[c] {
+                    i += 1;
+                    continue;
+                }
+                // a run of valid columns, contiguous in the ring
+                let mut j = i;
+                while j < COLS && valid[(head + j) % COLS] && (head + j) % COLS >= c {
+                    j += 1;
+                }
+                let n = j - i;
+                cr.save().ok();
+                cr.rectangle(gx + i as f64 * cw, ytop, n as f64 * cw, ybot - ytop);
+                cr.clip();
+                cr.translate(gx + (i as f64 - c as f64) * cw, ytop);
+                cr.scale(cw, (ybot - ytop) / KEYS as f64);
+                let _ = cr.set_source_surface(&*kimg, 0.0, 0.0);
+                cr.source().set_filter(cairo::Filter::Fast);
+                let _ = cr.paint();
+                cr.restore().ok();
+                i = j;
             }
         }
 
@@ -250,18 +330,41 @@ impl NoteScope {
             let _ = cr.show_text(s);
         }
 
-        // now: the current spectrum as horizontal bars on the right
+        // now: the current spectrum as horizontal bars on the right; one bar per key when the piano
+        // tracker runs (88 bars over the keyboard range), the bus bands elsewhere
         let now = self.now.borrow();
+        let know = self.know.borrow();
         let nx = gx + gw + 4.0;
         let bh = gh / BANDS as f64;
+        let key_top = py(108.5);
+        for (k, v) in know.iter().enumerate() {
+            let p = 21.0 + k as f64;
+            let (yt, yb) = (py(p + 0.5), py(p - 0.5));
+            let (r, g, b) = self.zone_rgb(hz(p));
+            cr.set_source_rgba(r, g, b, 0.95);
+            cr.rectangle(nx, yt + 0.2, (*v as f64).clamp(0.0, 1.0) * (NOW_W - 6.0), (yb - yt - 0.4).max(0.6));
+            let _ = cr.fill();
+        }
         for i in 0..BANDS {
             let v = now.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0) as f64;
             let f = F_LO * (F_HI / F_LO).powf((i as f64 + 0.5) / BANDS as f64);
             let (r, g, b) = self.zone_rgb(f);
             cr.set_source_rgba(r, g, b, 0.9);
             let y = gy + gh - (i as f64 + 1.0) * bh;
+            if !know.is_empty() && y + bh > key_top {
+                continue;
+            }
             cr.rectangle(nx, y + 0.5, v * (NOW_W - 6.0), (bh - 1.0).max(0.8));
             let _ = cr.fill();
+        }
+        // detected chord
+        let chord = self.chord.borrow();
+        if !chord.is_empty() {
+            cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+            cr.set_font_size(18.0);
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.9);
+            cr.move_to(gx + 8.0, gy + 22.0);
+            let _ = cr.show_text(&chord);
         }
         // playhead and time labels
         cr.set_source_rgba(1.0, 1.0, 1.0, 0.6);
