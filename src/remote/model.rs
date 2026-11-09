@@ -39,6 +39,7 @@ pub fn to_state(cfg: &Config, server: &str, rev: u64, caps: &BTreeMap<String, f6
                 mute: b.mute,
                 outputs,
                 max_db: super::settings::cap_for(caps, b),
+                ceiling_db: super::settings::ceiling_for(b),
             }
         })
         .collect();
@@ -93,7 +94,8 @@ pub fn apply(cfg: &mut Config, cmd: &p::Command) -> bool {
             }
             None => false,
         },
-        p::Command::SetBusGain { bus, db, .. } => cfg.buses.iter_mut().find(|b| &b.id == bus).map(|b| b.gain_db = *db).is_some(),
+        // never above the bus's hard ceiling (#35), whatever the command says
+        p::Command::SetBusGain { bus, db, .. } => cfg.buses.iter_mut().find(|b| &b.id == bus).map(|b| b.gain_db = b.clamp_db(*db)).is_some(),
         p::Command::SetBusMute { bus, mute } => cfg.buses.iter_mut().find(|b| &b.id == bus).map(|b| b.mute = *mute).is_some(),
     }
 }

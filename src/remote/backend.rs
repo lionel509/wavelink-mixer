@@ -43,6 +43,13 @@ impl PwBackend {
         None
     }
 
+    /// Node id and whether its props say AirPlay (for the #35 ceiling).
+    fn node(&self, name: &str) -> Option<(u64, bool)> {
+        let id = self.node_id(name)?;
+        let g = self.graph.lock().unwrap_or_else(|e| e.into_inner());
+        Some((id, g.1.as_ref().and_then(|gr| gr.node(name)).map_or(false, |n| n.raop)))
+    }
+
     fn graph(&self) -> Option<Graph> {
         let mut g = self.graph.lock().unwrap_or_else(|e| e.into_inner());
         if g.0.elapsed() > Duration::from_secs(2) || g.1.is_none() {
@@ -74,17 +81,22 @@ impl Backend for PwBackend {
             }
             // auto-normalize runs in the GUI (it owns the IN meter taps); the flag/target travel through config.json
             p::Command::SetNormalize { .. } => {}
+            // buses: never above the ceiling, including one only the node's props reveal (#35);
+            // volume before any unmute, in one ordered child
             p::Command::SetBusGain { bus, db, .. } => {
                 if let Some(b) = cfg.buses.iter().find(|b| &b.id == bus) {
-                    if let Some(id) = self.node_id(&crate::engine::bus_fader_node(b)) {
-                        pw::set_volume(id, db_to_vol(*db));
+                    if let Some((id, raop)) = self.node(&crate::engine::bus_fader_node(b)) {
+                        pw::set_volume(id, db_to_vol(db.min(b.ceiling_for(raop))));
                     }
                 }
             }
             p::Command::SetBusMute { bus, mute } => {
                 if let Some(b) = cfg.buses.iter().find(|b| &b.id == bus) {
-                    if let Some(id) = self.node_id(&crate::engine::bus_fader_node(b)) {
-                        pw::set_mute(id, *mute);
+                    if let Some((id, raop)) = self.node(&crate::engine::bus_fader_node(b)) {
+                        match &b.kind {
+                            crate::config::BusKind::Hardware { .. } => pw::set_volume_mute(id, db_to_vol(b.gain_db.min(b.ceiling_for(raop))), *mute),
+                            _ => pw::set_mute(id, *mute),
+                        }
                     }
                 }
             }
