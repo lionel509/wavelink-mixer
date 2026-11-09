@@ -36,7 +36,12 @@ pub struct Channel {
     pub hold: f64,          // seconds of manual hold left
     pub since_emit: f64,
     pub emitted: f64,       // last value handed to the slider
+    pub fixed: bool,        // #28: `out` was set explicitly on the Target slider; his fader moves no longer re-anchor it
 }
+
+/// Range of the Target slider (#28), dBFS short-term loudness.
+pub const TARGET_MIN_DB: f64 = -45.0;
+pub const TARGET_MAX_DB: f64 = -6.0;
 
 impl Channel {
     /// A channel he never touched: aims at TARGET_DB with auto's full range around 0 dB.
@@ -44,7 +49,7 @@ impl Channel {
         Channel {
             gain: gain_db, base: 0.0, out: TARGET_DB, pending: false, loud: None,
             acc: 0.0, wsum: 0.0, facc: 0.0, fwsum: 0.0, heard: 0.0, quiet: 0.0,
-            hold: 0.0, since_emit: MIN_EMIT_S, emitted: gain_db,
+            hold: 0.0, since_emit: MIN_EMIT_S, emitted: gain_db, fixed: false,
         }
     }
 
@@ -64,6 +69,18 @@ impl Channel {
     /// What a restart needs (the ui copies it into config): his position, and his level once anchored.
     pub fn saved(&self) -> (Option<f64>, Option<f64>) {
         (Some(self.base), (!self.pending).then_some(self.out))
+    }
+
+    /// #28: his explicit target loudness from the Target slider. It wins over the anchored level and
+    /// stays until he sets another one; auto starts moving toward it at once.
+    pub fn set_target(&mut self, out_db: f64) {
+        if !out_db.is_finite() {
+            return;
+        }
+        self.out = out_db.clamp(TARGET_MIN_DB, TARGET_MAX_DB);
+        self.pending = false;
+        self.fixed = true;
+        self.hold = 0.0;
     }
 
     /// N off: forget the loudness (stale by the time N is back on); keep his position, his level and a running hold.
@@ -97,6 +114,10 @@ impl Channel {
         self.emitted = g;
         self.base = g;
         self.hold = MANUAL_HOLD_S;
+        if self.fixed {
+            // an explicit target stays; his move only sets the position auto's range is centred on
+            return;
+        }
         match self.loud_db() {
             Some(l) if self.heard >= SETTLE_S && self.quiet == 0.0 => {
                 self.out = l + g;
@@ -182,6 +203,28 @@ mod tests {
     fn unit(x: &mut u64) -> f64 {
         *x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         (*x >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    #[test]
+    fn explicit_target_is_reached_and_survives_manual_moves() {
+        let mut c = Channel::new(0.0);
+        // 10 s of -30 dBFS audio, target -20: auto must raise the slider toward +10 dB (capped by MAX_BOOST)
+        c.set_target(-20.0);
+        let mut g = 0.0;
+        for _ in 0..1000 {
+            if let Some(x) = c.step(-30.0, 0.01) {
+                g = x;
+            }
+        }
+        assert!((g - 10.0).abs() <= 1.0, "slider {g} should approach +10 dB");
+        // his fader move keeps the explicit target
+        c.manual(2.0);
+        assert!(c.fixed && (c.out + 20.0).abs() < 1e-9);
+        // out-of-range and non-finite targets are clamped/ignored
+        c.set_target(10.0);
+        assert_eq!(c.out, TARGET_MAX_DB);
+        c.set_target(f64::NAN);
+        assert_eq!(c.out, TARGET_MAX_DB);
     }
 
     #[test]

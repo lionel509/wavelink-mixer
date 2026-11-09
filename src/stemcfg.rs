@@ -143,6 +143,7 @@ pub fn ensure_channel(cfg: &mut Config, source: &str) -> bool {
         normalize: false,
         norm_base: None,
         norm_out: None,
+        norm_target: None,
     });
     true
 }
@@ -200,6 +201,7 @@ mod tests {
             normalize: false,
             norm_base: None,
             norm_out: None,
+            norm_target: None,
         }
     }
 

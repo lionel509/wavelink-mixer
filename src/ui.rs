@@ -1324,13 +1324,63 @@ impl App {
         // auto-normalize: the IN tap's pre-fader RMS drives the real slider (no extra tap)
         // auto-normalize: one channel per input for the whole session (N only gates `step`), resumed from the saved state
         if !self.norm.borrow().contains_key(&id) {
-            self.norm.borrow_mut().insert(id.clone(), crate::norm::Channel::resume(inp.gain_db, inp.norm_base, inp.norm_out));
+            let mut ch = crate::norm::Channel::resume(inp.gain_db, inp.norm_base, inp.norm_out);
+            if let Some(t) = inp.norm_target {
+                ch.set_target(t);
+            }
+            self.norm.borrow_mut().insert(id.clone(), ch);
             self.norm_store(&id);
         }
+        // #28: with N on the fader splits in two: the gain fader (auto moves it) and a Target slider,
+        // the loudness he wants this channel kept at. "now" shows the measured loudness.
+        let tgt_col = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        tgt_col.set_margin_top(8);
+        tgt_col.set_margin_bottom(52);
+        let tgt = gtk::Scale::with_range(gtk::Orientation::Vertical, crate::norm::TARGET_MIN_DB, crate::norm::TARGET_MAX_DB, 0.5);
+        tgt.set_inverted(true);
+        tgt.set_draw_value(false);
+        tgt.set_vexpand(true);
+        tgt.set_halign(gtk::Align::Center);
+        tgt.set_tooltip_text(Some("Normalize target: the loudness N keeps this channel at (short-term dBFS). Drag to set it."));
+        tgt.update_property(&[gtk::accessible::Property::Label(&format!("{} normalize target", inp.name))]);
+        let tgt_val = label("", "small");
+        let tgt_now = label("", "small");
+        tgt_now.set_tooltip_text(Some("Measured loudness right now"));
+        let start = self.norm.borrow().get(&id).map(|c| c.out).unwrap_or(crate::norm::TARGET_DB);
+        tgt.set_value(start.clamp(crate::norm::TARGET_MIN_DB, crate::norm::TARGET_MAX_DB));
+        tgt_val.set_label(&format!("{:.0}", tgt.value()));
+        tgt_col.append(&tgt);
+        tgt_col.append(&tgt_val);
+        tgt_col.append(&tgt_now);
+        tgt_col.append(&label("TGT", "small"));
+        tgt_col.set_visible(inp.normalize);
+        {
+            let (app, id2, val) = (self.clone(), id.clone(), tgt_val.clone());
+            tgt.connect_value_changed(move |sc| {
+                let v = (sc.value() * 2.0).round() / 2.0;
+                if let Some(c) = app.norm.borrow_mut().get_mut(&id2) {
+                    c.set_target(v);
+                }
+                if let Some(i) = app.cfg.borrow_mut().inputs.iter_mut().find(|i| i.id == id2) {
+                    i.norm_target = Some(v);
+                }
+                app.norm_store(&id2);
+                val.set_label(&format!("{v:.0}"));
+                app.mark_dirty();
+            });
+        }
         if let Some(pre) = self.levels.borrow().get(&format!("pre:{id}")).cloned() {
-            let (w, id2, fw) = (Rc::downgrade(self), id.clone(), Rc::downgrade(&fader_rc));
+            let (w, id2, fw, nw) = (Rc::downgrade(self), id.clone(), Rc::downgrade(&fader_rc), tgt_now.downgrade());
             self.console_ticks.borrow_mut().push(Box::new(move |dt| {
                 let (Some(app), Some(f)) = (w.upgrade(), fw.upgrade()) else { return };
+                if let Some(n) = nw.upgrade() {
+                    if n.is_mapped() {
+                        let t = app.norm.borrow().get(&id2).and_then(|c| c.loud_db()).map(|l| format!("{l:.0}")).unwrap_or_else(|| "–".into());
+                        if n.label() != t {
+                            n.set_label(&t);
+                        }
+                    }
+                }
                 let on = app.cfg.borrow().inputs.iter().any(|i| i.id == id2 && i.normalize);
                 let (g, anchored) = match app.norm.borrow_mut().get_mut(&id2) {
                     Some(c) if on => {
@@ -1364,6 +1414,7 @@ impl App {
         };
         row.append(&meter_col(&in_led, "IN"));
         row.append(&fb);
+        row.append(&tgt_col);
         row.append(&meter_col(&led, "OUT"));
         strip.append(&row);
         strip.append(&self.side_row(format!("in:{id}")));
@@ -1473,9 +1524,10 @@ impl App {
             n_btn.set_tooltip_text(Some("Auto-normalize: moves this slider to keep the channel at an even loudness (saved)"));
             n_btn.set_active(inp.normalize);
             {
-                let (app, id2) = (self.clone(), id.clone());
+                let (app, id2, tc) = (self.clone(), id.clone(), tgt_col.clone());
                 n_btn.connect_toggled(move |b| {
                     let on = b.is_active();
+                    tc.set_visible(on);
                     {
                         let mut c = app.cfg.borrow_mut();
                         if let Some(i) = c.inputs.iter_mut().find(|i| i.id == id2) {
@@ -1785,6 +1837,7 @@ impl App {
                     normalize: false,
                     norm_base: None,
                     norm_out: None,
+                    norm_target: None,
                 });
             }
             entry.set_text("");

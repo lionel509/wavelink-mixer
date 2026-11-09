@@ -182,6 +182,9 @@ pub struct Input {
     /// Auto-normalize: his wanted output level (dBFS) anchored from that position; None while pending.
     #[serde(default)]
     pub norm_out: Option<f64>,
+    /// #28: his explicit normalize target (dBFS) from the Target slider; None = the anchored level.
+    #[serde(default)]
+    pub norm_target: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -380,7 +383,7 @@ impl Config {
         };
         let input = |id: &str, name: &str, color: &str, fx: &str, routes| Input {
             id: id.into(), name: name.into(), color: color.into(), kind: InputKind::Virtual, fx: fx.into(),
-            eq: flat_eq(), gain_db: 0.0, mute: false, routes, default_sink: id == "system", rack: Rack::default(), normalize: false, norm_base: None, norm_out: None,
+            eq: flat_eq(), gain_db: 0.0, mute: false, routes, default_sink: id == "system", rack: Rack::default(), normalize: false, norm_base: None, norm_out: None, norm_target: None,
         };
         Config {
             piano: PianoCfg::default(),
@@ -395,7 +398,7 @@ impl Config {
                     id: "mic".into(), name: "Mic".into(), color: "#bf5af2".into(),
                     kind: InputKind::Source { target: "easyeffects_source".into() },
                     fx: "clean".into(), eq: flat_eq(), gain_db: 0.0, mute: false,
-                    routes: r(&[("b1", true, 0.0), ("b2", true, 0.0)]), default_sink: false, rack: Rack::default(), normalize: false, norm_base: None, norm_out: None,
+                    routes: r(&[("b1", true, 0.0), ("b2", true, 0.0)]), default_sink: false, rack: Rack::default(), normalize: false, norm_base: None, norm_out: None, norm_target: None,
                 },
             ],
             buses: vec![
@@ -502,6 +505,7 @@ mod tests {
             normalize: true,
             norm_base: None,
             norm_out: None,
+            norm_target: None,
         };
         let s = serde_json::to_string(&i).unwrap();
         let back: Input = serde_json::from_str(&s).unwrap();
@@ -529,6 +533,7 @@ mod tests {
             normalize: true,
             norm_base: Some(-18.0),
             norm_out: Some(-26.0),
+            norm_target: Some(-18.0),
         };
         let s = serde_json::to_string(&i).unwrap();
         let back: Input = serde_json::from_str(&s).unwrap();
