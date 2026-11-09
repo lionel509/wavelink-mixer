@@ -14,6 +14,76 @@ use std::fmt::Write as _;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
+/// How long the child graph may go without a missing node appearing before it counts as stuck.
+/// Scales with graph size (each node costs a few ms of creation plus its buffer negotiation) and
+/// backs off exponentially after consecutive restarts that did not produce a complete graph.
+pub fn graph_patience(expected_nodes: usize, consecutive_restarts: u32) -> Duration {
+    let base_ms = 8_000 + 150 * expected_nodes as u64;
+    Duration::from_millis((base_ms << consecutive_restarts.min(4)).min(120_000))
+}
+
+/// Tracks progress of a freshly spawned child graph toward "every expected node exists".
+#[derive(Debug, Default)]
+pub struct Settle {
+    best_missing: Option<usize>,
+    progress_at: Option<Instant>,
+}
+
+impl Settle {
+    pub fn reset(&mut self, now: Instant) {
+        self.best_missing = None;
+        self.progress_at = Some(now);
+    }
+    /// Feed the current number of missing nodes; true when the graph is stuck (the missing set
+    /// has not shrunk for `patience`) and the child should be restarted. Never true while the
+    /// set is still shrinking, and never true for a complete graph.
+    pub fn stuck(&mut self, missing: usize, now: Instant, patience: Duration) -> bool {
+        if missing == 0 {
+            self.best_missing = Some(0);
+            self.progress_at = Some(now);
+            return false;
+        }
+        if self.best_missing.map_or(true, |b| missing < b) {
+            self.best_missing = Some(missing);
+            self.progress_at = Some(now);
+            return false;
+        }
+        now.duration_since(self.progress_at.unwrap_or(now)) >= patience
+    }
+}
+
+/// Spawn the child graph with the open-file limit raised to the hard limit. Every node and link
+/// of the graph costs several fds (memfds, eventfds, sockets) in the process hosting it, and the
+/// default soft limit of 1024 is exhausted at ~8 inputs x 5 buses: "can't DUP fd: Too many open
+/// files", then "invalid mem id" / "Buffer allocation failed". Only this child is raised, so the
+/// engine and its other children keep the default (select()-safe) limit.
+fn spawn_graph_child(conf: &std::path::Path) -> Option<Child> {
+    use std::os::unix::process::CommandExt;
+    #[repr(C)]
+    struct RLimit { cur: u64, max: u64 }
+    extern "C" {
+        fn getrlimit(res: std::ffi::c_int, r: *mut RLimit) -> std::ffi::c_int;
+        fn setrlimit(res: std::ffi::c_int, r: *const RLimit) -> std::ffi::c_int;
+    }
+    const RLIMIT_NOFILE: std::ffi::c_int = 7;
+    let mut cmd = Command::new("pipewire");
+    cmd.arg("-c").arg(conf).stdout(Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            let mut r = RLimit { cur: 0, max: 0 };
+            if getrlimit(RLIMIT_NOFILE, &mut r) == 0 {
+                let want = r.max.min(1 << 20);
+                if want > r.cur {
+                    r.cur = want;
+                    setrlimit(RLIMIT_NOFILE, &r);
+                }
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn().ok()
+}
+
 const CAPS: &str = "/usr/lib64/ladspa/caps.so";
 const RNNOISE: &str = "/usr/lib64/ladspa/librnnoise_ladspa.so";
 const DELAY: &str = "/usr/lib64/ladspa/delay.so";
@@ -323,7 +393,8 @@ pub fn run() {
     let mut child_structure = String::new();
     let mut child_started = Instant::now() - Duration::from_secs(60);
     let mut levels_pending = false;
-    let mut missing_ticks = 0u32;
+    let mut settle = Settle::default();
+    let mut stuck_restarts = 0u32;
     let mut hw: HashMap<String, (Child, String)> = HashMap::new();
     // piano synth (FluidSynth) feeding the "piano" input channel; stdin kept open = stays alive
     let mut piano: Option<(Child, std::process::ChildStdin)> = None;
@@ -383,22 +454,26 @@ pub fn run() {
             .into_iter()
             .filter(|(n, dep)| !g.has(n) && dep.as_ref().map(|d| g.has(d)).unwrap_or(true))
             .collect();
-        missing_ticks = if missing.is_empty() { 0 } else { missing_ticks + 1 };
-        let need_restart = !alive || structure != child_structure || missing_ticks >= 4;
+        if missing.is_empty() {
+            stuck_restarts = 0;
+        }
+        let stuck = settle.stuck(missing.len(), Instant::now(), graph_patience(expected(&cfg).len(), stuck_restarts));
+        let need_restart = !alive || structure != child_structure || stuck;
         if need_restart && child_started.elapsed() > Duration::from_secs(5) {
             if let Some(mut c) = child.take() {
                 let _ = c.kill();
                 let _ = c.wait();
             }
-            if missing_ticks >= 4 {
-                eprintln!("restarting graph, missing: {:?}", missing.iter().map(|m| &m.0).collect::<Vec<_>>());
+            if stuck {
+                stuck_restarts += 1;
+                eprintln!("restarting graph (stuck, attempt {stuck_restarts}), missing: {:?}", missing.iter().map(|m| &m.0).collect::<Vec<_>>());
             }
             let _ = std::fs::write(&conf_file, child_conf(&cfg));
-            child = Command::new("pipewire").arg("-c").arg(&conf_file).stdout(Stdio::null()).spawn().ok();
+            child = spawn_graph_child(&conf_file);
             child_structure = structure;
             child_started = Instant::now();
             levels_pending = true;
-            missing_ticks = 0;
+            settle.reset(Instant::now());
             std::thread::sleep(Duration::from_millis(1500));
             continue;
         }
@@ -479,5 +554,63 @@ pub fn run() {
             levels_pending = false;
         }
         std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn patience_scales_with_size_and_backs_off() {
+        assert!(graph_patience(56, 0) > Duration::from_secs(5) + Duration::from_millis(1500));
+        assert!(graph_patience(130, 0) > graph_patience(56, 0));
+        assert_eq!(graph_patience(56, 1), graph_patience(56, 0) * 2);
+        assert_eq!(graph_patience(56, 40), graph_patience(56, 4).min(Duration::from_secs(120)));
+        assert!(graph_patience(500, 9) <= Duration::from_secs(120));
+    }
+
+    #[test]
+    fn never_restarts_while_missing_set_shrinks() {
+        let t0 = Instant::now();
+        let p = Duration::from_secs(10);
+        let mut s = Settle::default();
+        s.reset(t0);
+        // one node appears every 9 s for 10 minutes: always progress, never stuck
+        for k in 0..60u64 {
+            assert!(!s.stuck(100 - k as usize, t0 + Duration::from_secs(9 * k), p));
+        }
+    }
+
+    #[test]
+    fn restarts_when_stuck_and_never_when_complete() {
+        let t0 = Instant::now();
+        let p = Duration::from_secs(10);
+        let mut s = Settle::default();
+        s.reset(t0);
+        assert!(!s.stuck(3, t0, p));
+        assert!(!s.stuck(3, t0 + Duration::from_secs(9), p));
+        assert!(s.stuck(3, t0 + Duration::from_secs(10), p));
+        assert!(!s.stuck(0, t0 + Duration::from_secs(500), p));
+        // the old rule gave a 28-node graph ~5.5 s; it must now outlast that
+        s.reset(t0);
+        assert!(!s.stuck(28, t0 + Duration::from_millis(5500), graph_patience(56, 0)));
+    }
+
+    /// A large synthetic config: the child conf names every expected node exactly once.
+    #[test]
+    fn large_config_conf_covers_expected_nodes() {
+        let mut cfg = Config::default_config();
+        let tmpl = cfg.inputs[0].clone();
+        let bus = cfg.buses[0].clone();
+        while cfg.inputs.len() < 10 { let mut i = tmpl.clone(); i.id = format!("x{}", cfg.inputs.len()); i.name = i.id.clone(); cfg.inputs.push(i); }
+        while cfg.buses.len() < 6 { let mut b = bus.clone(); b.id = format!("y{}", cfg.buses.len()); b.name = b.id.clone(); cfg.buses.push(b); }
+        let conf = child_conf(&cfg);
+        for (n, _) in expected(&cfg) {
+            if n.starts_with("route_") || n.starts_with("strip_") {
+                assert_eq!(conf.matches(&format!("node.name = \"{n}\"")).count(), 1, "{n}");
+            }
+        }
+        assert!(expected(&cfg).len() >= 10 * 6);
     }
 }
