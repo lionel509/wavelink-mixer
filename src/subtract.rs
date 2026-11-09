@@ -1028,6 +1028,8 @@ pub struct SubTracker {
     sh: Vec<[f32; 4]>,
     attack: bool,
     attack_rebirth: bool,
+    /// The key's own attack (short window) also counts as its onset for the onset lock.
+    attack_lock: bool,
     /// Notes refused by the gates (for the harness).
     pub blocked: usize,
 }
@@ -1085,6 +1087,7 @@ impl SubTracker {
             lvl: vec![-120.0; KEYS],
             sh: vec![[-120.0; 4]; KEYS],
             attack_rebirth: env_on("MIXER_PIANO_ATTACK_REBIRTH", false),
+            attack_lock: env_on("MIXER_PIANO_ATTACK_LOCK", true),
             attack: env_on("MIXER_PIANO_ATTACK", true),
             lvl_rule: env_on("MIXER_PIANO_LEVELRULE", true),
             blocked: 0,
@@ -1289,7 +1292,7 @@ impl SubTracker {
                     let kr_re = if self.lvl_rule { (v - (self.lvl[k] - tun("LVL_DECAY", 25.0) * fs * since as f32) - gshift).min(kr) } else { kr };
                     let fresh = !(self.holdkey || self.decode) || since > 26 || kr_re >= tun("REBIRTH_DB", 9.0) || (self.attack_rebirth && att >= tun("ATTACK_DB", 11.0));
                     if fresh && v > on_db && (rise || v3 < on_db) {
-                        KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i, rise: kr }
+                        KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i, rise: if self.attack_lock { kr.max(att) } else { kr } }
                     } else {
                         KeySeg::Idle
                     }
@@ -1299,7 +1302,7 @@ impl SubTracker {
                         KeySeg::Idle
                     } else if rise && v > on_db {
                         // a fresh attack on a blocked key gets a new chance
-                        KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i, rise: kr }
+                        KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i, rise: if self.attack_lock { kr.max(att) } else { kr } }
                     } else {
                         KeySeg::Blocked
                     }
@@ -1349,7 +1352,7 @@ impl SubTracker {
                     };
                     if rs_ok && v > on_db {
                         evs.push(Ev::Off { t: Self::t(at.saturating_sub(1)), pitch });
-                        KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i, rise: kr }
+                        KeySeg::Pending { s: at.saturating_sub(1), pk: v, i0: i, rise: if self.attack_lock { kr.max(att) } else { kr } }
                     } else {
                         let below = if v < off_db || v < pk - drop { below + 1 } else { 0 };
                         if below >= nbelow {

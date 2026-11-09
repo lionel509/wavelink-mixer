@@ -322,6 +322,9 @@ pub fn eval(mono: &[f32], sections: &[(String, f64, f64)]) -> String {
                         late_on += 1;
                     } else {
                         absent += 1;
+                        if std::env::var_os("PIANO_EVAL_ABSENT").is_some() {
+                            eprintln!("absent: {} at {:.2}", g.pitch, g.t);
+                        }
                     }
                 }
                 let mut offs: Vec<i32> = gt
