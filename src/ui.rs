@@ -156,6 +156,8 @@ struct Fader {
     mute: Option<gtk::ToggleButton>,
     /// row holding M (strips add S next to it)
     btns: gtk::Box,
+    /// holds the fader; #28 adds the Target half next to it when N is on
+    pair: gtk::Box,
     updating: Cell<bool>,
     busy: Cell<u32>,
     /// true while auto-normalize moves the slider (its moves are not his, so they are not saved at once)
@@ -1062,7 +1064,12 @@ impl App {
             m.set_tooltip_text(Some("Mute"));
             m
         });
-        b.append(&scale);
+        // the fader sits in a row so normalize can split it into two halves (#28)
+        let pair = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        pair.set_halign(gtk::Align::Center);
+        pair.set_vexpand(true);
+        pair.append(&scale);
+        b.append(&pair);
         b.append(&lab);
         let btns = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         btns.set_halign(gtk::Align::Center);
@@ -1070,7 +1077,7 @@ impl App {
         if let Some(m) = &mute {
             btns.append(m);
         }
-        let f = Rc::new(Fader { node: RefCell::new(node), scale, label: lab, mute, btns, updating: Cell::new(false), busy: Cell::new(0), auto: Cell::new(false) });
+        let f = Rc::new(Fader { node: RefCell::new(node), scale, label: lab, mute, btns, pair, updating: Cell::new(false), busy: Cell::new(0), auto: Cell::new(false) });
         // double-click the dB label area resets to 0 dB
         let gest = gtk::GestureClick::new();
         let fw = Rc::downgrade(&f);
@@ -1331,29 +1338,29 @@ impl App {
             self.norm.borrow_mut().insert(id.clone(), ch);
             self.norm_store(&id);
         }
-        // #28: with N on the fader splits in two: the gain fader (auto moves it) and a Target slider,
-        // the loudness he wants this channel kept at. "now" shows the measured loudness.
-        let tgt_col = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        tgt_col.set_margin_top(8);
-        tgt_col.set_margin_bottom(52);
+        // #28: with N on the fader splits in two: the left half is the gain (auto moves it), the right
+        // half is the Target, the loudness he wants. Same console fader look, side by side.
         let tgt = gtk::Scale::with_range(gtk::Orientation::Vertical, crate::norm::TARGET_MIN_DB, crate::norm::TARGET_MAX_DB, 0.5);
         tgt.set_inverted(true);
         tgt.set_draw_value(false);
         tgt.set_vexpand(true);
-        tgt.set_halign(gtk::Align::Center);
+        tgt.add_css_class("console");
+        for (d, t) in [(-6.0, "6"), (-10.0, "10"), (-20.0, "20"), (-30.0, "30"), (-45.0, "45")] {
+            tgt.add_mark(d, gtk::PositionType::Right, Some(t));
+        }
         tgt.set_tooltip_text(Some("Normalize target: the loudness N keeps this channel at (short-term dBFS). Drag to set it."));
         tgt.update_property(&[gtk::accessible::Property::Label(&format!("{} normalize target", inp.name))]);
+        // one line under the dB readout: target and what it measures now
         let tgt_val = label("", "small");
-        let tgt_now = label("", "small");
-        tgt_now.set_tooltip_text(Some("Measured loudness right now"));
+        let tgt_now = tgt_val.clone();
         let start = self.norm.borrow().get(&id).map(|c| c.out).unwrap_or(crate::norm::TARGET_DB);
         tgt.set_value(start.clamp(crate::norm::TARGET_MIN_DB, crate::norm::TARGET_MAX_DB));
-        tgt_val.set_label(&format!("{:.0}", tgt.value()));
-        tgt_col.append(&tgt);
-        tgt_col.append(&tgt_val);
-        tgt_col.append(&tgt_now);
-        tgt_col.append(&label("TGT", "small"));
-        tgt_col.set_visible(inp.normalize);
+        tgt_val.set_label(&format!("target {:.0}", tgt.value()));
+        fader_rc.pair.append(&tgt);
+        fb.insert_child_after(&tgt_val, Some(&fader_rc.label));
+        tgt.set_visible(inp.normalize);
+        tgt_val.set_visible(inp.normalize);
+        let tgt_col = (tgt.clone(), tgt_val.clone());
         {
             let (app, id2, val) = (self.clone(), id.clone(), tgt_val.clone());
             tgt.connect_value_changed(move |sc| {
@@ -1365,7 +1372,7 @@ impl App {
                     i.norm_target = Some(v);
                 }
                 app.norm_store(&id2);
-                val.set_label(&format!("{v:.0}"));
+                val.set_label(&format!("target {v:.0}"));
                 app.mark_dirty();
             });
         }
@@ -1375,7 +1382,10 @@ impl App {
                 let (Some(app), Some(f)) = (w.upgrade(), fw.upgrade()) else { return };
                 if let Some(n) = nw.upgrade() {
                     if n.is_mapped() {
-                        let t = app.norm.borrow().get(&id2).and_then(|c| c.loud_db()).map(|l| format!("{l:.0}")).unwrap_or_else(|| "–".into());
+                        let t = app.norm.borrow().get(&id2).map(|c| match c.loud_db() {
+                            Some(l) => format!("target {:.0} · now {l:.0}", c.out),
+                            None => format!("target {:.0}", c.out),
+                        }).unwrap_or_default();
                         if n.label() != t {
                             n.set_label(&t);
                         }
@@ -1414,7 +1424,6 @@ impl App {
         };
         row.append(&meter_col(&in_led, "IN"));
         row.append(&fb);
-        row.append(&tgt_col);
         row.append(&meter_col(&led, "OUT"));
         strip.append(&row);
         strip.append(&self.side_row(format!("in:{id}")));
@@ -1527,7 +1536,8 @@ impl App {
                 let (app, id2, tc) = (self.clone(), id.clone(), tgt_col.clone());
                 n_btn.connect_toggled(move |b| {
                     let on = b.is_active();
-                    tc.set_visible(on);
+                    tc.0.set_visible(on);
+                    tc.1.set_visible(on);
                     {
                         let mut c = app.cfg.borrow_mut();
                         if let Some(i) = c.inputs.iter_mut().find(|i| i.id == id2) {
