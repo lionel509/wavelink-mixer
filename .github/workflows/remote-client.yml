@@ -1,0 +1,51 @@
+name: Wavelink Remote (macOS)
+
+on:
+  push:
+    branches: [main]
+    paths: ["client/**", "proto/**", "Cargo.lock", ".github/workflows/remote-client.yml"]
+  pull_request:
+    paths: ["client/**", "proto/**", "Cargo.lock", ".github/workflows/remote-client.yml"]
+  workflow_dispatch:
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (both Mac architectures)
+        run: |
+          rustup update stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: remote-macos-${{ hashFiles('Cargo.lock') }}
+      - name: Test protocol and client
+        run: cargo test --locked -p wavelink-proto -p wavelink-remote
+      - name: Build (arm64 + x86_64)
+        run: |
+          cargo build --locked --release -p wavelink-remote --target aarch64-apple-darwin
+          cargo build --locked --release -p wavelink-remote --target x86_64-apple-darwin
+      - name: Bundle a universal, ad-hoc signed app
+        run: |
+          set -e
+          VERSION=$(grep -m1 '^version' client/Cargo.toml | cut -d'"' -f2)
+          APP="dist/Wavelink Remote.app"
+          mkdir -p "$APP/Contents/MacOS"
+          lipo -create -output "$APP/Contents/MacOS/wavelink-remote" \
+            target/aarch64-apple-darwin/release/wavelink-remote \
+            target/x86_64-apple-darwin/release/wavelink-remote
+          sed "s/VERSION/$VERSION/g" client/macos/Info.plist > "$APP/Contents/Info.plist"
+          codesign --force --deep --sign - "$APP"
+          lipo -info "$APP/Contents/MacOS/wavelink-remote"
+          # tar keeps the executable bit (the artifact zip alone would drop it)
+          tar -C dist -czf wavelink-remote-macos-universal.tar.gz "Wavelink Remote.app"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wavelink-remote-macos-universal
+          path: wavelink-remote-macos-universal.tar.gz
+          if-no-files-found: error
