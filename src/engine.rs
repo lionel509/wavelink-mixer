@@ -14,13 +14,30 @@ use std::fmt::Write as _;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
-/// How long the child graph may go without a missing node appearing before it counts as stuck.
-/// Scales with graph size (each node costs a few ms of creation plus its buffer negotiation) and
-/// backs off exponentially after consecutive restarts that did not produce a complete graph.
+/// How long a freshly spawned child graph may go without a missing node appearing before it counts
+/// as stuck. Scales with graph size (each node costs a few ms of creation plus its buffer
+/// negotiation) and backs off exponentially after consecutive restarts that did not produce a
+/// stable graph. Capped at 60 s.
 pub fn graph_patience(expected_nodes: usize, consecutive_restarts: u32) -> Duration {
     let base_ms = 8_000 + 150 * expected_nodes as u64;
-    Duration::from_millis((base_ms << consecutive_restarts.min(4)).min(120_000))
+    Duration::from_millis((base_ms << consecutive_restarts.min(4)).min(60_000))
 }
+
+/// Grace before restarting after a node vanished from a graph that had already been complete
+/// (no creation race to wait for): about the pre-#22 behaviour.
+pub const LOSS_GRACE: Duration = Duration::from_secs(5);
+/// A graph must stay complete this long before earlier failed restarts are forgotten.
+pub const STABLE_AFTER: Duration = Duration::from_secs(30);
+/// Never restart a child younger than this.
+pub const MIN_CHILD_AGE: Duration = Duration::from_secs(5);
+/// An alive child that owns none of its expected nodes after this long is treated like a dead one.
+pub const ZERO_NODES_AFTER: Duration = Duration::from_secs(10);
+/// Failed restarts that leave the same set missing before the engine stops tearing the graph down.
+pub const SAME_SET_RESTARTS: u32 = 3;
+/// Failed restarts in a row (any missing set) before giving up, too.
+pub const MAX_FAILED_RESTARTS: u32 = 6;
+/// While degraded, retry (one restart) only this rarely; a structure change retries at once.
+pub const DEGRADED_RETRY: Duration = Duration::from_secs(60 * 60);
 
 /// Tracks progress of a freshly spawned child graph toward "every expected node exists".
 #[derive(Debug, Default)]
@@ -52,36 +69,194 @@ impl Settle {
     }
 }
 
-/// Spawn the child graph with the open-file limit raised to the hard limit. Every node and link
-/// of the graph costs several fds (memfds, eventfds, sockets) in the process hosting it, and the
-/// default soft limit of 1024 is exhausted at ~8 inputs x 5 buses: "can't DUP fd: Too many open
-/// files", then "invalid mem id" / "Buffer allocation failed". Only this child is raised, so the
-/// engine and its other children keep the default (select()-safe) limit.
-fn spawn_graph_child(conf: &std::path::Path) -> Option<Child> {
-    use std::os::unix::process::CommandExt;
-    #[repr(C)]
-    struct RLimit { cur: u64, max: u64 }
-    extern "C" {
-        fn getrlimit(res: std::ffi::c_int, r: *mut RLimit) -> std::ffi::c_int;
-        fn setrlimit(res: std::ffi::c_int, r: *const RLimit) -> std::ffi::c_int;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Why {
+    /// no child yet, or it exited
+    Dead,
+    /// config structure changed
+    Structure,
+    /// child alive but owns none of its expected nodes
+    ZeroNodes,
+    /// some nodes missing and not coming
+    Stuck,
+}
+
+/// The restart policy for the child graph, kept free of I/O so it can be driven by a simulated
+/// timeline. `run()` calls `tick` once per loop and `spawned` after (re)starting the child.
+#[derive(Debug, Default)]
+pub struct Supervisor {
+    settle: Settle,
+    spawned_at: Option<Instant>,
+    seen_complete: bool,
+    complete_since: Option<Instant>,
+    /// consecutive stuck restarts without a stable complete graph (drives the backoff)
+    pub stuck_restarts: u32,
+    same_set: u32,
+    failed_total: u32,
+    last_set: Vec<String>,
+    last_restart: Option<Instant>,
+    degraded: Option<Vec<String>>,
+}
+
+impl Supervisor {
+    /// Missing nodes the engine gave up restarting for (partial graph kept), if any.
+    pub fn degraded(&self) -> Option<&[String]> {
+        self.degraded.as_deref()
     }
-    const RLIMIT_NOFILE: std::ffi::c_int = 7;
-    let mut cmd = Command::new("pipewire");
-    cmd.arg("-c").arg(conf).stdout(Stdio::null());
+
+    fn forget_failures(&mut self) {
+        self.stuck_restarts = 0;
+        self.same_set = 0;
+        self.failed_total = 0;
+        self.last_set.clear();
+        self.degraded = None;
+    }
+
+    /// The patience that applies to the next stuck decision.
+    pub fn patience(&self, expected_nodes: usize) -> Duration {
+        if self.seen_complete && self.stuck_restarts == 0 {
+            LOSS_GRACE
+        } else {
+            graph_patience(expected_nodes, self.stuck_restarts)
+        }
+    }
+
+    pub fn spawned(&mut self, now: Instant) {
+        self.settle.reset(now);
+        self.spawned_at = Some(now);
+        self.seen_complete = false;
+        self.complete_since = None;
+    }
+
+    /// `missing`: expected child nodes that are absent (dependencies present); `expected_total`:
+    /// how many child nodes the config expects. Returns the reason to restart now, if any.
+    pub fn tick(&mut self, now: Instant, alive: bool, structure_changed: bool, missing: &[String], expected_total: usize) -> Option<Why> {
+        let age = self.spawned_at.map(|t| now.saturating_duration_since(t));
+        let old_enough = age.map_or(true, |a| a > MIN_CHILD_AGE);
+        if missing.is_empty() {
+            self.seen_complete = true;
+            let since = *self.complete_since.get_or_insert(now);
+            if now.saturating_duration_since(since) >= STABLE_AFTER {
+                self.forget_failures();
+            }
+        } else {
+            self.complete_since = None;
+        }
+        if structure_changed {
+            // a different graph deserves fresh patience and a clean slate
+            self.forget_failures();
+            return old_enough.then_some(Why::Structure);
+        }
+        if !alive || self.spawned_at.is_none() {
+            return old_enough.then_some(Why::Dead);
+        }
+        if expected_total > 0 && missing.len() == expected_total && age.map_or(false, |a| a >= ZERO_NODES_AFTER) && old_enough {
+            return Some(Why::ZeroNodes);
+        }
+        if self.degraded.is_some() {
+            if self.last_restart.map_or(false, |t| now.saturating_duration_since(t) >= DEGRADED_RETRY) {
+                // one more attempt, then back to degraded if it did not help
+                self.degraded = None;
+                self.same_set = SAME_SET_RESTARTS - 1;
+                self.failed_total = MAX_FAILED_RESTARTS - 1;
+            } else {
+                return None;
+            }
+        }
+        let stuck = self.settle.stuck(missing.len(), now, self.patience(expected_total));
+        if !stuck || !old_enough {
+            return None;
+        }
+        if self.same_set >= SAME_SET_RESTARTS || self.failed_total >= MAX_FAILED_RESTARTS {
+            self.degraded = Some(missing.to_vec());
+            return None;
+        }
+        self.same_set = if missing == self.last_set.as_slice() { self.same_set + 1 } else { 1 };
+        self.last_set = missing.to_vec();
+        self.failed_total += 1;
+        self.stuck_restarts += 1;
+        self.last_restart = Some(now);
+        Some(Why::Stuck)
+    }
+}
+
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+mod nofile {
+    #[repr(C)]
+    pub struct RLimit { pub cur: u64, pub max: u64 }
+    extern "C" {
+        pub fn getrlimit(res: std::ffi::c_int, r: *mut RLimit) -> std::ffi::c_int;
+        pub fn setrlimit(res: std::ffi::c_int, r: *const RLimit) -> std::ffi::c_int;
+    }
+    pub const RLIMIT_NOFILE: std::ffi::c_int = 7;
+    pub fn get() -> Option<(u64, u64)> {
+        let mut r = RLimit { cur: 0, max: 0 };
+        (unsafe { getrlimit(RLIMIT_NOFILE, &mut r) } == 0).then_some((r.cur, r.max))
+    }
+}
+
+/// Make `cmd` start with the open-file soft limit raised to the hard limit (capped at 1<<20).
+/// Every node and link of the graph costs several fds (memfds, eventfds, sockets) in the process
+/// hosting it, and the default soft limit of 1024 is exhausted at ~8 inputs x 5 buses: "can't DUP
+/// fd: Too many open files", then "invalid mem id" / "Buffer allocation failed". Only the command
+/// is affected, so the engine and its other children keep the default (select()-safe) limit.
+/// Returns the soft limit the child should get, and warns when that cannot be more than the
+/// current one.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+pub fn raise_nofile(cmd: &mut Command) -> Option<u64> {
+    use std::os::unix::process::CommandExt;
+    let (cur, max) = nofile::get()?;
+    let want = max.min(1 << 20);
+    if want <= cur {
+        eprintln!("warning: graph child fd limit stays {cur} (hard limit {max}); large graphs (>= 8 inputs x 5 buses) will fail with 'Too many open files'");
+        return Some(cur);
+    }
+    if max < 4096 {
+        eprintln!("warning: hard fd limit is only {max}; large graphs may still run out of fds");
+    }
     unsafe {
         cmd.pre_exec(|| {
-            let mut r = RLimit { cur: 0, max: 0 };
-            if getrlimit(RLIMIT_NOFILE, &mut r) == 0 {
-                let want = r.max.min(1 << 20);
-                if want > r.cur {
-                    r.cur = want;
-                    setrlimit(RLIMIT_NOFILE, &r);
+            // only plain syscalls: safe between fork and exec
+            if let Some((cur, max)) = nofile::get() {
+                let want = max.min(1 << 20);
+                if want > cur {
+                    let r = nofile::RLimit { cur: want, max };
+                    nofile::setrlimit(nofile::RLIMIT_NOFILE, &r);
                 }
             }
             Ok(())
         });
     }
-    cmd.spawn().ok()
+    Some(want)
+}
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+pub fn raise_nofile(_cmd: &mut Command) -> Option<u64> { None }
+
+fn proc_nofile_soft(pid: u32) -> Option<u64> {
+    let l = std::fs::read_to_string(format!("/proc/{pid}/limits")).ok()?;
+    l.lines().find(|l| l.starts_with("Max open files"))?.split_whitespace().nth(3)?.parse().ok()
+}
+
+fn spawn_graph_child(conf: &std::path::Path) -> Option<Child> {
+    let mut cmd = Command::new("pipewire");
+    cmd.arg("-c").arg(conf).stdout(Stdio::null());
+    // run() is on the long-lived main thread, so pdeathsig is safe: no orphan graph if we die
+    pw::die_with_parent(&mut cmd);
+    let want = raise_nofile(&mut cmd);
+    match cmd.spawn() {
+        Ok(c) => {
+            if let (Some(w), Some(got)) = (want, proc_nofile_soft(c.id())) {
+                if got < w {
+                    eprintln!("warning: graph child fd soft limit is {got}, wanted {w} (setrlimit failed?)");
+                }
+            }
+            Some(c)
+        }
+        Err(e) => {
+            eprintln!("cannot spawn pipewire graph child: {e}");
+            None
+        }
+    }
 }
 
 const CAPS: &str = "/usr/lib64/ladspa/caps.so";
@@ -391,10 +566,10 @@ pub fn run() {
     let mut mtime: Option<SystemTime> = None;
     let mut child: Option<Child> = None;
     let mut child_structure = String::new();
-    let mut child_started = Instant::now() - Duration::from_secs(60);
     let mut levels_pending = false;
-    let mut settle = Settle::default();
-    let mut stuck_restarts = 0u32;
+    let mut sup = Supervisor::default();
+    let mut was_degraded = false;
+    let degraded_file = conf_dir.join("engine.degraded");
     let mut hw: HashMap<String, (Child, String)> = HashMap::new();
     // piano synth (FluidSynth) feeding the "piano" input channel; stdin kept open = stays alive
     let mut piano: Option<(Child, std::process::ChildStdin)> = None;
@@ -454,26 +629,34 @@ pub fn run() {
             .into_iter()
             .filter(|(n, dep)| !g.has(n) && dep.as_ref().map(|d| g.has(d)).unwrap_or(true))
             .collect();
-        if missing.is_empty() {
-            stuck_restarts = 0;
+        let missing_names: Vec<String> = missing.iter().map(|m| m.0.clone()).collect();
+        let why = sup.tick(Instant::now(), alive, structure != child_structure, &missing_names, expected(&cfg).len());
+        match (sup.degraded(), was_degraded) {
+            (Some(d), false) => {
+                eprintln!("degraded: still missing {d:?} after repeated restarts; keeping the partial graph, retrying in {} min or on a config structure change", DEGRADED_RETRY.as_secs() / 60);
+                let _ = std::fs::write(&degraded_file, format!("{}\n", d.join("\n")));
+                was_degraded = true;
+            }
+            (None, true) => {
+                eprintln!("degraded state cleared");
+                let _ = std::fs::remove_file(&degraded_file);
+                was_degraded = false;
+            }
+            _ => {}
         }
-        let stuck = settle.stuck(missing.len(), Instant::now(), graph_patience(expected(&cfg).len(), stuck_restarts));
-        let need_restart = !alive || structure != child_structure || stuck;
-        if need_restart && child_started.elapsed() > Duration::from_secs(5) {
+        if let Some(why) = why {
             if let Some(mut c) = child.take() {
                 let _ = c.kill();
                 let _ = c.wait();
             }
-            if stuck {
-                stuck_restarts += 1;
-                eprintln!("restarting graph (stuck, attempt {stuck_restarts}), missing: {:?}", missing.iter().map(|m| &m.0).collect::<Vec<_>>());
+            if why == Why::Stuck || why == Why::ZeroNodes {
+                eprintln!("restarting graph ({why:?}, attempt {}, next patience {:?}), missing: {:?}", sup.stuck_restarts, sup.patience(expected(&cfg).len()), missing_names);
             }
             let _ = std::fs::write(&conf_file, child_conf(&cfg));
             child = spawn_graph_child(&conf_file);
             child_structure = structure;
-            child_started = Instant::now();
             levels_pending = true;
-            settle.reset(Instant::now());
+            sup.spawned(Instant::now());
             std::thread::sleep(Duration::from_millis(1500));
             continue;
         }
@@ -566,8 +749,9 @@ mod tests {
         assert!(graph_patience(56, 0) > Duration::from_secs(5) + Duration::from_millis(1500));
         assert!(graph_patience(130, 0) > graph_patience(56, 0));
         assert_eq!(graph_patience(56, 1), graph_patience(56, 0) * 2);
-        assert_eq!(graph_patience(56, 40), graph_patience(56, 4).min(Duration::from_secs(120)));
-        assert!(graph_patience(500, 9) <= Duration::from_secs(120));
+        assert_eq!(graph_patience(56, 2), Duration::from_secs(60));
+        assert_eq!(graph_patience(56, 40), Duration::from_secs(60));
+        assert_eq!(graph_patience(500, 9), Duration::from_secs(60));
     }
 
     #[test]
@@ -611,13 +795,145 @@ mod tests {
                 assert_eq!(conf.matches(&format!("node.name = \"{n}\"")).count(), 1, "{n}");
             }
         }
-        assert!(expected(&cfg).len() >= 10 * 6);
+        // per input: strip.in + strip + 6 routes; plus the virtual buses' own nodes
+        let virt = cfg.buses.iter().filter(|b| matches!(b.kind, BusKind::Virtual { .. })).count();
+        assert_eq!(expected(&cfg).len(), 10 * (2 + 6) + virt);
     }
 }
 
-/// Breaker round 1 for PR #27 (#22). `sim` mirrors the step-2 restart decision in `run()` so the
-/// policy (Settle + graph_patience + stuck_restarts + 5 s minimum) can be driven by a scripted
-/// missing-node timeline. Keep it in sync with run() if that block changes.
+#[cfg(test)]
+mod supervisor_tests {
+    use super::*;
+
+    fn names(n: usize) -> Vec<String> { (0..n).map(|i| format!("n{i}")).collect() }
+
+    #[test]
+    fn raise_nofile_child_sees_raised_limit_and_parent_is_untouched() {
+        let before = nofile::get().unwrap();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "ulimit -Sn"]);
+        let want = raise_nofile(&mut cmd).unwrap();
+        let out = cmd.output().unwrap();
+        let got: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        assert_eq!(got, want);
+        assert_eq!(got, before.1.min(1 << 20));
+        assert_eq!(nofile::get().unwrap(), before, "engine's own limit must not change");
+        // a plain child (pw-cat, pw-loopback...) keeps the engine's limit
+        let plain = Command::new("sh").args(["-c", "ulimit -Sn"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&plain.stdout).trim().parse::<u64>().unwrap(), before.0);
+    }
+
+    #[test]
+    fn structure_change_resets_backoff() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut sup = Supervisor::default();
+        assert_eq!(sup.tick(at(0), false, false, &[], 50), Some(Why::Dead));
+        sup.spawned(at(0));
+        let m = names(1);
+        let mut t = 1;
+        let mut got = 0;
+        while got < 2 {
+            if sup.tick(at(t), true, false, &m, 50) == Some(Why::Stuck) { got += 1; sup.spawned(at(t)); }
+            t += 1;
+        }
+        assert_eq!(sup.stuck_restarts, 2);
+        assert_eq!(sup.tick(at(t + 10), true, true, &m, 50), Some(Why::Structure));
+        assert_eq!(sup.stuck_restarts, 0);
+        assert_eq!(sup.patience(50), graph_patience(50, 0));
+    }
+
+    #[test]
+    fn dead_child_does_not_advance_backoff() {
+        let t0 = Instant::now();
+        let mut sup = Supervisor::default();
+        sup.spawned(t0);
+        for k in 1..10u64 {
+            let t = t0 + Duration::from_secs(10 * k);
+            assert_eq!(sup.tick(t, false, false, &[], 50), Some(Why::Dead));
+            sup.spawned(t);
+        }
+        assert_eq!(sup.stuck_restarts, 0);
+        assert!(sup.degraded().is_none());
+    }
+
+    #[test]
+    fn alive_child_with_zero_nodes_restarts_promptly_without_backoff() {
+        let t0 = Instant::now();
+        let mut sup = Supervisor::default();
+        sup.spawned(t0);
+        let all = names(50);
+        assert_eq!(sup.tick(t0 + Duration::from_secs(6), true, false, &all, 50), None, "creation grace");
+        assert_eq!(sup.tick(t0 + Duration::from_secs(10), true, false, &all, 50), Some(Why::ZeroNodes));
+        assert_eq!(sup.stuck_restarts, 0);
+    }
+
+    #[test]
+    fn node_lost_after_complete_graph_uses_short_grace() {
+        let t0 = Instant::now();
+        let mut sup = Supervisor::default();
+        sup.spawned(t0);
+        for k in 1..=20u64 { assert_eq!(sup.tick(t0 + Duration::from_secs(k), true, false, &[], 130), None); }
+        let m = names(1);
+        let lost = t0 + Duration::from_secs(21);
+        assert_eq!(sup.tick(lost, true, false, &m, 130), None);
+        assert_eq!(sup.tick(lost + Duration::from_secs(5), true, false, &m, 130), Some(Why::Stuck));
+    }
+
+    #[test]
+    fn brief_complete_graph_does_not_reset_backoff_but_stable_one_does() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut sup = Supervisor::default();
+        sup.spawned(at(0));
+        sup.stuck_restarts = 3;
+        // complete for 29 s: still remembered
+        for k in 0..30u64 { sup.tick(at(k), true, false, &[], 50); }
+        assert_eq!(sup.stuck_restarts, 3);
+        sup.tick(at(30), true, false, &[], 50);
+        assert_eq!(sup.stuck_restarts, 0);
+    }
+
+    #[test]
+    fn gives_up_on_the_same_missing_set_and_retries_rarely() {
+        let t0 = Instant::now();
+        let mut sup = Supervisor::default();
+        let m = names(2);
+        let mut t = 0u64;
+        sup.spawned(t0);
+        let mut restarts = 0;
+        while t < 3 * 3600 {
+            t += 1;
+            if let Some(w) = sup.tick(t0 + Duration::from_secs(t), true, false, &m, 50) {
+                assert_eq!(w, Why::Stuck);
+                restarts += 1;
+                sup.spawned(t0 + Duration::from_secs(t));
+            }
+        }
+        // 3 attempts, then one retry per hour
+        assert!((3..=6).contains(&restarts), "{restarts}");
+        assert_eq!(sup.degraded(), Some(m.as_slice()));
+    }
+
+    #[test]
+    fn structure_change_clears_degraded() {
+        let t0 = Instant::now();
+        let mut sup = Supervisor::default();
+        let m = names(2);
+        sup.spawned(t0);
+        let mut t = 0;
+        while sup.degraded().is_none() {
+            t += 1;
+            assert!(t < 1000);
+            if sup.tick(t0 + Duration::from_secs(t), true, false, &m, 50).is_some() { sup.spawned(t0 + Duration::from_secs(t)); }
+        }
+        assert_eq!(sup.tick(t0 + Duration::from_secs(t + 10), true, true, &m, 50), Some(Why::Structure));
+        assert!(sup.degraded().is_none());
+    }
+}
+
+/// Breaker round 1 for PR #27 (#22). `sim` drives the real `Supervisor` (the restart policy `run()`
+/// uses) with a scripted missing-node timeline.
 #[cfg(test)]
 mod breaker27 {
     use super::*;
@@ -632,28 +948,21 @@ mod breaker27 {
     fn sim(n: usize, total: f64, structure_change_at: &[f64], mut missing: impl FnMut(f64, f64, usize) -> usize) -> Vec<Ev> {
         let base = Instant::now();
         let at = |t: f64| base + Duration::from_secs_f64(t);
-        let mut settle = Settle::default();
-        let mut stuck_restarts = 0u32;
+        let mut sup = Supervisor::default();
         let mut child_started = -60.0f64;
-        let mut have_child = false;
         let mut pending_struct: Vec<f64> = structure_change_at.to_vec();
         let mut ev: Vec<Ev> = vec![];
         let mut t = 0.0;
         while t < total {
             let m = missing(t, t - child_started, ev.len());
-            if m == 0 {
-                stuck_restarts = 0;
-            }
-            let stuck = settle.stuck(m, at(t), graph_patience(n, stuck_restarts));
+            let names: Vec<String> = (0..m).map(|i| format!("n{i}")).collect();
             let struct_changed = pending_struct.first().map_or(false, |s| t >= *s);
-            let need = !have_child || struct_changed || stuck;
-            if need && t - child_started > 5.0 {
-                if struct_changed { pending_struct.remove(0); }
-                if stuck { stuck_restarts += 1; }
-                if have_child { ev.push(Ev { t, stuck }); }
-                have_child = true;
+            // alive: the first spawn happens when there is no child yet (spawned_at None => Dead)
+            if let Some(why) = sup.tick(at(t), true, struct_changed, &names, n) {
+                if why == Why::Structure { pending_struct.remove(0); }
+                if child_started > -59.0 { ev.push(Ev { t, stuck: why == Why::Stuck }); }
                 child_started = t;
-                settle.reset(at(t));
+                sup.spawned(at(t));
                 t += AFTER_RESTART;
                 continue;
             }
