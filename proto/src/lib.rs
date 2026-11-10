@@ -352,6 +352,21 @@ pub struct Level {
     pub rms_db: f32,
 }
 
+/// A live PipeWire write from a full window, by node id/serial (what ui.rs did with pw:: locally).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum PwCmd {
+    SetVolume { id: u64, v: f64 },
+    SetVolumeMute { id: u64, v: f64, mute: bool },
+    SetMute { id: u64, mute: bool },
+    SetEq { id: u64, eq: Vec<f64> },
+    SetRack { id: u64, rack: serde_json::Value },
+    MoveStream { serial: u64, sink: String },
+    Link { out: String, inp: String },
+    /// side: "stereo" | "left" | "right"
+    LinkSide { out: String, inp: String, side: String },
+}
+
 // ---------------------------------------------------------------- messages
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -367,6 +382,9 @@ pub struct Hello {
     /// Set by a computer that owns a host (its system volume). Absent for plain clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<HostHello>,
+    /// Ask for whole-config and graph snapshots (the full mixer window). Absent = false.
+    #[serde(default)]
+    pub full: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -381,6 +399,11 @@ pub enum ClientMsg {
     Unlock { bus: String, on: bool },
     /// A host reports its system volume/mute after a change it saw itself (volume keys). Host connections only.
     HostState { volume: u8, mute: bool },
+    /// 3-way merge `mine` against config.json with `base` as the common ancestor, like the local window.
+    /// Bus-gain raises are capped as SetBusGain would be. Answered with `Ack`.
+    SaveConfig { id: u64, base: serde_json::Value, mine: serde_json::Value },
+    /// A live PipeWire write from a full window. Answered with `Ack`.
+    Pw { id: u64, cmd: PwCmd },
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -418,6 +441,10 @@ pub enum ServerMsg {
     Pong { t: u64 },
     /// This connection's unlock state for a bus changed: `seconds` left (0 = locked again).
     Unlock { bus: String, seconds: u32 },
+    /// The whole config.json. Sent only to `full` connections.
+    Config { config: serde_json::Value },
+    /// The graph as a `pw::GraphWire`. Sent only to `full` connections.
+    Graph { graph: serde_json::Value },
 }
 
 impl ClientMsg {
