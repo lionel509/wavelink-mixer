@@ -402,4 +402,113 @@ mod tests {
         assert_eq!((ons.len(), offs.len()), (2, 2));
         assert!(offs[0] < ons[1], "the first note's off must come before the second note's on at the shared tick");
     }
+
+    /// (abs_tick, status & 0xf0, key) of every note on/off in one MTrk chunk (0 = tempo map, 1 = drums, 2 = bass, 3 = other).
+    fn track_events(bytes: &[u8], track: usize) -> Vec<(u64, u8, u8)> {
+        let mut pos = 14usize;
+        for idx in 0..=track {
+            assert_eq!(&bytes[pos..pos + 4], b"MTrk");
+            let len = u32::from_be_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            let body = &bytes[pos + 8..pos + 8 + len];
+            pos += 8 + len;
+            if idx != track {
+                continue;
+            }
+            let mut out = Vec::new();
+            let (mut i, mut tick) = (0usize, 0u64);
+            while i < body.len() {
+                let (delta, next) = vlq(body, i);
+                i = next;
+                tick += delta as u64;
+                let st = body[i];
+                if st == 0xff {
+                    let (plen, next) = vlq(body, i + 2);
+                    i = next + plen;
+                } else if st & 0xf0 == 0xc0 || st & 0xf0 == 0xd0 {
+                    i += 2;
+                } else {
+                    if st & 0xf0 == 0x80 || st & 0xf0 == 0x90 {
+                        out.push((tick, st & 0xf0, body[i + 1]));
+                    }
+                    i += 3;
+                }
+            }
+            return out;
+        }
+        panic!("no track {track}");
+    }
+
+    fn lcg(s: &mut u64) -> f64 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*s >> 33) as f64) / (1u64 << 31) as f64
+    }
+
+    #[test]
+    fn midi_same_pitch_overlap_clips_first_at_second_onset() {
+        let tracks = [vec![], vec![n(1.0, 1.0, 50, 100), n(1.5, 1.0, 50, 100)], vec![]];
+        let b = midi_bytes(&tracks);
+        let ev: Vec<(u64, u8, u8)> = track_events(&b, 2).into_iter().filter(|e| e.2 == 50).collect();
+        assert_eq!(ev, vec![(0, 0x90, 50), (480, 0x80, 50), (480, 0x90, 50), (1440, 0x80, 50)]);
+    }
+
+    #[test]
+    fn midi_never_stacks_same_key() {
+        let mut s = 7u64;
+        let mut notes = Vec::new();
+        for _ in 0..30 {
+            let k = 50 + (lcg(&mut s) * 4.0) as u8;
+            let t = lcg(&mut s) * 5.0;
+            let dur = 0.05 + lcg(&mut s) * 1.45;
+            notes.push(n(t, dur, k, 100));
+        }
+        let b = midi_bytes(&[vec![], notes, vec![]]);
+        let ev = track_events(&b, 2);
+        assert_eq!(ev.len(), 60, "one on and one off per note");
+        for k in 50..54u8 {
+            let seq: Vec<(u64, u8)> = ev.iter().filter(|e| e.2 == k).map(|e| (e.0, e.1)).collect();
+            for pair in seq.chunks(2) {
+                assert_eq!(pair.len(), 2, "key {k} has an unmatched event");
+                assert_eq!(pair[0].1, 0x90, "key {k} starts with an on");
+                assert_eq!(pair[1].1, 0x80, "key {k}: an on is followed by its off, never another on");
+                assert!(pair[1].0 >= pair[0].0 + 1, "key {k}: off must come after its on");
+            }
+            assert_eq!(seq.len() % 2, 0);
+        }
+    }
+
+    #[test]
+    fn synth_same_pitch_overlap_clips_first() {
+        let mut ev = synth_events(1, &[n(1.0, 1.0, 50, 100), n(1.5, 1.0, 50, 100)], 0.0);
+        let off_a = ev.iter().filter(|e| e.1 == "noteoff 1 50").map(|e| e.0).fold(f64::INFINITY, f64::min);
+        assert!((off_a - 1.5).abs() < 1e-9, "first off must land at the second on: {off_a}");
+        let got = due(&mut ev, 1e9);
+        assert_eq!(got, vec!["noteon 1 50 100", "noteoff 1 50", "noteon 1 50 100", "noteoff 1 50"]);
+    }
+
+    #[test]
+    fn retime_offs_moves_pending_off() {
+        let mut pending = synth_events(1, &[n(10.0, 0.9, 60, 100)], 1.5);
+        retime_offs(&mut pending, 1, &[(10.9, n(10.0, 2.4, 60, 100))], 1.5);
+        let off = pending.iter().find(|e| e.1 == "noteoff 1 60").unwrap().0;
+        let on = pending.iter().find(|e| e.1 == "noteon 1 60 100").unwrap().0;
+        assert!((off - 13.9).abs() < 1e-9, "off moves to new end + lag: {off}");
+        assert!((on - 11.5).abs() < 1e-9, "on is untouched: {on}");
+        // the old off has already played: nothing to move, nothing added
+        let before = pending.clone();
+        retime_offs(&mut pending, 1, &[(99.0, n(10.0, 5.0, 60, 100))], 1.5);
+        assert_eq!(pending, before);
+    }
+
+    #[test]
+    fn timeline_extend_lengthens_matching_note() {
+        let mut tl = Timeline::new();
+        tl.add(1, &[n(10.0, 0.9, 60, 100), n(10.0, 0.9, 62, 100)]);
+        tl.extend(1, &[(10.9, n(10.0, 2.4, 60, 100)), (10.9, n(10.0, 2.4, 64, 100))]);
+        let got = tl.window(1, 0.0, 100.0);
+        assert_eq!(got.len(), 2, "no note is created for pitch 64");
+        let p60 = got.iter().find(|m| m.pitch == 60).unwrap();
+        let p62 = got.iter().find(|m| m.pitch == 62).unwrap();
+        assert_eq!(p60.dur, 2.4);
+        assert_eq!(p62.dur, 0.9);
+    }
 }

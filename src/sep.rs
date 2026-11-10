@@ -815,4 +815,60 @@ mod tests {
         assert!(seen(&loud), "precondition: model should see the loud note: {loud:?}");
         assert!(seen(&quiet), "silence gate dropped a real 300 ms A2 at -49 dBFS peak: {quiet:?}");
     }
+
+    #[test]
+    fn walk_end_reports_edge() {
+        let mut held = grid(172, 88);
+        for f in 20..172 {
+            held[f][48] = 0.9;
+        }
+        assert_eq!(walk_end(&held, 20, 48), (172, true));
+
+        let mut short = grid(172, 88);
+        for f in 20..60 {
+            short[f][48] = 0.9;
+        }
+        assert_eq!(walk_end(&short, 20, 48), (60, false));
+
+        // a 10-frame dip is within ENERGY_TOL, so the note still runs to frame 60
+        let mut dip = short.clone();
+        for f in 40..50 {
+            dip[f][48] = 0.0;
+        }
+        assert_eq!(walk_end(&dip, 20, 48), (60, false));
+    }
+
+    #[test]
+    fn frames_to_notes_open_flags_edge() {
+        let mut held = grid(172, 88);
+        let mut held_on = grid(172, 88);
+        for f in 20..172 {
+            held[f][48] = 0.9;
+        }
+        held_on[20][48] = 0.9;
+        let open = frames_to_notes_open(&held, &held_on);
+        assert_eq!(open.len(), 1);
+        assert!(open[0].1, "a note still sounding at the last frame is flagged as reaching the edge");
+        assert!((open[0].0.dur - 152.0 / FPS).abs() < 1e-3);
+
+        let mut short = grid(172, 88);
+        let mut short_on = grid(172, 88);
+        for f in 20..60 {
+            short[f][48] = 0.9;
+        }
+        short_on[20][48] = 0.9;
+        let open = frames_to_notes_open(&short, &short_on);
+        assert_eq!(open.len(), 1);
+        assert!(!open[0].1);
+        assert!((open[0].0.dur - 40.0 / FPS).abs() < 1e-3);
+
+        for (note, onset) in [(&held, &held_on), (&short, &short_on)] {
+            let plain = frames_to_notes(note, onset);
+            let flagged = frames_to_notes_open(note, onset);
+            assert_eq!(plain.len(), flagged.len());
+            for (p, (f, _)) in plain.iter().zip(flagged.iter()) {
+                assert_eq!((p.t, p.dur, p.pitch, p.vel), (f.t, f.dur, f.pitch, f.vel));
+            }
+        }
+    }
 }

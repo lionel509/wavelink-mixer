@@ -1185,4 +1185,133 @@ mod tests {
         let n: usize = newer.live().expect("the newer handle is current").drain_all().iter().map(|v| v.len()).sum();
         assert_eq!(n, 1, "only the note written before the replacement may be there");
     }
+
+    /// Grids for one 2 s window starting at `ws`: each (on, off, column) is held at 0.9 on the frames it covers,
+    /// with an onset at the first frame when the note starts inside this window.
+    fn held_win(ws: f64, notes: &[(f64, f64, usize)]) -> crate::sep::Grids {
+        let mut note = vec![vec![0.0f32; 88]; 172];
+        let mut onset = vec![vec![0.0f32; 88]; 172];
+        for &(on, off, p) in notes {
+            let mut first = true;
+            for f in 0..172 {
+                let t = ws + f as f64 / crate::sep::FPS;
+                if t >= on && t < off {
+                    note[f][p] = 0.9;
+                    if first && on >= ws {
+                        onset[f][p] = 0.9;
+                    }
+                    first = false;
+                }
+            }
+        }
+        crate::sep::Grids { note, onset }
+    }
+
+    /// Runs the carry-over over windows k in ks (window k ends at k * CHUNK / RATE) and feeds a Timeline.
+    fn run_windows(
+        notes: &[(f64, f64, usize)],
+        ks: std::ops::RangeInclusive<usize>,
+        extra_onset: Option<(f64, usize)>,
+    ) -> (crate::notes::Timeline, Vec<crate::notes::Note>, usize) {
+        let step = CHUNK as f64 / RATE as f64;
+        let win_len = BP_WINDOW as f64 / RATE as f64;
+        let mut open = Vec::new();
+        let mut tl = crate::notes::Timeline::new();
+        let mut ext_windows = 0;
+        for k in ks {
+            let end_t = k as f64 * step;
+            let ws = end_t - win_len;
+            let mut g = held_win(ws, notes);
+            if let Some((at, p)) = extra_onset {
+                let f = ((at - ws) * crate::sep::FPS).round();
+                if f >= 0.0 && (f as usize) < 172 {
+                    g.onset[f as usize][p] = 0.95;
+                }
+            }
+            let (new, ext) = window_notes(Some(&mut g), end_t, &mut open);
+            tl.add(1, &new);
+            if !ext.is_empty() {
+                ext_windows += 1;
+            }
+            tl.extend(1, &ext);
+        }
+        let out = tl.window(1, 0.0, 100.0);
+        (tl, out, ext_windows)
+    }
+
+    #[test]
+    fn window_notes_joins_held_note_across_windows() {
+        let (_, out, ext_windows) = run_windows(&[(1.0, 5.0, 48)], 4..=14, None);
+        assert_eq!(out.len(), 1, "one held note must come out as one note: {out:?}");
+        let m = &out[0];
+        assert_eq!(m.pitch, 69);
+        assert!((m.t - 1.0).abs() <= 1.0 / crate::sep::FPS, "onset kept: {}", m.t);
+        assert!((m.dur - 4.0).abs() <= 1.0 / crate::sep::FPS + 1e-9, "full length: {}", m.dur);
+        assert_eq!(m.vel, 114);
+        assert!(ext_windows >= 6, "the note was extended in {ext_windows} windows");
+    }
+
+    #[test]
+    fn window_notes_closes_when_next_window_quiet() {
+        let step = CHUNK as f64 / RATE as f64;
+        let win_len = BP_WINDOW as f64 / RATE as f64;
+        let mut open = Vec::new();
+        let mut g4 = held_win(4.0 * step - win_len, &[(1.0, 2.3, 48)]);
+        let (new4, _) = window_notes(Some(&mut g4), 4.0 * step, &mut open);
+        let mut tl = crate::notes::Timeline::new();
+        tl.add(1, &new4);
+        let mut g5 = held_win(5.0 * step - win_len, &[(1.0, 2.3, 48)]);
+        let (new5, ext5) = window_notes(Some(&mut g5), 5.0 * step, &mut open);
+        tl.add(1, &new5);
+        tl.extend(1, &ext5);
+        let out = tl.window(1, 0.0, 100.0);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!((out[0].dur - 1.3).abs() <= 1.0 / crate::sep::FPS, "closed at the real end: {}", out[0].dur);
+        assert!(open.is_empty());
+
+        // a silent window closes the open note at its current end, with no extension
+        let mut open = Vec::new();
+        let mut g4 = held_win(4.0 * step - win_len, &[(1.0, 2.3, 48)]);
+        let (first, _) = window_notes(Some(&mut g4), 4.0 * step, &mut open);
+        assert_eq!(open.len(), 1);
+        let (none_new, none_ext) = window_notes(None, 5.0 * step, &mut open);
+        assert!(none_new.is_empty() && none_ext.is_empty());
+        assert!(open.is_empty());
+        assert!(first[0].dur > 0.9, "keeps its first-window length: {}", first[0].dur);
+    }
+
+    #[test]
+    fn window_notes_does_not_duplicate_the_held_pitch() {
+        let (_, out, _) = run_windows(&[(1.0, 5.0, 48)], 4..=14, Some((3.0, 48)));
+        assert_eq!(out.len(), 1, "a re-onset inside the sustain must not start a second note: {out:?}");
+        assert!((out[0].dur - 4.0).abs() <= 1.0 / crate::sep::FPS + 1e-9, "full length: {}", out[0].dur);
+    }
+
+    #[test]
+    fn window_notes_random_held_notes_come_out_whole() {
+        let mut s = 11u64;
+        let mut lcg = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) as f64) / (1u64 << 31) as f64
+        };
+        let mut notes: Vec<(f64, f64, usize)> = Vec::new();
+        while notes.len() < 5 {
+            let p = 30 + (lcg() * 40.0) as usize;
+            if notes.iter().any(|x| x.2 == p) {
+                continue;
+            }
+            let on = 0.5 + lcg() * 2.5;
+            let dur = 0.3 + lcg() * 3.7;
+            notes.push((on, on + dur, p));
+        }
+        // from k = 1: a note starting before 1.0 s is emitted by window k = 3 and must not be skipped
+        let (_, out, _) = run_windows(&notes, 1..=20, None);
+        assert_eq!(out.len(), 5, "{out:?}");
+        let tol = 1.0 / crate::sep::FPS + 1e-9;
+        for &(on, off, p) in &notes {
+            let m = out.iter().find(|m| m.pitch as usize == p + 21).unwrap_or_else(|| panic!("pitch {} missing", p + 21));
+            assert!((m.t - on).abs() <= tol, "onset of pitch {}: {} vs {on}", p + 21, m.t);
+            assert!((m.dur - (off - on)).abs() <= tol, "length of pitch {}: {} vs {}", p + 21, m.dur, off - on);
+        }
+    }
 }
