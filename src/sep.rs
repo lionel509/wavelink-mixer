@@ -243,6 +243,12 @@ pub struct Transcriber {
     session: Session,
 }
 
+/// Raw Basic Pitch output for one window: [frame][pitch] grids (172 x 88).
+pub struct Grids {
+    pub note: Vec<Vec<f32>>,
+    pub onset: Vec<Vec<f32>>,
+}
+
 impl Transcriber {
     /// File "basic-pitch-nmp.onnx".
     pub fn load(m: &ModelSet) -> Result<Transcriber, String> {
@@ -252,10 +258,15 @@ impl Transcriber {
 
     /// Mono at 44.1 kHz in; notes with t relative to the start of the input.
     pub fn notes(&mut self, mono44: &[f32]) -> Result<Vec<Note>, String> {
+        Ok(self.grids(mono44)?.map(|g| frames_to_notes(&g.note, &g.onset)).unwrap_or_default())
+    }
+
+    /// Mono at 44.1 kHz in; the raw note and onset grids, or None for a silent window.
+    pub fn grids(&mut self, mono44: &[f32]) -> Result<Option<Grids>, String> {
         // The model normalises its input, so near-silence (below about -60 dBFS RMS) looks like full-scale
         // noise to it and turns into notes. Treat it as silence.
         if is_silent(mono44) {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         // Mono -> stereo -> 22.05 kHz, then one channel.
         let mut stereo = Vec::with_capacity(mono44.len() * 2);
@@ -284,7 +295,7 @@ impl Transcriber {
         };
         let note = grid(ni)?;
         let onset = grid(oi)?;
-        Ok(frames_to_notes(&note, &onset))
+        Ok(Some(Grids { note, onset }))
     }
 }
 
@@ -330,8 +341,37 @@ pub fn infer_onsets(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<Vec<f32>> {
     out
 }
 
+/// From frame `f` on pitch column `p`, walk forward tolerating up to ENERGY_TOL quiet frames in a row.
+/// Returns the exclusive end frame and whether the walk ran to the last frame (the note may continue
+/// past the window).
+pub fn walk_end(work: &[Vec<f32>], f: usize, p: usize) -> (usize, bool) {
+    let frames = work.len();
+    let mut k = 0usize;
+    let mut fp = f + 1;
+    loop {
+        if fp >= frames {
+            return (frames - k, true);
+        }
+        if work[fp][p] < FRAME_THRESH {
+            k += 1;
+        } else {
+            k = 0;
+        }
+        if k > ENERGY_TOL {
+            return (fp + 1 - k, false);
+        }
+        fp += 1;
+    }
+}
+
 /// note and onset are [frame][pitch] grids (172 x 88).
 pub fn frames_to_notes(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<Note> {
+    frames_to_notes_open(note, onset).into_iter().map(|(n, _)| n).collect()
+}
+
+/// As `frames_to_notes`, and each note carries a flag: true when its walk reached the last frame,
+/// so the note may still be sounding past the window.
+pub fn frames_to_notes_open(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<(Note, bool)> {
     let frames = note.len();
     if frames == 0 {
         return Vec::new();
@@ -359,31 +399,12 @@ pub fn frames_to_notes(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<Note> {
     // deterministic: strongest first, then earliest frame, then lowest pitch
     cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
 
-    let mut out: Vec<Note> = Vec::new();
+    let mut out: Vec<(Note, bool)> = Vec::new();
     for &(_, f, p) in &cands {
         if work[f][p] < FRAME_THRESH {
             continue;
         }
-        // Walk forward, tolerating up to ENERGY_TOL quiet frames in a row.
-        let mut k = 0usize;
-        let mut end = f;
-        let mut fp = f + 1;
-        loop {
-            if fp >= frames {
-                end = frames - k;
-                break;
-            }
-            if work[fp][p] < FRAME_THRESH {
-                k += 1;
-            } else {
-                k = 0;
-            }
-            if k > ENERGY_TOL {
-                end = fp + 1 - k;
-                break;
-            }
-            fp += 1;
-        }
+        let (end, at_edge) = walk_end(&work, f, p);
         // upstream: `if i - note_start_idx <= min_note_len: continue`, so a note needs at least 12 frames
         if end - f <= MIN_NOTE_FRAMES {
             continue;
@@ -394,12 +415,14 @@ pub fn frames_to_notes(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<Note> {
             continue;
         }
         let vel = (127.0 * mean).round().clamp(0.0, 127.0) as u8;
-        out.push(Note { t: f as f64 / FPS, dur: (end - f) as f64 / FPS, pitch: (p + 21) as u8, vel });
+        out.push((Note { t: f as f64 / FPS, dur: (end - f) as f64 / FPS, pitch: (p + 21) as u8, vel }, at_edge));
         for r in work[f..end].iter_mut() {
             r[p] = 0.0;
         }
     }
-    out.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal).then(a.pitch.cmp(&b.pitch)));
+    out.sort_by(|a, b| {
+        a.0.t.partial_cmp(&b.0.t).unwrap_or(std::cmp::Ordering::Equal).then(a.0.pitch.cmp(&b.0.pitch))
+    });
     out
 }
 
