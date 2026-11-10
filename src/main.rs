@@ -93,7 +93,11 @@ fn main() -> glib::ExitCode {
         std::process::exit(latency::run(std::env::args().skip(2).collect()));
     }
     if std::env::args().nth(1).as_deref() == Some("remote") {
-        std::process::exit(console::run(std::env::args().skip(2).collect()));
+        std::process::exit(match console::parse(std::env::args().skip(2).collect()) {
+            Err(c) => c,
+            Ok(o) if o.console => console::run_console(o),
+            Ok(o) => ui::run_remote(o),
+        });
     }
     if std::env::args().nth(1).as_deref() == Some("fake-engine") {
         std::process::exit(remote::fake_engine(&std::env::args().skip(2).collect::<Vec<_>>()));

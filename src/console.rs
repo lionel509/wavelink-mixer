@@ -28,11 +28,13 @@ const TICK: Duration = Duration::from_millis(33);
 
 /// Parsed `remote` arguments.
 #[derive(Clone)]
-struct Opts {
-    addr: String,
-    token: String,
-    label: String,
-    host: bool,
+pub struct Opts {
+    pub addr: String,
+    pub token: String,
+    pub label: String,
+    pub host: bool,
+    /// `--console`: the reduced console instead of the full mixer window.
+    pub console: bool,
 }
 
 /// `~/.config/wavelink-mixer/remote-client.json` on the Mac only (never `config.json`).
@@ -68,6 +70,14 @@ fn save_client_file_to(p: &std::path::Path, f: &ClientFile) -> std::io::Result<(
 
 /// `wavelink-mixer remote [ADDR] [--label NAME] [--no-host] [--save]`. Returns the process exit code.
 pub fn run(args: Vec<String>) -> i32 {
+    match parse(args) {
+        Ok(o) => run_console(o),
+        Err(c) => c,
+    }
+}
+
+/// Parse the `remote` arguments (and save the client file for `--save`). Err = the exit code.
+pub fn parse(args: Vec<String>) -> Result<Opts, i32> {
     let mut args = args;
     if args.first().map(|s| s.as_str()) == Some("remote") {
         args.remove(0);
@@ -76,12 +86,14 @@ pub fn run(args: Vec<String>) -> i32 {
     let mut label: Option<String> = None;
     let mut no_host = false;
     let mut save = false;
+    let mut console = false;
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--label" => label = it.next(),
             "--no-host" => no_host = true,
             "--save" => save = true,
+            "--console" => console = true,
             s if s.starts_with("--") => eprintln!("remote: ignoring unknown flag {s}"),
             _ => addr = Some(a),
         }
@@ -90,8 +102,8 @@ pub fn run(args: Vec<String>) -> i32 {
     let addr = match addr.or_else(|| stored.as_ref().map(|s| s.addr.clone()).filter(|s| !s.is_empty())) {
         Some(a) => a,
         None => {
-            eprintln!("usage: wavelink-mixer remote <ADDR> [--label NAME] [--no-host] [--save]");
-            return 2;
+            eprintln!("usage: wavelink-mixer remote <ADDR> [--label NAME] [--no-host] [--save] [--console]");
+            return Err(2);
         }
     };
     let token = match std::env::var("WAVELINK_REMOTE_TOKEN").ok().filter(|t| !t.is_empty()).or_else(|| stored.as_ref().map(|s| s.token.clone()).filter(|t| !t.is_empty())) {
@@ -104,7 +116,7 @@ pub fn run(args: Vec<String>) -> i32 {
     };
     if token.is_empty() {
         eprintln!("remote: no token (WAVELINK_REMOTE_TOKEN, remote-client.json, or stdin)");
-        return 2;
+        return Err(2);
     }
     let default_label = if cfg!(target_os = "macos") { "MacBook" } else { "Remote" };
     let label = label.or_else(|| stored.as_ref().map(|s| s.label.clone()).filter(|s| !s.is_empty())).unwrap_or_else(|| default_label.to_string());
@@ -114,11 +126,15 @@ pub fn run(args: Vec<String>) -> i32 {
             Ok(()) => eprintln!("remote: saved {}", client_file_path().display()),
             Err(e) => {
                 eprintln!("remote: could not save client file: {e}");
-                return 1;
+                return Err(1);
             }
         }
     }
-    let opts = Opts { addr, token, label, host: cfg!(target_os = "macos") && !no_host };
+    Ok(Opts { addr, token, label, host: cfg!(target_os = "macos") && !no_host, console })
+}
+
+/// The reduced console window (`remote --console`).
+pub fn run_console(opts: Opts) -> i32 {
     let app = adw::Application::builder().application_id("local.wavelink.Remote").build();
     app.connect_startup(|_| adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark));
     app.connect_activate(move |app| activate(app, opts.clone()));
@@ -141,6 +157,18 @@ pub fn sanitize_host_id(s: &str) -> String {
 }
 
 /// This computer's host id: `hostname -s`, sanitised; "mac" when that gives nothing.
+/// The Hello host source for this machine when `o.host` and CoreAudio has an output volume (no watcher).
+pub fn host_source(o: &Opts) -> Option<HostSource> {
+    if !o.host || macvol::read().is_none() {
+        return None;
+    }
+    let (idc, lc) = (host_id(), o.label.clone());
+    Some(Box::new(move || {
+        let v = macvol::read().unwrap_or(Volume { volume: 0, mute: false });
+        HostHello { id: idc.clone(), label: lc.clone(), volume: v.volume, mute: v.mute }
+    }))
+}
+
 fn host_id() -> String {
     let raw = std::process::Command::new("hostname")
         .arg("-s")
@@ -801,7 +829,7 @@ fn activate(app: &adw::Application, o: Opts) {
     outer.append(&scroll);
     win.set_content(Some(&outer));
 
-    let conn = link::connect(o.addr.clone(), o.token.clone(), true, host_src, || {});
+    let conn = link::connect(o.addr.clone(), o.token.clone(), true, host_src, false, || {});
     let console = Rc::new(Console {
         win: win.clone(),
         pill,
@@ -924,6 +952,8 @@ mod tests {
 
     #[test]
     fn parse_defaults_to_the_full_window_and_console_flag_opts_in() {
+        // parse reads the token from the environment (else stdin, which is empty under cargo test)
+        std::env::set_var("WAVELINK_REMOTE_TOKEN", "test-token");
         let o = match parse(vec!["remote".into(), "10.0.0.2:8791".into()]) {
             Ok(o) => o,
             Err(c) => panic!("exit {c}"),
