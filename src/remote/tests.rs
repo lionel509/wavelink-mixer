@@ -1030,3 +1030,5 @@ fn safety_raise() -> f64 {
 
 #[path = "breaker_r5.rs"]
 mod breaker_r5;
+#[path = "breaker_r6.rs"]
+mod breaker_r6;
