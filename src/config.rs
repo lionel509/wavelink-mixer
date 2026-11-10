@@ -475,6 +475,12 @@ impl Config {
     /// changes (`base` stays, so the next save still merges instead of overwriting).
     pub fn pull_merged_with(&mut self, base: &mut Config, p: &std::path::Path, prefer: &dyn Fn(&Config, &Config, &mut Config)) -> Result<Option<Config>, String> {
         let Some(d) = Config::peek(p) else { return Ok(None) };
+        self.pull_merged_from(base, d, prefer)
+    }
+
+    /// The merge half of `pull_merged_with`, no I/O: `theirs` is the other writer's config.
+    pub fn pull_merged_from(&mut self, base: &mut Config, theirs: Config, prefer: &dyn Fn(&Config, &Config, &mut Config)) -> Result<Option<Config>, String> {
+        let d = theirs;
         if &d == base {
             return Ok(None);
         }
@@ -482,7 +488,7 @@ impl Config {
         prefer(base, &d, &mut mine);
         match merge3(base, &mine, &d) {
             Some(m) => *self = m,
-            None => return Err(format!("{}: merge with the newer file failed; keeping the window's config", p.display())),
+            None => return Err("merge with the newer config failed; keeping the window's config".to_string()),
         }
         *base = d.clone();
         Ok(Some(d))

@@ -50,7 +50,7 @@ impl Conn {
 }
 
 /// Connect to `addr` (host:port) with `token`; `wake` is called after each event so a GTK window can poll.
-pub fn connect(addr: String, token: String, meters: bool, host: Option<HostSource>, wake: impl Fn() + Send + 'static) -> Conn {
+pub fn connect(addr: String, token: String, meters: bool, host: Option<HostSource>, full: bool, wake: impl Fn() + Send + 'static) -> Conn {
     let (tx, orx) = mpsc::channel::<Out>();
     let (etx, rx) = mpsc::channel::<Event>();
     let stop = Arc::new(AtomicBool::new(false));
@@ -65,7 +65,7 @@ pub fn connect(addr: String, token: String, meters: bool, host: Option<HostSourc
         while !st.load(Ordering::SeqCst) {
             emit(Event::Connecting(addr.clone()));
             let started = Instant::now();
-            match session(&addr, &token, meters, host.as_ref(), &orx, &st, &emit) {
+            match session(&addr, &token, meters, host.as_ref(), full, &orx, &st, &emit) {
                 Ok(()) => return, // stopped
                 Err(Fail::Fatal(m)) => {
                     emit(Event::Fatal(m));
@@ -97,7 +97,7 @@ fn timeout(e: &tungstenite::Error) -> bool {
     matches!(e, tungstenite::Error::Io(io) if matches!(io.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut))
 }
 
-fn session(addr: &str, token: &str, meters: bool, host: Option<&HostSource>, orx: &Receiver<Out>, stop: &AtomicBool, emit: &dyn Fn(Event)) -> Result<(), Fail> {
+fn session(addr: &str, token: &str, meters: bool, host: Option<&HostSource>, full: bool, orx: &Receiver<Out>, stop: &AtomicBool, emit: &dyn Fn(Event)) -> Result<(), Fail> {
     let r = |e: String| Fail::Retry(e);
     let sa = addr.to_socket_addrs().map_err(|e| r(format!("{addr}: {e}")))?.collect::<Vec<_>>();
     // prefer IPv4 (mDNS .local names often resolve to a link-local v6 first)
@@ -126,6 +126,7 @@ fn session(addr: &str, token: &str, meters: bool, host: Option<&HostSource>, orx
         client: format!("Wavelink Remote {} ({})", env!("CARGO_PKG_VERSION"), std::env::consts::OS),
         meters,
         host: host.map(|f| f()),
+        full,
     });
     ws.send(Message::text(hello.to_json())).map_err(|e| r(e.to_string()))?;
     match ws.read() {
@@ -239,6 +240,7 @@ mod tests {
             "tok".into(),
             false,
             Some(Box::new(move || HostHello { id: "macbook".into(), label: "MacBook".into(), volume: src.load(Ordering::SeqCst), mute: false })),
+            false,
             || {},
         );
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), 10, "first Hello");
@@ -257,7 +259,7 @@ mod tests {
             welcome(&mut ws);
             tx.send(read_msg(&mut ws)).unwrap();
         });
-        let conn = connect(addr, "tok".into(), false, None, || {});
+        let conn = connect(addr, "tok".into(), false, None, false, || {});
         loop {
             match conn.rx.recv_timeout(Duration::from_secs(5)) {
                 Ok(Event::Connected { .. }) => break,
