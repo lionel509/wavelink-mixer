@@ -3182,3 +3182,31 @@ mod host_link_tests {
         assert_eq!(host_link_addr(&off), None);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mixer::Locals;
+    use wavelink_proto::{Level, Meters};
+
+    #[test]
+    fn meters_to_levels_writes_pre_post_in_and_bus_keys() {
+        let m = Meters {
+            inputs: vec![Level { id: "spotify".into(), peak_db: -6.0, rms_db: -12.0 }],
+            buses: vec![Level { id: "b2".into(), peak_db: -3.0, rms_db: -9.0 }],
+        };
+        let got = meters_to_levels(&m);
+        assert!(got.contains(&("pre:spotify".to_string(), (-6.0f32, -12.0f32))));
+        assert!(got.contains(&("post:spotify".to_string(), (-6.0f32, -12.0f32))));
+        assert!(got.contains(&("in:spotify".to_string(), (-6.0f32, -12.0f32))));
+        assert!(got.contains(&("bus:b2".to_string(), (-3.0f32, -9.0f32))));
+        assert_eq!(got.len(), 4, "{got:?}");
+    }
+
+    #[test]
+    fn locals_gate_list_matches_the_trait() {
+        // exhaustive destructuring: adding a Locals field without a gate decision fails to compile here
+        let Locals { taps, sysmon, midi, norm, leak, restart } = Locals::for_mixer(false);
+        assert!(!(taps || sysmon || midi || norm || leak || restart));
+    }
+}

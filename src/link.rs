@@ -269,4 +269,24 @@ mod tests {
         let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(got, ClientMsg::HostState { volume: 12, mute: true });
     }
+
+    #[test]
+    fn hello_carries_full_when_asked() {
+        let lis = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = lis.local_addr().unwrap().to_string();
+        let (tx, rx) = mpsc::channel::<bool>();
+        std::thread::spawn(move || {
+            let (s, _) = lis.accept().unwrap();
+            let mut ws = tungstenite::accept(s).unwrap();
+            let hello = match read_msg(&mut ws) {
+                ClientMsg::Hello(h) => h,
+                m => panic!("expected Hello, got {m:?}"),
+            };
+            tx.send(hello.full).unwrap();
+            welcome(&mut ws);
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        let _conn = connect(addr, "tok".into(), false, None, true, || {});
+        assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "the full window asks for snapshots");
+    }
 }

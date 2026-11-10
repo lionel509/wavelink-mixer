@@ -28,6 +28,7 @@ mod remote;
 mod busvol;
 mod ui;
 mod link;
+mod mixer;
 mod macvol;
 mod console;
 #[cfg(test)]

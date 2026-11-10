@@ -700,4 +700,20 @@ mod tests {
         HELD.lock().unwrap_or_else(|e| e.into_inner()).retain(|&q| q != p);
         assert_eq!(left, 1, "one reap of pid {p} forgot both holds");
     }
+
+    #[test]
+    fn graph_wire_round_trip_keeps_name_lookups_and_links() {
+        let node = |id: u64, name: &str| Node { id, serial: id + 100, name: name.into(), ..Default::default() };
+        let w = GraphWire { nodes: vec![node(1, "x"), node(2, "y"), node(3, "z")], links: vec![(1, 3)], cookie: 42 };
+        let json = serde_json::to_string(&w).unwrap();
+        let g: Graph = serde_json::from_str::<GraphWire>(&json).unwrap().into();
+        assert_eq!(g.node("y").map(|n| n.id), Some(2), "by_name rebuilt");
+        assert!(g.has("z"));
+        assert!(g.linked("x", "z"));
+        assert!(!g.linked("y", "z"));
+        assert_eq!(g.cookie, 42);
+        let back = GraphWire::from(&g);
+        assert_eq!(back.links, vec![(1, 3)]);
+        assert_eq!(back.cookie, 42);
+    }
 }

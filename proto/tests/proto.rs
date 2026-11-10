@@ -311,3 +311,53 @@ fn unlock_messages_round_trip() {
     rt_client(ClientMsg::Unlock { bus: "a3".into(), on: true });
     rt_server(ServerMsg::Unlock { bus: "a3".into(), seconds: 60 });
 }
+
+// ---- #44 U1: wire types for the full window (Hello.full, PwCmd, SaveConfig/Pw, Config/Graph)
+
+#[test]
+fn hello_full_defaults_false_and_round_trips() {
+    // old clients never send `full`; it must parse as false
+    let old = r#"{"type":"hello","protocol":1,"token":"t"}"#;
+    match ClientMsg::from_json(old).unwrap() {
+        ClientMsg::Hello(h) => assert!(!h.full),
+        other => panic!("{other:?}"),
+    }
+    rt_client(ClientMsg::Hello(Hello { protocol: 1, token: "t".into(), client: "c".into(), meters: true, host: None, full: true }));
+}
+
+#[test]
+fn pw_cmd_round_trips_every_variant() {
+    let cmds = vec![
+        PwCmd::SetVolume { id: 1, v: 0.5 },
+        PwCmd::SetVolumeMute { id: 1, v: 0.5, mute: true },
+        PwCmd::SetMute { id: 2, mute: false },
+        PwCmd::SetEq { id: 3, eq: vec![0.0, -3.0, 2.5] },
+        PwCmd::SetRack { id: 4, rack: serde_json::json!({"gate": {"on": true}}) },
+        PwCmd::MoveStream { serial: 9, sink: "wavelink_bus_a1".into() },
+        PwCmd::Link { out: "a".into(), inp: "b".into() },
+        PwCmd::LinkSide { out: "a".into(), inp: "b".into(), side: "left".into() },
+    ];
+    for c in cmds {
+        let j = serde_json::to_string(&c).unwrap();
+        assert_eq!(serde_json::from_str::<PwCmd>(&j).unwrap(), c, "{j}");
+    }
+}
+
+#[test]
+fn save_config_and_pw_client_msgs_round_trip() {
+    rt_client(ClientMsg::SaveConfig { id: 7, base: serde_json::json!({"v": 1}), mine: serde_json::json!({"v": 2}) });
+    rt_client(ClientMsg::Pw { id: 8, cmd: PwCmd::SetMute { id: 5, mute: true } });
+}
+
+#[test]
+fn config_and_graph_server_msgs_round_trip() {
+    rt_server(ServerMsg::Config { config: serde_json::json!({"inputs": []}) });
+    rt_server(ServerMsg::Graph { graph: serde_json::json!({"nodes": [], "links": [], "cookie": 3}) });
+}
+
+#[test]
+fn old_hello_json_without_full_parses() {
+    // the exact shape console.rs and client/ send today
+    let s = r#"{"type":"hello","protocol":1,"token":"0123456789abcdef0123456789abcdef","client":"Wavelink Remote 0.1 (macos)","meters":false}"#;
+    assert!(matches!(ClientMsg::from_json(s).unwrap(), ClientMsg::Hello(h) if !h.full));
+}

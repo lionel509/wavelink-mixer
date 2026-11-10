@@ -2,6 +2,7 @@
 use super::backend::FakeBackend;
 use super::server::{serve, Opts, Running};
 use crate::config::{Bus, BusKind, Config};
+use crate::pw;
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -646,4 +647,190 @@ fn bad_host_id_is_refused() {
         Some((ErrorCode::BadRequest, msg)) => assert!(msg.contains("bad host id"), "{msg}"),
         m => panic!("expected BadRequest, got {m:?}"),
     }
+}
+
+// ---- #44 U2: hub side of the full window (Hello.full, SaveConfig, Pw, Config/Graph snapshots)
+
+fn hello_full(ws: &mut Ws) {
+    send(ws, &ClientMsg::Hello(Hello { protocol: PROTOCOL_VERSION, token: TOKEN.into(), client: "test".into(), meters: false, host: None, full: true }));
+}
+
+/// Everything that arrives within `wait`.
+fn collect(ws: &mut Ws, wait: Duration) -> Vec<ServerMsg> {
+    ws.get_ref().set_read_timeout(Some(wait)).unwrap();
+    let mut out = vec![];
+    while let Ok(Message::Text(t)) = ws.read() {
+        out.push(ServerMsg::from_json(t.as_str()).unwrap());
+    }
+    ws.get_ref().set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    out
+}
+
+/// The Ack for command `id`, skipping other traffic.
+fn ack_for(ws: &mut Ws, id: u64) -> (bool, Option<String>, Option<String>) {
+    loop {
+        match recv_np(ws) {
+            Some(ServerMsg::Ack { id: i, ok, error, note }) if i == id => return (ok, error, note),
+            Some(_) => continue,
+            None => panic!("no ack for {id}"),
+        }
+    }
+}
+
+fn graph_fixture(cookie: u64) -> pw::GraphWire {
+    let node = |id: u64, name: &str| pw::Node { id, serial: id + 100, name: name.into(), ..Default::default() };
+    pw::GraphWire { nodes: vec![node(1, "hp"), node(2, "spotify")], links: vec![(2, 1)], cookie }
+}
+
+fn graph_msgs(seen: &[ServerMsg]) -> usize {
+    seen.iter().filter(|m| matches!(m, ServerMsg::Graph { .. })).count()
+}
+
+#[test]
+fn full_hello_gets_config_then_graph_snapshots() {
+    let r = rig("full");
+    *r.fake.graph.lock().unwrap() = Some(graph_fixture(7));
+    let mut ws = connect(&r);
+    hello_full(&mut ws);
+    let msgs = collect(&mut ws, Duration::from_millis(400));
+    let kinds: Vec<&str> = msgs
+        .iter()
+        .map(|m| match m {
+            ServerMsg::Welcome { .. } => "welcome",
+            ServerMsg::State { .. } => "state",
+            ServerMsg::Config { .. } => "config",
+            ServerMsg::Graph { .. } => "graph",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(kinds, ["welcome", "state", "config", "graph"], "{kinds:?}");
+    let want_cfg = serde_json::to_value(Config::peek(&r.cfg).unwrap()).unwrap();
+    match &msgs[2] {
+        ServerMsg::Config { config } => assert_eq!(config, &want_cfg),
+        m => panic!("{m:?}"),
+    }
+    let want_graph = serde_json::to_value(graph_fixture(7)).unwrap();
+    match &msgs[3] {
+        ServerMsg::Graph { graph } => assert_eq!(graph, &want_graph),
+        m => panic!("{m:?}"),
+    }
+}
+
+#[test]
+fn plain_hello_never_gets_config_or_graph() {
+    // I2: old clients (console.rs, client/) never see config or graph, even while both change
+    let r = rig("plain");
+    *r.fake.graph.lock().unwrap() = Some(graph_fixture(7));
+    let (mut a, _) = join(&r);
+    let mut p = connect(&r);
+    hello(&mut p, TOKEN, false);
+    let first = collect(&mut p, Duration::from_millis(300));
+    assert!(matches!(first.first(), Some(ServerMsg::Welcome { .. })), "{first:?}");
+    *r.fake.graph.lock().unwrap() = Some(graph_fixture(8));
+    let (ok, _, _, _) = cmd(&mut a, 1, Command::SetInputGain { input: "spotify".into(), db: -9.5 });
+    assert!(ok);
+    let later = collect(&mut p, Duration::from_millis(1200));
+    let all: Vec<&ServerMsg> = first.iter().chain(later.iter()).collect();
+    assert!(all.iter().all(|m| !matches!(m, ServerMsg::Config { .. } | ServerMsg::Graph { .. })), "{all:?}");
+    assert!(all.iter().any(|m| matches!(m, ServerMsg::Delta { .. })), "the plain client still gets deltas");
+}
+
+#[test]
+fn save_config_merges_three_way_and_publishes() {
+    let r = rig("save3");
+    let (mut a, _) = join(&r);
+    let mut f = connect(&r);
+    hello_full(&mut f);
+    let base = Config::peek(&r.cfg).unwrap();
+    // mine renames spotify; meanwhile disk gets a new gain for spotify from elsewhere
+    let mut mine = base.clone();
+    mine.inputs.iter_mut().find(|i| i.id == "spotify").unwrap().name = "Renamed".into();
+    let mut disk = Config::load_from(&r.cfg);
+    disk.inputs.iter_mut().find(|i| i.id == "spotify").unwrap().gain_db = -9.5;
+    assert!(disk.save_to(&r.cfg));
+    send(&mut a, &ClientMsg::SaveConfig { id: 5, base: serde_json::to_value(&base).unwrap(), mine: serde_json::to_value(&mine).unwrap() });
+    let (ok, err, _) = ack_for(&mut a, 5);
+    assert!(ok, "{err:?}");
+    let saved = Config::peek(&r.cfg).unwrap();
+    let sp = saved.inputs.iter().find(|i| i.id == "spotify").unwrap();
+    assert_eq!(sp.name, "Renamed", "my edit kept");
+    assert_eq!(sp.gain_db, -9.5, "their edit kept");
+    // the full client hears the merged file
+    let got = collect(&mut f, Duration::from_millis(600));
+    let pushed = got.iter().rev().find_map(|m| match m {
+        ServerMsg::Config { config } => Some(config.clone()),
+        _ => None,
+    });
+    assert_eq!(pushed, Some(serde_json::to_value(&saved).unwrap()));
+}
+
+#[test]
+fn save_config_caps_bus_raises_like_set_bus_gain() {
+    // I1, generated: a SaveConfig that raises a bus leaves the same gain (or refusal) as SetBusGain
+    // from the same connection would. The rig's a3 is a speaker capped at -20 dB.
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for i in 0..50u64 {
+        let start = -30.0 + (next() % 101) as f64 / 10.0; // -30.0 ..= -20.0
+        let want = -60.0 + (next() % 721) as f64 / 10.0; // -60.0 ..= +12.0
+        let gain_of = |c: &mut Config, db: f64| c.buses.iter_mut().find(|b| b.id == "a3").unwrap().gain_db = db;
+        let r1 = rig_with(&format!("capA{i}"), |c| gain_of(c, start));
+        let r2 = rig_with(&format!("capB{i}"), |c| gain_of(c, start));
+        let (mut a, _) = join(&r1);
+        let (cmd_ok, _, _, _) = cmd(&mut a, 1, Command::SetBusGain { bus: "a3".into(), db: want, unlock: false });
+        let want_gain = Config::peek(&r1.cfg).unwrap().buses.iter().find(|b| b.id == "a3").unwrap().gain_db;
+
+        let (mut b, _) = join(&r2);
+        let base = Config::peek(&r2.cfg).unwrap();
+        let mut mine = base.clone();
+        gain_of(&mut mine, want);
+        send(&mut b, &ClientMsg::SaveConfig { id: 1, base: serde_json::to_value(&base).unwrap(), mine: serde_json::to_value(&mine).unwrap() });
+        let (save_ok, _, _) = ack_for(&mut b, 1);
+        assert_eq!(save_ok, cmd_ok, "case {i}: start {start} want {want}");
+        let got = Config::peek(&r2.cfg).unwrap().buses.iter().find(|b| b.id == "a3").unwrap().gain_db;
+        assert_eq!(got, want_gain, "case {i}: start {start} want {want}");
+    }
+}
+
+#[test]
+fn pw_volume_on_a_bus_node_goes_through_safety() {
+    // I1: a bus's live node is written through the same caps as SetBusGain, never raw
+    let r = rig("pwbus");
+    r.fake.bus_nodes.lock().unwrap().insert(7, "a3".into());
+    let (mut a, _) = join(&r);
+    send(&mut a, &ClientMsg::Pw { id: 3, cmd: PwCmd::SetVolume { id: 7, v: 2.0 } });
+    let (ok, _, _) = ack_for(&mut a, 3);
+    assert!(ok);
+    assert!(r.fake.pw_log.lock().unwrap().is_empty(), "no raw pw write for a bus node");
+    assert!(r.fake.applied.lock().unwrap().iter().any(|c| matches!(c, Command::SetBusGain { bus, .. } if bus == "a3")));
+}
+
+#[test]
+fn pw_on_a_plain_node_is_applied_raw() {
+    let r = rig("pwraw");
+    let (mut a, _) = join(&r);
+    let eq = vec![0.0, -3.0, 2.5];
+    send(&mut a, &ClientMsg::Pw { id: 4, cmd: PwCmd::SetEq { id: 9, eq: eq.clone() } });
+    let (ok, _, _) = ack_for(&mut a, 4);
+    assert!(ok);
+    assert_eq!(r.fake.pw_log.lock().unwrap().as_slice(), &[PwCmd::SetEq { id: 9, eq }]);
+}
+
+#[test]
+fn graph_thread_sends_only_on_change() {
+    let r = rig("graphchg");
+    *r.fake.graph.lock().unwrap() = Some(graph_fixture(7));
+    let mut f = connect(&r);
+    hello_full(&mut f);
+    let mut seen = collect(&mut f, Duration::from_millis(1200)); // hello's snapshot
+    *r.fake.graph.lock().unwrap() = Some(graph_fixture(7)); // same value: no send
+    seen.extend(collect(&mut f, Duration::from_millis(1200)));
+    *r.fake.graph.lock().unwrap() = Some(graph_fixture(8)); // changed: one send
+    seen.extend(collect(&mut f, Duration::from_millis(1200)));
+    assert_eq!(graph_msgs(&seen), 2, "hello snapshot + one change");
 }

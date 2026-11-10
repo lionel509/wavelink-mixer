@@ -921,4 +921,18 @@ mod tests {
         // Without a monitor, the sane max applies.
         assert_eq!(default_width(2400, None), 1800);
     }
+
+    #[test]
+    fn parse_defaults_to_the_full_window_and_console_flag_opts_in() {
+        let o = match parse(vec!["remote".into(), "10.0.0.2:8791".into()]) {
+            Ok(o) => o,
+            Err(c) => panic!("exit {c}"),
+        };
+        assert!(!o.console, "the full window is the default");
+        let o = match parse(vec!["remote".into(), "10.0.0.2:8791".into(), "--console".into()]) {
+            Ok(o) => o,
+            Err(c) => panic!("exit {c}"),
+        };
+        assert!(o.console, "--console keeps the reduced console");
+    }
 }
