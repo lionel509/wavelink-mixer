@@ -23,6 +23,8 @@ pub struct Node {
     /// an AirPlay/RAOP sink by its props (factory/media.class/device.api/raop.* keys), whatever its name (#33)
     pub raop: bool,
     pub owned: bool,
+    /// an output of the engine's own child graph (virtual mic): never a capture candidate
+    pub child_out: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -73,6 +75,7 @@ impl Graph {
                         has_vol,
                         raop: props_say_raop(p),
                         owned: p["wavelink.owned"].as_bool() == Some(true) || s("wavelink.owned") == "true",
+                        child_out: p["wavelink.child_out"].as_bool() == Some(true) || s("wavelink.child_out") == "true",
                     };
                     if !n.name.is_empty() {
                         g.by_name.insert(n.name.clone(), g.nodes.len());
@@ -122,7 +125,7 @@ impl Graph {
         self.nodes.iter().filter(|n| n.class == "Audio/Sink" && (n.name.starts_with("alsa_") || n.name.starts_with("bluez_"))).collect()
     }
     pub fn sources(&self) -> Vec<&Node> {
-        self.nodes.iter().filter(|n| n.class.starts_with("Audio/Source") && !n.owned && !n.name.ends_with(".monitor")).collect()
+        self.nodes.iter().filter(|n| n.class.starts_with("Audio/Source") && !n.owned && !n.child_out && !n.name.ends_with(".monitor")).collect()
     }
 }
 
