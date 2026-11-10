@@ -1027,3 +1027,6 @@ fn breaker_delete_and_readd_within_window_keeps_the_raise_limit() {
 fn safety_raise() -> f64 {
     wavelink_proto::safety::MAX_RAISE_PER_WINDOW_DB
 }
+
+#[path = "breaker_r5.rs"]
+mod breaker_r5;

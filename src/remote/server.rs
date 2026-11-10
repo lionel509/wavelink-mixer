@@ -68,10 +68,20 @@ struct Core {
     clients: Vec<Client>,
     /// time-based raise limit per physical bus, shared by every client
     limits: HashMap<String, safety::RaiseLimiter>,
+    /// last known gain per limiter key, kept after a bus is deleted so a later re-add can't restart from 'unknown'
+    last_gain: HashMap<String, f64>,
     /// the Macs (and other hosts) that report their own output volume (#37)
     hosts: Vec<p::Host>,
     /// host id -> the connection that owns it (the newest registration wins)
     host_owner: HashMap<String, u64>,
+}
+
+/// Limiter key: the hardware target a bus plays to (so a new id on the same device shares its history), else the id.
+fn limit_key(cfg: &Config, bus: &str) -> String {
+    match cfg.buses.iter().find(|b| b.id == bus).map(|b| &b.kind) {
+        Some(config::BusKind::Hardware { target }) => format!("target:{target}"),
+        _ => bus.to_string(),
+    }
 }
 
 struct Token {
@@ -279,7 +289,7 @@ pub fn serve(opts: Opts, backend: Arc<dyn Backend>) -> std::io::Result<Running> 
     let inner = Arc::new(Inner {
         opts,
         backend,
-        core: Mutex::new(Core { cfg, state, clients: vec![], limits: HashMap::new(), hosts: vec![], host_owner: HashMap::new() }),
+        core: Mutex::new(Core { cfg, state, clients: vec![], limits: HashMap::new(), last_gain: HashMap::new(), hosts: vec![], host_owner: HashMap::new() }),
         next_id: AtomicU64::new(1),
         stop: AtomicBool::new(false),
         conns: AtomicUsize::new(0),
@@ -612,7 +622,8 @@ impl Inner {
                 }
                 let cur = b.gain_db;
                 if *db > cur {
-                    let allowed = core.limits.entry(bus.clone()).or_default().allowed(now, cur);
+                    let key = limit_key(&core.cfg, bus);
+                    let allowed = core.limits.entry(key).or_default().allowed(now, cur);
                     if *db > allowed {
                         *db = allowed.max(cur);
                         checked.note = Some(format!("raised at most {} dB per {} s", safety::MAX_RAISE_PER_WINDOW_DB, safety::RAISE_WINDOW_S));
@@ -634,7 +645,9 @@ impl Inner {
         for (bus, before, _) in raised {
             // what was really written (model::apply clamps to the ceiling too)
             let after = cfg.buses.iter().find(|b| b.id == bus).map(|b| b.gain_db).unwrap_or(before);
-            core.limits.entry(bus).or_default().record(now, before, after);
+            let key = limit_key(&cfg, &bus);
+            core.last_gain.insert(key.clone(), after);
+            core.limits.entry(key).or_default().record(now, before, after);
         }
         for c in &checked.cmds {
             self.backend.apply(&cfg, c);
@@ -656,6 +669,11 @@ impl Inner {
         let now = self.now_s();
         let mut notes: Vec<String> = vec![];
         let mut raised = vec![];
+        // remember every hub bus's gain by target before this save can delete it
+        let hub_cfg = core.cfg.clone();
+        for b in hub_cfg.buses.iter().filter(|b| matches!(b.kind, config::BusKind::Hardware { .. })) {
+            core.last_gain.insert(limit_key(&hub_cfg, &b.id), b.gain_db);
+        }
         // a remote save never moves a bus's ceiling or kind: the hub's values win (their lift would defeat I1)
         for b in mine.buses.iter_mut() {
             if let Some(h) = core.cfg.buses.iter().find(|h| h.id == b.id) {
@@ -677,15 +695,17 @@ impl Inner {
             .collect();
         for (bus, db) in want {
             if core.state.bus(&bus).is_none() {
-                // not live (offline target, or deleted and re-added): key on config + limiter history, never skip the limit
-                let known = core.cfg.buses.iter().find(|b| b.id == bus).map(|b| b.gain_db);
-                if known.is_none() && !core.limits.contains_key(&bus) {
-                    continue; // a truly new id: ceiling-clamped only
-                }
-                let cur = known.unwrap_or(f64::INFINITY);
-                let allowed = core.limits.entry(bus.clone()).or_default().allowed(now, cur);
+                // not live (new id, offline target, or deleted and re-added): the rule is per target,
+                // the same one SetBusGain applies (raise window + 6 dB step), never skipped
+                let key = match mine.buses.iter().find(|b| b.id == bus).map(|b| &b.kind) {
+                    Some(config::BusKind::Hardware { target }) => format!("target:{target}"),
+                    _ => bus.clone(),
+                };
+                let known = hub_cfg.buses.iter().find(|b| b.id == bus).map(|b| b.gain_db).or_else(|| core.last_gain.get(&key).copied());
+                let Some(cur) = known else { continue }; // a target the hub has never seen: ceiling-clamped only
+                let allowed = core.limits.entry(key).or_default().allowed(now, cur).min(cur + safety::MAX_STEP_DB);
                 if db > allowed {
-                    let capped = if known.is_some() { allowed.max(cur) } else { allowed };
+                    let capped = allowed.max(cur);
                     if let Some(b) = mine.buses.iter_mut().find(|b| b.id == bus) {
                         b.gain_db = capped;
                     }
@@ -703,7 +723,8 @@ impl Inner {
                     if let Some(b) = core.state.bus(bus).filter(|b| b.physical()) {
                         let cur = b.gain_db;
                         if *db > cur {
-                            let allowed = core.limits.entry(bus.clone()).or_default().allowed(now, cur);
+                            let key = limit_key(&hub_cfg, bus);
+                            let allowed = core.limits.entry(key).or_default().allowed(now, cur);
                             if *db > allowed {
                                 *db = allowed.max(cur);
                                 checked.note = Some(format!("raised at most {} dB per {} s", safety::MAX_RAISE_PER_WINDOW_DB, safety::RAISE_WINDOW_S));
@@ -732,7 +753,9 @@ impl Inner {
                 let cfg = Config::load_from(&self.opts.cfg_path);
                 for (bus, before) in raised {
                     let after = cfg.buses.iter().find(|b| b.id == bus).map_or(before, |b| b.gain_db);
-                    core.limits.entry(bus).or_default().record(now, before, after);
+                    let key = limit_key(&hub_cfg, &bus);
+                    core.last_gain.insert(key.clone(), after);
+                    core.limits.entry(key).or_default().record(now, before, after);
                 }
                 self.publish(&mut core, cfg);
                 ServerMsg::Ack { id, ok: true, error: None, note: if notes.is_empty() { None } else { Some(notes.join("; ")) } }
