@@ -6,7 +6,7 @@ use crate::dsp::{envelope, onsets, xcorr_lag, BP_RATE};
 use crate::models::{self, ModelSet, S_FILES, U_FILES};
 use crate::notes::{synth_events, Note, Synth, Timeline, MIDI_LAG, STEMS};
 use crate::pw::{die_with_parent, Graph};
-use crate::sep::{calibrate, deinterleave, frames_to_notes_open, walk_end, Grids, Separator, Streamer, Transcriber, BLOCK, BLOCK_MS, BP_SAMPLES, FPS, PARALLEL};
+use crate::sep::{calibrate, deinterleave, frames_to_notes_open, walk_end, Grids, FRAME_THRESH, ONSET_THRESH, Separator, Streamer, Transcriber, BLOCK, BLOCK_MS, BP_SAMPLES, FPS, PARALLEL};
 use crate::stemcfg::{self, Plays, SepEngine};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -867,12 +867,30 @@ pub fn window_notes(g: Option<&mut Grids>, end_t: f64, open: &mut Vec<Note>) -> 
     for n in open.drain(..) {
         let p = n.pitch as usize - 21;
         let old_end = n.t + n.dur;
-        let f0 = ((old_end - ws) * FPS).floor();
-        if f0 < 1.0 || f0 as usize + 1 >= frames {
+        let mut f0 = ((old_end - ws) * FPS).floor();
+        if f0 < 1.0 {
+            // Windows were dropped and this one starts past the note's last known end: bridge the gap
+            // when the pitch is still sounding at the window start, else the note is over.
+            if old_end >= ws || g.note.len() < 2 || g.note[1][p] < FRAME_THRESH {
+                continue;
+            }
+            f0 = 1.0;
+        }
+        if f0 as usize + 1 >= frames {
             continue;
         }
         let f0 = f0 as usize;
-        let (end, at_edge) = walk_end(&g.note, f0 - 1, p); // starts by testing frame f0
+        let (mut end, mut at_edge) = walk_end(&g.note, f0 - 1, p); // starts by testing frame f0
+        // A same-pitch onset peak inside the walk is a re-strike: the carried note ends where it
+        // went quiet, and the re-strike is left on the grid for a new note.
+        let restrike = (f0 + 1..end).find(|&f| {
+            let v = g.onset[f][p];
+            v >= ONSET_THRESH && v >= g.onset[f - 1][p] && g.onset.get(f + 1).map_or(true, |r| v >= r[p]) && g.note[f - 1][p] < FRAME_THRESH
+        });
+        if let Some(fr) = restrike {
+            end = (f0..fr).rev().find(|&f| g.note[f][p] >= FRAME_THRESH).map_or(f0, |f| f + 1);
+            at_edge = false;
+        }
         if ws + end as f64 / FPS <= old_end {
             continue;
         }
@@ -1338,6 +1356,39 @@ mod tests {
         let (_, out, _) = run_windows(&[(1.0, 5.0, 48)], 4..=14, Some((3.0, 48)));
         assert_eq!(out.len(), 1, "a re-onset inside the sustain must not start a second note: {out:?}");
         assert!((out[0].dur - 4.0).abs() <= 1.0 / crate::sep::FPS + 1e-9, "full length: {}", out[0].dur);
+    }
+
+    #[test]
+    fn window_notes_bridges_four_or_more_dropped_windows() {
+        let ks: Vec<usize> = (4..=14).filter(|k| !(15..=18).contains(k)).chain(19..=24).collect();
+        let (_, out, _) = run_windows(&[(1.0, 12.0, 48)], 4..=4, None);
+        let _ = out;
+        for drop in 1..=7usize {
+            let ks: Vec<usize> = ks.iter().copied().filter(|k| !(15..15 + drop).contains(k)).chain(15 + drop..=24).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+            let step = CHUNK as f64 / RATE as f64;
+            let win_len = BP_SAMPLES as f64 / BP_RATE as f64;
+            let mut open = Vec::new();
+            let mut tl = crate::notes::Timeline::new();
+            for k in ks {
+                let end_t = k as f64 * step;
+                let mut g = held_win(end_t - win_len, &[(1.0, 12.0, 48)]);
+                let (new, ext) = window_notes(Some(&mut g), end_t, &mut open);
+                tl.add(1, &new);
+                tl.extend(1, &ext);
+            }
+            let out = tl.window(1, 0.0, 100.0);
+            let total: f64 = out.iter().map(|n| n.dur).sum();
+            assert_eq!(out.len(), 1, "drop {drop}: {out:?}");
+            assert!((total - 11.0).abs() < 0.1, "drop {drop}: dur {total:.3}");
+        }
+    }
+
+    #[test]
+    fn window_notes_restrike_inside_carry_tail_is_kept() {
+        let ks: Vec<usize> = (4..=14).collect();
+        let (_, out, _) = run_windows(&[(1.0, 3.0, 48), (3.1, 5.0, 48)], 4..=14, None);
+        let _ = ks;
+        assert_eq!(out.len(), 2, "re-strike swallowed: {out:?}");
     }
 
     /// Pin for the grid origin: frame 0 of a production window sits at `end_t - BP_SAMPLES / BP_RATE`.
