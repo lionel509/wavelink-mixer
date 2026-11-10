@@ -1018,9 +1018,10 @@ fn readd_case(tag: &str, wait: Option<Duration>) -> f64 {
 
 #[test]
 fn breaker_delete_and_readd_within_window_keeps_the_raise_limit() {
-    // last known -20 dB; a re-add inside the window may rise at most 12 dB, so at most -8
+    // the window floor is the lowest level in it (-30 before the raise to -20),
+    // so an in-window re-add may reach at most -30 + 12 = -18 dB
     let g = readd_case("readdnow", None);
-    assert!(g <= -8.0 + 1e-9, "re-added at {g}");
+    assert!(g <= -30.0 + safety_raise() + 1e-9, "re-added at {g}");
 }
 
 fn safety_raise() -> f64 {
