@@ -84,7 +84,7 @@ fn recv_np(ws: &mut Ws) -> Option<ServerMsg> {
 }
 
 fn hello(ws: &mut Ws, token: &str, meters: bool) {
-    send(ws, &ClientMsg::Hello(Hello { protocol: PROTOCOL_VERSION, token: token.into(), client: "test".into(), meters, host: None }));
+    send(ws, &ClientMsg::Hello(Hello { protocol: PROTOCOL_VERSION, token: token.into(), client: "test".into(), meters, host: None, full: false }));
 }
 
 /// Connect, greet, return the socket and the first snapshot.
@@ -141,7 +141,7 @@ fn rejects_bad_token_and_protocol() {
     hello(&mut ws, "wrong", false);
     assert!(matches!(recv(&mut ws), Some(ServerMsg::Error { code: ErrorCode::Auth, .. })));
     let mut ws = connect(&r);
-    send(&mut ws, &ClientMsg::Hello(Hello { protocol: PROTOCOL_VERSION + 1, token: TOKEN.into(), client: String::new(), meters: false, host: None }));
+    send(&mut ws, &ClientMsg::Hello(Hello { protocol: PROTOCOL_VERSION + 1, token: TOKEN.into(), client: String::new(), meters: false, host: None, full: false }));
     assert!(matches!(recv(&mut ws), Some(ServerMsg::Error { code: ErrorCode::Protocol, .. })));
     let mut ws = connect(&r);
     send(&mut ws, &ClientMsg::Ping { t: 1 });
@@ -513,7 +513,7 @@ fn client_leaving_is_unregistered() {
 /// Greet as a host (a computer that owns its system volume).
 fn hello_host(ws: &mut Ws, id: &str, label: &str, volume: u8, mute: bool) {
     let host = HostHello { id: id.into(), label: label.into(), volume, mute };
-    send(ws, &ClientMsg::Hello(Hello { protocol: PROTOCOL_VERSION, token: TOKEN.into(), client: "test-host".into(), meters: false, host: Some(host) }));
+    send(ws, &ClientMsg::Hello(Hello { protocol: PROTOCOL_VERSION, token: TOKEN.into(), client: "test-host".into(), meters: false, host: Some(host), full: false }));
 }
 
 /// Wait for the welcome and the first snapshot of a host connection.
