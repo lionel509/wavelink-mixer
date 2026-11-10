@@ -7,6 +7,7 @@ use crate::dash::{db_to_pos, hex_rgb, Hit, pos_to_db, screw_row, Analyzer, Fft, 
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use crate::pw::{self, Graph, Side};
+use crate::mixer::{Event, Mixer};
 use adw::prelude::*;
 use gtk::{gdk, glib};
 use std::cell::{Cell, RefCell};
@@ -217,7 +218,8 @@ impl Fader {
 
 /// Peak meter fed by a `pw-record` child process (raw f32 on stdout).
 struct Meter {
-    child: std::process::Child,
+    /// the pw-record tap; None for a silent meter on a remote window (#44)
+    child: Option<std::process::Child>,
     level: [std::sync::Arc<std::sync::atomic::AtomicU64>; 2],
     led: Option<Rc<LedMeter>>,
     vu: Option<Rc<Vu>>,
@@ -236,8 +238,10 @@ struct Meter {
 }
 impl Drop for Meter {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(c) = self.child.as_mut() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
     }
 }
 impl Meter {
@@ -247,6 +251,10 @@ impl Meter {
             let raw = f64::from_bits(self.level[c].swap(f64::NAN.to_bits(), std::sync::atomic::Ordering::Relaxed));
             db[c] = if raw.is_nan() { self.last[c].get() } else { raw };
             self.last[c].set(db[c]);
+        }
+        if self.child.is_none() {
+            // a silent tap (remote window, #44): apply_meters keeps `out` current from the hub
+            db = [self.out.get().0; 2];
         }
         // L/R solo: both ears get the one side (the monitor shows what is heard)
         match self.side.get() {
@@ -259,6 +267,7 @@ impl Meter {
         }
         let raw = f64::from_bits(self.rms.swap(f64::NAN.to_bits(), std::sync::atomic::Ordering::Relaxed));
         let r = if raw.is_nan() { self.last_rms.get() } else { raw };
+        let r = if self.child.is_none() { self.out.get().1 } else { r };
         self.last_rms.set(r);
         if let Some(vu) = &self.vu {
             vu.step(r, dt);
@@ -267,11 +276,43 @@ impl Meter {
     }
 }
 
+/// Hub meter levels as the window's cell keys (#44): an input feeds `pre:`, `post:` and `in:`, a bus `bus:`.
+fn meters_to_levels(m: &wavelink_proto::Meters) -> Vec<(String, (f32, f32))> {
+    let mut out = Vec::new();
+    for l in &m.inputs {
+        let v = (l.peak_db as f32, l.rms_db as f32);
+        for p in ["pre", "post", "in"] {
+            out.push((format!("{p}:{}", l.id), v));
+        }
+    }
+    for l in &m.buses {
+        out.push((format!("bus:{}", l.id), (l.peak_db as f32, l.rms_db as f32)));
+    }
+    out
+}
+
 /// Meter on a sink monitor / source (`target`), or unconnected (`None`, linked manually as `name`).
-fn meter(name: &str, target: Option<(&str, bool)>, led: Option<Rc<LedMeter>>, vu: Option<Rc<Vu>>, side: Rc<Cell<Side>>) -> Option<Meter> {
+fn meter(name: &str, target: Option<(&str, bool)>, led: Option<Rc<LedMeter>>, vu: Option<Rc<Vu>>, side: Rc<Cell<Side>>, spawn: bool) -> Option<Meter> {
     use std::io::Read;
     if crate::dash::no_audio() {
         return None;
+    }
+    if !spawn {
+        // a remote window (#44) has no local tap: apply_meters fills `out` from the hub
+        let nan = || std::sync::Arc::new(std::sync::atomic::AtomicU64::new(f64::NAN.to_bits()));
+        return Some(Meter {
+            child: None,
+            level: [nan(), nan()],
+            led,
+            vu,
+            out: Rc::new(Cell::new((-90.0, -90.0))),
+            last: [Cell::new(-90.0), Cell::new(-90.0)],
+            rms: nan(),
+            last_rms: Cell::new(-90.0),
+            bands: Arc::new(Mutex::new(vec![0.0f32; crate::dash::BANDS])),
+            node: format!("{name}.{}", std::process::id()),
+            side,
+        });
     }
     use std::sync::atomic::{AtomicU64, Ordering};
     // a stale same-named tap from an earlier window can never take the link: every tap gets its pid
@@ -347,7 +388,7 @@ fn meter(name: &str, target: Option<(&str, bool)>, led: Option<Rc<LedMeter>>, vu
             }
         }
     });
-    Some(Meter { child, level, led, vu, out: Rc::new(Cell::new((-90.0, -90.0))), last: [Cell::new(-90.0), Cell::new(-90.0)], rms, last_rms: Cell::new(-90.0), bands, node, side })
+    Some(Meter { child: Some(child), level, led, vu, out: Rc::new(Cell::new((-90.0, -90.0))), last: [Cell::new(-90.0), Cell::new(-90.0)], rms, last_rms: Cell::new(-90.0), bands, node, side })
 }
 
 /// Failed merges in a row before the window parks its config and follows the file (B36-9).
@@ -374,8 +415,9 @@ pub struct App {
     rack_page: gtk::Box,
     /// system gauges, shown under the output strips
     sys_panel: gtk::Box,
-    /// #37: the loopback link to this engine (None when remote control is off), and the MacBook-style host strips
-    link: RefCell<Option<crate::link::Conn>>,
+    /// the engine this window reads and writes (#44): the local PipeWire engine, or the hub over the wire
+    mixer: Rc<dyn Mixer>,
+    /// the MacBook-style host strips (#37)
     /// host strips at the end of the OUTPUTS row (re-homed on every rebuild, rebuilt only when the host list changes)
     hosts_box: gtk::Box,
     last_hosts: RefCell<Vec<wavelink_proto::Host>>,
@@ -498,7 +540,7 @@ impl App {
                 }
                 app.mark_dirty();
                 if let Some(nid) = app.node_id(&names::strip_in(&id2)) {
-                    pw::set_eq(nid, &eq);
+                    app.mixer.set_eq(nid, &eq);
                 }
             });
             knob.area.set_tooltip_text(Some("Drag or scroll · double-click resets"));
@@ -528,7 +570,7 @@ impl App {
             }
             app.mark_dirty();
             if let Some(nid) = app.node_id(&names::strip_in(&id2)) {
-                pw::set_eq(nid, &eq);
+                app.mixer.set_eq(nid, &eq);
             }
             // back to the placeholder so the same preset can be picked again
             let d = d.clone();
@@ -547,7 +589,7 @@ impl App {
         };
         self.mark_dirty();
         if let Some(nid) = self.node_id(&names::strip_in(id)) {
-            pw::set_rack(nid, &rack);
+            self.mixer.set_rack(nid, &rack);
         }
         rack
     }
@@ -792,8 +834,9 @@ impl App {
                 for (i, inp) in inputs.iter().enumerate().filter(|(_, i)| i.kind == InputKind::Virtual) {
                     let b = gtk::Button::with_label(&if i == cur { format!("● {}", inp.name) } else { inp.name.clone() });
                     let (sink, p2) = (names::ch(&inp.id), pop.clone());
+                    let mx = self.mixer.clone();
                     b.connect_clicked(move |_| {
-                        pw::move_stream(serial, &sink);
+                        mx.move_stream(serial, &sink);
                         p2.popdown();
                     });
                     body.append(&b);
@@ -831,7 +874,7 @@ impl App {
                         }
                         self.mark_dirty();
                         if let Some(nid) = self.node_id(&names::strip_in(&inp.id)) {
-                            pw::set_mute(nid, m);
+                            self.mixer.set_mute(nid, m);
                         }
                         pop.unparent();
                         return;
@@ -855,7 +898,7 @@ impl App {
                         }
                         app.mark_dirty();
                         if let Some(nid) = app.node_id(&names::route(&iid, &bid)) {
-                            pw::set_mute(nid, !on);
+                            app.mixer.set_mute(nid, !on);
                         }
                     });
                     body.append(&sw);
@@ -973,11 +1016,18 @@ impl App {
             }
         }
         if !work.is_empty() {
-            self.side_q.push(Box::new(move || {
+            if !self.mixer.is_local() {
+                // a remote window (#44) has no PipeWire: the hub makes the links
                 for (o, i, s) in work {
-                    pw::link_side(&o, &i, s);
+                    self.mixer.link_side(&o, &i, s);
                 }
-            }));
+            } else {
+                self.side_q.push(Box::new(move || {
+                    for (o, i, s) in work {
+                        pw::link_side(&o, &i, s);
+                    }
+                }));
+            }
         }
         let any = self.sides.borrow().values().any(|c| c.get() != Side::Stereo);
         if let Some(btn) = self.side_clear.borrow().as_ref() {
@@ -992,7 +1042,7 @@ impl App {
         for (id, muted) in inputs {
             let m = crate::stemcfg::effective_mute(muted, &id, &solo, self.stems.replaced.borrow().as_deref());
             if let Some(nid) = self.node_id(&names::strip_in(&id)) {
-                pw::set_mute(nid, m);
+                self.mixer.set_mute(nid, m);
             }
         }
     }
@@ -1086,7 +1136,7 @@ impl App {
         let prefer = |b: &Config, d: &Config, m: &mut Config| *won.borrow_mut() = config::their_gains_win(b, d, m, &auto);
         let r = {
             let (mut c, mut b) = (self.cfg.borrow_mut(), self.synced.borrow_mut());
-            c.save_merged_with(&mut b, &Config::path(), &prefer)
+            self.mixer.save_cfg(&mut c, &mut b, &prefer)
         };
         match r {
             Ok(changed) => {
@@ -1113,13 +1163,13 @@ impl App {
             return;
         }
         self.merge_fails.set(0);
-        let parked = config::parked_path(&Config::path(), std::time::SystemTime::now());
+        let parked = config::parked_path(&self.mixer.cfg_path(), std::time::SystemTime::now());
         let ok = mine.save_to(&parked);
         eprintln!(
             "wavelink: WARNING: config.json could not be merged {MERGE_TRIES} times in a row; {} ({e}). The window now follows config.json.",
             if ok { format!("this window's settings were saved to {}", parked.display()) } else { format!("saving them to {} failed too", parked.display()) }
         );
-        if let Some(d) = Config::peek(&Config::path()) {
+        if let Some(d) = Config::peek(&self.mixer.cfg_path()) {
             *self.cfg.borrow_mut() = d.clone();
             *self.synced.borrow_mut() = d;
             self.dirty.set(false);
@@ -1136,7 +1186,7 @@ impl App {
         let prefer = |b: &Config, d: &Config, m: &mut Config| *won.borrow_mut() = config::their_gains_win(b, d, m, &auto);
         let disk = {
             let (mut c, mut b) = (self.cfg.borrow_mut(), self.synced.borrow_mut());
-            c.pull_merged_with(&mut b, &Config::path(), &prefer)
+            self.mixer.pull_cfg(&mut c, &mut b, &prefer)
         };
         match disk {
             Ok(Some(_)) => {
@@ -1191,7 +1241,7 @@ impl App {
                 // a remote fader move is his move for auto-normalize too; and it is what the strip plays
                 self.fader_manual(&names::strip_in(&n.id), n.gain_db);
                 if let Some(id) = self.node_id(&names::strip_in(&n.id)) {
-                    pw::set_volume(id, db_to_vol(n.gain_db));
+                    self.mixer.set_volume(id, db_to_vol(n.gain_db));
                 }
             } else if n.norm_out != b.norm_out {
                 if let (Some(o), Some(c)) = (n.norm_out, self.norm.borrow_mut().get_mut(&n.id)) {
@@ -1289,7 +1339,7 @@ impl App {
                         eprintln!("wavelink: bus {id}: device {} reads {}{}, re-applying saved {}{}", n.name, fmt_db(config::vol_to_db(n.vol)),
                                   if n.mute { " muted" } else { "" }, fmt_db(saved), if b.mute { " muted" } else { "" });
                     }
-                    pw::set_volume_mute(n.id, db_to_vol(saved), b.mute);
+                    self.mixer.set_volume_mute(n.id, db_to_vol(saved), b.mute);
                 }
             }
             crate::busvol::Step::Adopt { gain_db, mute } => {
@@ -1413,7 +1463,7 @@ impl App {
                 app.fader_manual(&node, db);
             }
             if let Some(id) = app.node_id(&node) {
-                pw::set_volume(id, db_to_vol(db));
+                app.mixer.set_volume(id, db_to_vol(db));
             }
             app.bus_wrote(&f);
         });
@@ -1431,8 +1481,8 @@ impl App {
                 if let Some(id) = app.node_id(&node) {
                     match app.bus_effective_db(&f) {
                         // hardware bus: the saved (capped) volume goes in before the unmute (#33)
-                        Some(db) => pw::set_volume_mute(id, db_to_vol(db), b.is_active()),
-                        None => pw::set_mute(id, b.is_active()),
+                        Some(db) => app.mixer.set_volume_mute(id, db_to_vol(db), b.is_active()),
+                        None => app.mixer.set_mute(id, b.is_active()),
                     }
                 }
                 app.bus_wrote(&f);
@@ -1579,7 +1629,7 @@ impl App {
             InputKind::Virtual => (names::ch(&id), true),
             InputKind::Source { target } => (target.clone(), false),
         };
-        if let Some(m) = self.taps_on.get().then(|| meter(&format!("meter_pre_{id}"), Some((&pre_node, pre_sink)), Some(in_led.clone()), None, self.side_cell(&format!("in:{id}")))).flatten() {
+        if let Some(m) = self.taps_on.get().then(|| meter(&format!("meter_pre_{id}"), Some((&pre_node, pre_sink)), Some(in_led.clone()), None, self.side_cell(&format!("in:{id}")), self.mixer.locals().taps)).flatten() {
             self.levels.borrow_mut().insert(format!("pre:{id}"), m.out.clone());
             self.spectra.borrow_mut().insert(format!("pre:{id}"), m.bands.clone());
             self.meters.borrow_mut().push(m);
@@ -1592,7 +1642,7 @@ impl App {
         row.set_halign(gtk::Align::Center);
         row.set_vexpand(true);
         let meter_name = format!("meter_{id}");
-        if let Some(m) = self.taps_on.get().then(|| meter(&meter_name, None, Some(led.clone()), Some(vu.clone()), self.side_cell(&format!("in:{id}")))).flatten() {
+        if let Some(m) = self.taps_on.get().then(|| meter(&meter_name, None, Some(led.clone()), Some(vu.clone()), self.side_cell(&format!("in:{id}")), self.mixer.locals().taps)).flatten() {
             self.levels.borrow_mut().insert(format!("post:{id}"), m.out.clone());
             self.spectra.borrow_mut().insert(format!("post:{id}"), m.bands.clone());
             self.meter_links.borrow_mut().push((names::strip(&id), m.node.clone()));
@@ -1634,7 +1684,7 @@ impl App {
             let (w, id2, fw) = (Rc::downgrade(self), id.clone(), Rc::downgrade(&fader_rc));
             self.console_ticks.borrow_mut().push(Box::new(move |dt| {
                 let (Some(app), Some(f)) = (w.upgrade(), fw.upgrade()) else { return };
-                let on = app.cfg.borrow().inputs.iter().any(|i| i.id == id2 && i.normalize);
+                let on = app.mixer.locals().norm && app.cfg.borrow().inputs.iter().any(|i| i.id == id2 && i.normalize);
                 let (g, anchored) = match app.norm.borrow_mut().get_mut(&id2) {
                     Some(c) if on => {
                         let was = c.pending;
@@ -1702,7 +1752,7 @@ impl App {
                 show2(t2.is_active(), db);
                 app.mark_dirty();
                 if let Some(nid) = app.node_id(&names::route(&iid, &bid)) {
-                    pw::set_volume(nid, db_to_vol(db));
+                    app.mixer.set_volume(nid, db_to_vol(db));
                 }
             });
             knob.area.set_tooltip_text(Some(&format!("Send level to {} · drag/scroll · double-click = 0 dB", b.name)));
@@ -1747,7 +1797,7 @@ impl App {
                 }
                 app.mark_dirty();
                 if let Some(nid) = app.node_id(&names::route(&iid, &bid)) {
-                    pw::set_mute(nid, !on);
+                    app.mixer.set_mute(nid, !on);
                 }
             });
             self.routes.borrow_mut().push((names::route(&id, &b.id), t.clone(), guard));
@@ -1928,7 +1978,7 @@ impl App {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         row.set_halign(gtk::Align::Center);
         row.set_vexpand(true);
-        if let Some(m) = meter(&format!("meter_bus_{}", bus.id), Some((&names::bus(&bus.id), true)), Some(led.clone()), Some(vu.clone()), self.side_cell(&format!("bus:{}", bus.id))) {
+        if let Some(m) = meter(&format!("meter_bus_{}", bus.id), Some((&names::bus(&bus.id), true)), Some(led.clone()), Some(vu.clone()), self.side_cell(&format!("bus:{}", bus.id)), self.mixer.locals().taps) {
             // the bottom spectrum reads this tap's bands (bus taps run on every page)
             self.spectra.borrow_mut().insert(format!("bus:{}", names::bus(&bus.id)), m.bands.clone());
             self.meters.borrow_mut().push(m);
@@ -2161,12 +2211,19 @@ impl App {
         pop
     }
 
+    /// Hub levels for a remote window (#44): fill the strips' pre/post/bus meter cells.
+    fn apply_meters(&self, m: &wavelink_proto::Meters) {
+        for (k, (peak, rms)) in meters_to_levels(m) {
+            if let Some(c) = self.levels.borrow().get(&k) {
+                c.set((peak as f64, rms as f64));
+            }
+        }
+    }
+
     /// Send a host command over the loopback link; no-op without a link (remote control off).
     fn send_host_cmd(&self, cmd: wavelink_proto::Command) {
-        if let Some(c) = self.link.borrow().as_ref() {
-            let id = HOST_CMD_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            c.send(wavelink_proto::ClientMsg::Command { id, cmd });
-        }
+        let id = HOST_CMD_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.mixer.send(wavelink_proto::ClientMsg::Command { id, cmd });
     }
 
     /// Rebuild the host strips from the engine's host list (structure changed: a State arrived).
@@ -2343,7 +2400,9 @@ impl App {
         self.rebuild_rack();
         let g = self.graph.borrow().clone();
         self.sync(&g);
-        crate::leak::EXPECTED_TAPS.store(self.meters.borrow().len() as u64, std::sync::atomic::Ordering::Relaxed);
+        if self.mixer.locals().leak {
+            crate::leak::EXPECTED_TAPS.store(self.meters.borrow().len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// One 19" rack row per input: nameplate, preamp, gate, compressor, exciter, 12-band EQ.
@@ -2433,10 +2492,16 @@ impl App {
             if g.has(out) && g.has(inp) && !g.linked(out, inp) {
                 unlinked += 1;
                 let (o, i) = (out.clone(), inp.clone());
-                std::thread::spawn(move || pw::link(&o, &i));
+                if self.mixer.is_local() {
+                    std::thread::spawn(move || pw::link(&o, &i));
+                } else {
+                    self.mixer.link(&o, &i);
+                }
             }
         }
-        crate::leak::UNLINKED.store(unlinked, std::sync::atomic::Ordering::Relaxed);
+        if self.mixer.locals().leak {
+            crate::leak::UNLINKED.store(unlinked, std::sync::atomic::Ordering::Relaxed);
+        }
         self.apply_sides(g);
         self.sync_apps(g);
         self.sync_patch(g);
@@ -2530,9 +2595,10 @@ impl App {
             let dd = gtk::DropDown::from_strings(&labels);
             dd.set_selected(tgt.map(|t| t as u32).unwrap_or(gtk::INVALID_LIST_POSITION));
             let (serial, names_) = (n.serial, inputs.iter().map(|i| i.0.clone()).collect::<Vec<_>>());
+            let mx = self.mixer.clone();
             dd.connect_selected_notify(move |d| {
                 if let Some(sink) = names_.get(d.selected() as usize) {
-                    pw::move_stream(serial, sink);
+                    mx.move_stream(serial, sink);
                 }
             });
             row.append(&t);
@@ -2588,7 +2654,24 @@ fn restart_audio(st: &Rc<App>, btn: &adw::SplitButton, full: bool) {
     });
 }
 
+/// The local mixer window (`wavelink-mixer`): the local engine, with the loopback link (#37) so the MacBook strip shows here too.
 pub fn activate(app: &adw::Application) {
+    if let Some(w) = app.active_window() {
+        w.present();
+        return;
+    }
+    let link = match crate::remote::settings::load_or_create(&crate::remote::settings::path()) {
+        Ok(rc) => host_link_addr(&rc).map(|addr| crate::link::connect(addr, rc.token.clone(), false, None, false, || {})),
+        Err(e) => {
+            eprintln!("remote link: {e}");
+            None
+        }
+    };
+    activate_with(app, crate::mixer::LocalMixer::new(link));
+}
+
+/// The mixer window over `mixer` (#44): the local engine, or the hub's over the wire.
+pub fn activate_with(app: &adw::Application, mixer: Rc<dyn Mixer>) {
     if let Some(w) = app.active_window() {
         w.present();
         return;
@@ -2601,7 +2684,7 @@ pub fn activate(app: &adw::Application) {
     let dynamic = gtk::CssProvider::new();
     gtk::style_context_add_provider_for_display(&display, &dynamic, gtk::STYLE_PROVIDER_PRIORITY_USER + 1);
 
-    let win = adw::ApplicationWindow::builder().application(app).title("Mixer").default_width(1920).default_height(1000).build();
+    let win = adw::ApplicationWindow::builder().application(app).title(format!("Mixer{}", mixer.title_suffix())).default_width(1920).default_height(1000).build();
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
     outer.add_css_class("main");
     let hb = adw::HeaderBar::new();
@@ -2620,6 +2703,17 @@ pub fn activate(app: &adw::Application) {
     body.set_margin_start(12);
     body.set_margin_end(12);
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    // #44: a remote window waits for the hub's config and graph before it builds the strips
+    let mut waiting = (!mixer.ready()).then(|| gtk::Label::new(Some("connecting to the hub…")));
+    if let Some(w) = &waiting {
+        content.append(w);
+        let (m, w2) = (mixer.clone(), w.clone());
+        glib::timeout_add_local_once(Duration::from_secs(10), move || {
+            if !m.ready() {
+                w2.set_text("waiting for the hub's config: is its engine older than this window?");
+            }
+        });
+    }
     content.set_hexpand(true);
     body.append(&content);
 
@@ -2658,7 +2752,7 @@ pub fn activate(app: &adw::Application) {
     outer.append(&split);
 
     // RGB spectrum analyser across the bottom, tapping a chosen bus
-    let spec_buses: Vec<(String, String)> = Config::load().buses.iter().map(|b| (names::bus(&b.id), b.name.clone())).collect();
+    let spec_buses: Vec<(String, String)> = mixer.load_cfg().buses.iter().map(|b| (names::bus(&b.id), b.name.clone())).collect();
     let spectrum = Spectrum::new(spec_buses.first().map(|b| b.0.as_str()).unwrap_or("bus_a1"));
     let spec_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
     spec_box.set_margin_start(12);
@@ -2725,7 +2819,12 @@ pub fn activate(app: &adw::Application) {
     sys_panel.append(&lights_row);
     {
         let (stx, srx) = std::sync::mpsc::channel::<crate::sysmon::Stats>();
-        crate::sysmon::spawn(stx);
+        if mixer.locals().sysmon {
+            crate::sysmon::spawn(stx);
+        } else {
+            lights_row.set_visible(false);
+            warn_lbl.set_label("hub stats are not sent yet");
+        }
         let (cd, fdd, cl, wl, lr, lk) = (cpu_dial.clone(), fd_dial.clone(), clock_lbl.clone(), warn_lbl.clone(), lights_row.clone(), leak_lbl.clone());
         // needles animate on the frame clock (never starves redraws); data arrives every 2 s
         {
@@ -2800,29 +2899,20 @@ pub fn activate(app: &adw::Application) {
     });
     win.set_content(Some(&outer));
 
-    // #37: the window's own loopback link to the engine, so the MacBook strip shows here too
     let hosts_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let link = match crate::remote::settings::load_or_create(&crate::remote::settings::path()) {
-        Ok(rc) => host_link_addr(&rc).map(|addr| crate::link::connect(addr, rc.token.clone(), false, None, || {})),
-        Err(e) => {
-            eprintln!("remote link: {e}");
-            None
-        }
-    };
-    let has_link = link.is_some();
     let st = Rc::new(App {
-        cfg: RefCell::new(Config::load()),
+        cfg: RefCell::new(mixer.load_cfg()),
         synced: RefCell::new(Config::default_config()), // set to the loaded config right below (one load, B36-9)
         norm_btns: RefCell::new(HashMap::new()),
         auto_gain: RefCell::new(Default::default()),
         merge_fails: Cell::new(0),
-        graph: RefCell::new(Graph::read().unwrap_or_default()),
+        graph: RefCell::new(mixer.graph().unwrap_or_default()),
         dirty: Cell::new(false),
         content,
         _player: player.clone(),
         rack_page: rack_page.clone(),
         sys_panel: sys_panel.clone(),
-        link: RefCell::new(link),
+        mixer: mixer.clone(),
         hosts_box: hosts_box.clone(),
         last_hosts: RefCell::new(vec![]),
         host_strips: RefCell::new(vec![]),
@@ -2875,6 +2965,7 @@ pub fn activate(app: &adw::Application) {
         .label("Restart audio")
         .tooltip_text("Restart the mixer engine (rebuilds strips, routes and outputs)")
         .build();
+restart.set_visible(mixer.locals().restart);
     let full = gtk::Button::with_label("Full restart (PipeWire + engine)");
     full.add_css_class("flat");
     let pop = gtk::Popover::new();
@@ -2911,10 +3002,16 @@ pub fn activate(app: &adw::Application) {
             }
         });
     }
-    st.rebuild();
+    if mixer.ready() {
+        st.rebuild();
+    }
     {
         let (mtx, mrx) = std::sync::mpsc::channel::<crate::midi::Midi>();
-        crate::midi::spawn(mtx);
+        if mixer.locals().midi {
+            crate::midi::spawn(mtx);
+        } else {
+            midi_lbl.set_sensitive(false);
+        }
         let (w, ml) = (Rc::downgrade(&st), midi_lbl.clone());
         glib::timeout_add_local(Duration::from_millis(20), move || {
             let Some(st) = w.upgrade() else { return glib::ControlFlow::Break };
@@ -2946,16 +3043,7 @@ pub fn activate(app: &adw::Application) {
         st.rebuild();
     }
 
-    // graph polling in a worker thread
-    let (tx, rx) = mpsc::channel::<Graph>();
-    std::thread::spawn(move || loop {
-        if let Some(g) = Graph::read() {
-            if tx.send(g).is_err() {
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    });
+    // the graph is polled by the mixer (LocalMixer's worker, or the hub's snapshots): see Event::Graph below
     // animate needles and spectrum on the frame clock (never starves redraws, pauses when hidden)
     let (st3, sp3) = (st.clone(), spectrum.clone());
     let last_frame = Cell::new(0i64);
@@ -2985,22 +3073,6 @@ pub fn activate(app: &adw::Application) {
         stems_view::step(&st3, dt);
         glib::ControlFlow::Continue
     });
-    if has_link {
-        let w = Rc::downgrade(&st);
-        glib::timeout_add_local(Duration::from_millis(100), move || {
-            let Some(app) = w.upgrade() else { return glib::ControlFlow::Break };
-            let mut evs = Vec::new();
-            if let Some(conn) = app.link.borrow().as_ref() {
-                while let Ok(e) = conn.rx.try_recv() {
-                    evs.push(e);
-                }
-            }
-            for e in evs {
-                app.on_link_event(e);
-            }
-            glib::ControlFlow::Continue
-        });
-    }
     let (st2, ww) = (st.clone(), win.downgrade());
     let mut save_tick = 0u32;
     glib::timeout_add_local(Duration::from_millis(100), move || {
@@ -3021,14 +3093,22 @@ pub fn activate(app: &adw::Application) {
                     restore.push((o, i, s));
                 }
             }
-            st2.side_q.push(Box::new(move || {
+            if st2.mixer.is_local() {
+                st2.side_q.push(Box::new(move || {
+                    for (o, i, s) in restore {
+                        pw::link_side(&o, &i, s);
+                    }
+                }));
+                st2.side_q.flush(Duration::from_secs(5));
+            } else {
                 for (o, i, s) in restore {
-                    pw::link_side(&o, &i, s);
+                    st2.mixer.link_side(&o, &i, s);
                 }
-            }));
-            st2.side_q.flush(Duration::from_secs(5));
+            }
             st2.meters.borrow_mut().clear();
-            crate::leak::EXPECTED_TAPS.store(0, std::sync::atomic::Ordering::Relaxed);
+            if st2.mixer.locals().leak {
+                crate::leak::EXPECTED_TAPS.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
             if st2.norm_moved.get() {
                 st2.dirty.set(true);
             }
@@ -3039,12 +3119,27 @@ pub fn activate(app: &adw::Application) {
         }
         // stems housekeeping runs here, not in the frame tick: the tick stops while the display sleeps
         let mut remute = false;
-        if let Some(g) = rx.try_iter().last() {
+        let mut graph = None;
+        for e in st2.mixer.events() {
+            match e {
+                Event::Link(e) => st2.on_link_event(e),
+                Event::Graph(g) => graph = Some(g),
+                Event::Config => st2.pull_cfg(),
+                Event::Meters(m) => st2.apply_meters(&m),
+            }
+        }
+        if let Some(g) = graph {
             // fresh config first: #35's bus tracker must never re-apply a gain the remote just replaced
             st2.pull_cfg();
             st2.sync(&g);
             *st2.graph.borrow_mut() = g;
             remute = true;
+        }
+        if waiting.is_some() && st2.mixer.ready() {
+            if let Some(w) = waiting.take() {
+                st2.content.remove(&w);
+            }
+            st2.rebuild();
         }
         save_tick += 1;
         stems_view::housekeep(&st2, remute, save_tick % 10 == 0);
@@ -3181,6 +3276,15 @@ mod host_link_tests {
         let off = crate::remote::settings::RemoteCfg { enabled: false, ..on };
         assert_eq!(host_link_addr(&off), None);
     }
+}
+
+/// `wavelink-mixer remote <addr>` (#44): the same mixer window, driven by the hub over the wire.
+pub fn run_remote(opts: crate::console::Opts) -> i32 {
+    let app = adw::Application::builder().application_id("local.wavelink.Mixer").build();
+    app.connect_startup(|_| adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark));
+    app.connect_activate(move |app| activate_with(app, crate::mixer::RemoteMixer::new(opts.clone())));
+    let code = app.run_with_args::<&str>(&[]);
+    if code == glib::ExitCode::SUCCESS { 0 } else { 1 }
 }
 
 #[cfg(test)]
