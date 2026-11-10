@@ -56,6 +56,10 @@ struct Client {
     id: u64,
     tx: SyncSender<Arc<str>>,
     meters: Arc<AtomicBool>,
+    /// Hello.full: wants whole-config and graph snapshots (the full mixer window).
+    full: bool,
+    /// The last graph JSON queued for this client (full clients only).
+    last_graph: Option<Arc<str>>,
 }
 
 struct Core {
@@ -345,6 +349,39 @@ pub fn serve(opts: Opts, backend: Arc<dyn Backend>) -> std::io::Result<Running> 
             }
         })?;
     }
+    {
+        let inner = inner.clone();
+        std::thread::Builder::new().name("remote-graph".into()).spawn(move || {
+            while !inner.stop.load(Ordering::SeqCst) {
+                let any_full = inner.lock().clients.iter().any(|c| c.full);
+                if any_full {
+                    if let Some(g) = inner.backend.graph_wire() {
+                        if let Ok(v) = serde_json::to_value(&g) {
+                            let json: Arc<str> = ServerMsg::Graph { graph: v }.to_json().into();
+                            let mut core = inner.lock();
+                            core.clients.retain_mut(|c| {
+                                if !c.full || c.last_graph.as_ref() == Some(&json) {
+                                    return true;
+                                }
+                                match c.tx.try_send(json.clone()) {
+                                    Ok(()) => {
+                                        c.last_graph = Some(json.clone());
+                                        true
+                                    }
+                                    Err(TrySendError::Full(_)) => {
+                                        eprintln!("wavelink remote: client {} stalled, dropping it", c.id);
+                                        false
+                                    }
+                                    Err(TrySendError::Disconnected(_)) => false,
+                                }
+                            });
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        })?;
+    }
     Ok(run)
 }
 
@@ -447,12 +484,33 @@ impl Inner {
         });
     }
 
+    /// Queue `msg` for the `full` clients only.
+    fn broadcast_full(core: &mut Core, msg: &ServerMsg) {
+        let s: Arc<str> = msg.to_json().into();
+        core.clients.retain(|c| {
+            if !c.full {
+                return true;
+            }
+            match c.tx.try_send(s.clone()) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) => {
+                    eprintln!("wavelink remote: client {} stalled, dropping it", c.id);
+                    false
+                }
+                Err(TrySendError::Disconnected(_)) => false,
+            }
+        });
+    }
+
     /// Make `cfg` current and tell everyone what changed (deltas, or a full state on structure changes).
     fn publish(&self, core: &mut Core, cfg: Config) {
         let mut new = model::to_state(&cfg, &self.opts.name, core.state.rev + 1, &self.opts.caps);
         new.hosts = core.hosts.clone();
         core.cfg = cfg;
         self.publish_state(core, new);
+        if let Ok(config) = serde_json::to_value(&core.cfg) {
+            Self::broadcast_full(core, &ServerMsg::Config { config });
+        }
     }
 
     /// Edit the host list (engine memory only, never config.json) and tell everyone what changed.
@@ -585,6 +643,101 @@ impl Inner {
         ServerMsg::Ack { id, ok: true, error: None, note: checked.note }
     }
 
+    /// A full window's save: 3-way merge `mine` against config.json (`base` = common ancestor), with every
+    /// bus-gain raise capped exactly as `SetBusGain` from this connection would be (I1).
+    fn save_config(&self, id: u64, base: serde_json::Value, mine: serde_json::Value, unlocked: &dyn Fn(&str) -> bool) -> ServerMsg {
+        let nack = |e: String| ServerMsg::Ack { id, ok: false, error: Some(e), note: None };
+        let (mut base, mut mine): (Config, Config) = match (serde_json::from_value(base), serde_json::from_value(mine)) {
+            (Ok(b), Ok(m)) => (b, m),
+            (Err(e), _) | (_, Err(e)) => return nack(format!("bad config: {e}")),
+        };
+        let mut core = self.lock();
+        self.sync_disk(&mut core);
+        let now = self.now_s();
+        let mut notes: Vec<String> = vec![];
+        let mut raised = vec![];
+        let want: Vec<(String, f64)> = mine
+            .buses
+            .iter()
+            .filter(|b| base.buses.iter().find(|o| o.id == b.id).map_or(true, |o| b.gain_db > o.gain_db))
+            .map(|b| (b.id.clone(), b.gain_db))
+            .collect();
+        for (bus, db) in want {
+            let cmd = p::Command::SetBusGain { bus: bus.clone(), db, unlock: false };
+            let mut checked = match safety::check(&cmd, &core.state, unlocked) {
+                Ok(c) => c,
+                Err(e) => return nack(e.to_string()),
+            };
+            for c in checked.cmds.iter_mut() {
+                if let p::Command::SetBusGain { bus, db, .. } = c {
+                    if let Some(b) = core.state.bus(bus).filter(|b| b.physical()) {
+                        let cur = b.gain_db;
+                        if *db > cur {
+                            let allowed = core.limits.entry(bus.clone()).or_default().allowed(now, cur);
+                            if *db > allowed {
+                                *db = allowed.max(cur);
+                                checked.note = Some(format!("raised at most {} dB per {} s", safety::MAX_RAISE_PER_WINDOW_DB, safety::RAISE_WINDOW_S));
+                            }
+                        }
+                        raised.push((bus.clone(), cur));
+                    }
+                }
+            }
+            for c in &checked.cmds {
+                model::apply(&mut mine, c); // writes the capped (ceiling-clamped) gain back into `mine`
+            }
+            notes.extend(checked.note);
+        }
+        match mine.save_merged_with(&mut base, &self.opts.cfg_path, &|_, _, _| {}) {
+            Err(e) => nack(e),
+            Ok(_) => {
+                let cfg = Config::load_from(&self.opts.cfg_path);
+                for (bus, before) in raised {
+                    let after = cfg.buses.iter().find(|b| b.id == bus).map_or(before, |b| b.gain_db);
+                    core.limits.entry(bus).or_default().record(now, before, after);
+                }
+                self.publish(&mut core, cfg);
+                ServerMsg::Ack { id, ok: true, error: None, note: if notes.is_empty() { None } else { Some(notes.join("; ")) } }
+            }
+        }
+    }
+
+    /// A full window's live PipeWire write. A bus node's volume/mute goes through `command` (the caps); the rest is raw.
+    fn pw(&self, id: u64, cmd: p::PwCmd, unlocked: &dyn Fn(&str) -> bool) -> ServerMsg {
+        let node = match &cmd {
+            p::PwCmd::SetVolume { id, .. } | p::PwCmd::SetVolumeMute { id, .. } | p::PwCmd::SetMute { id, .. } => Some(*id),
+            _ => None,
+        };
+        let bus = node.and_then(|n| {
+            let cfg = self.lock().cfg.clone();
+            self.backend.bus_for_node(&cfg, n)
+        });
+        let Some(bus) = bus else {
+            self.backend.pw(&cmd);
+            return ServerMsg::Ack { id, ok: true, error: None, note: None };
+        };
+        let gain = |v: f64| p::Command::SetBusGain { bus: bus.clone(), db: config::vol_to_db(v), unlock: false };
+        let mute = |m: bool| p::Command::SetBusMute { bus: bus.clone(), mute: m };
+        match cmd {
+            p::PwCmd::SetVolume { v, .. } => self.command(id, &gain(v), unlocked),
+            p::PwCmd::SetMute { mute: m, .. } => self.command(id, &mute(m), unlocked),
+            p::PwCmd::SetVolumeMute { v, mute: m, .. } => {
+                let g = self.command(id, &gain(v), unlocked);
+                match self.command(id, &mute(m), unlocked) {
+                    ServerMsg::Ack { ok: false, error, .. } => match g {
+                        ServerMsg::Ack { error: e0, note, .. } => {
+                            let err = [e0, error].into_iter().flatten().collect::<Vec<_>>().join("; ");
+                            ServerMsg::Ack { id, ok: false, error: Some(err), note }
+                        }
+                        other => other,
+                    },
+                    _ => g,
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
     fn conn(self: &Arc<Self>, s: TcpStream, peer: SocketAddr) -> Result<(), String> {
         let deadline = Instant::now() + HELLO_DEADLINE;
         let pre = self.admit(&s, peer)?;
@@ -661,7 +814,18 @@ impl Inner {
                 self.register_host(&mut core, id, h);
             }
             let _ = tx.try_send(ServerMsg::State { state: core.state.clone() }.to_json().into());
-            core.clients.push(Client { id, tx, meters: meters.clone() });
+            let mut last_graph = None;
+            if hello.full {
+                if let Ok(config) = serde_json::to_value(&core.cfg) {
+                    let _ = tx.try_send(ServerMsg::Config { config }.to_json().into());
+                }
+                if let Some(Ok(graph)) = self.backend.graph_wire().map(|g| serde_json::to_value(&g)) {
+                    let j: Arc<str> = ServerMsg::Graph { graph }.to_json().into();
+                    let _ = tx.try_send(j.clone());
+                    last_graph = Some(j);
+                }
+            }
+            core.clients.push(Client { id, tx, meters: meters.clone(), full: hello.full, last_graph });
         }
         let who = format!("client {id} ({}, {peer})", sanitize_name(&hello.client));
         eprintln!("wavelink remote: {who} connected");
@@ -710,6 +874,17 @@ impl Inner {
                         Ok(ClientMsg::Command { id, cmd }) => {
                             let live = |b: &str| unlocks.get(b).is_some_and(|t| *t > Instant::now());
                             Some(self.command(id, &cmd, &live))
+                        }
+                        Ok(ClientMsg::SaveConfig { .. } | ClientMsg::Pw { .. }) if self.token_gen.load(Ordering::SeqCst) != token_gen => {
+                            break Err("token rotated".into());
+                        }
+                        Ok(ClientMsg::SaveConfig { id, base, mine }) => {
+                            let live = |b: &str| unlocks.get(b).is_some_and(|t| *t > Instant::now());
+                            Some(self.save_config(id, base, mine, &live))
+                        }
+                        Ok(ClientMsg::Pw { id, cmd }) => {
+                            let live = |b: &str| unlocks.get(b).is_some_and(|t| *t > Instant::now());
+                            Some(self.pw(id, cmd, &live))
                         }
                         Ok(ClientMsg::Subscribe { meters: on }) => {
                             meters.store(on, Ordering::Relaxed);
