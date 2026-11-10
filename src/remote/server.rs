@@ -77,12 +77,19 @@ struct Core {
 }
 
 /// Limiter key: the hardware target a bus plays to (so a new id on the same device shares its history), else the id.
-fn limit_key(cfg: &Config, bus: &str) -> String {
-    match cfg.buses.iter().find(|b| b.id == bus).map(|b| &b.kind) {
+fn target_key(kind: Option<&config::BusKind>, id: &str) -> String {
+    match kind {
         Some(config::BusKind::Hardware { target }) => format!("target:{target}"),
-        _ => bus.to_string(),
+        _ => id.to_string(),
     }
 }
+
+fn limit_key(cfg: &Config, bus: &str) -> String {
+    target_key(cfg.buses.iter().find(|b| b.id == bus).map(|b| &b.kind), bus)
+}
+
+/// last_gain is client-influenced (target strings come from saved configs): past this many entries, drop the ones no bus uses.
+const LAST_GAIN_CAP: usize = 256;
 
 struct Token {
     value: String,
@@ -672,7 +679,9 @@ impl Inner {
         // remember every hub bus's gain by target before this save can delete it
         let hub_cfg = core.cfg.clone();
         for b in hub_cfg.buses.iter().filter(|b| matches!(b.kind, config::BusKind::Hardware { .. })) {
-            core.last_gain.insert(limit_key(&hub_cfg, &b.id), b.gain_db);
+            // two hub buses on one target: keep the lowest, the safe baseline for a later re-add
+            let g = core.last_gain.entry(limit_key(&hub_cfg, &b.id)).or_insert(b.gain_db);
+            *g = g.min(b.gain_db);
         }
         // a remote save never moves a bus's ceiling or kind: the hub's values win (their lift would defeat I1)
         for b in mine.buses.iter_mut() {
@@ -697,10 +706,7 @@ impl Inner {
             if core.state.bus(&bus).is_none() {
                 // not live (new id, offline target, or deleted and re-added): the rule is per target,
                 // the same one SetBusGain applies (raise window + 6 dB step), never skipped
-                let key = match mine.buses.iter().find(|b| b.id == bus).map(|b| &b.kind) {
-                    Some(config::BusKind::Hardware { target }) => format!("target:{target}"),
-                    _ => bus.clone(),
-                };
+                let key = target_key(mine.buses.iter().find(|b| b.id == bus).map(|b| &b.kind), &bus);
                 let known = hub_cfg.buses.iter().find(|b| b.id == bus).map(|b| b.gain_db).or_else(|| core.last_gain.get(&key).copied());
                 let Some(cur) = known else { continue }; // a target the hub has never seen: ceiling-clamped only
                 let allowed = core.limits.entry(key).or_default().allowed(now, cur).min(cur + safety::MAX_STEP_DB);
@@ -711,6 +717,8 @@ impl Inner {
                     }
                     notes.push(format!("raised at most {} dB per {} s", safety::MAX_RAISE_PER_WINDOW_DB, safety::RAISE_WINDOW_S));
                 }
+                // recorded after the save applies, under the post-apply target key, so the next save sees this raise
+                raised.push((bus.clone(), cur));
                 continue;
             }
             let cmd = p::Command::SetBusGain { bus: bus.clone(), db, unlock: false };
@@ -753,9 +761,13 @@ impl Inner {
                 let cfg = Config::load_from(&self.opts.cfg_path);
                 for (bus, before) in raised {
                     let after = cfg.buses.iter().find(|b| b.id == bus).map_or(before, |b| b.gain_db);
-                    let key = limit_key(&hub_cfg, &bus);
+                    let key = limit_key(&cfg, &bus);
                     core.last_gain.insert(key.clone(), after);
                     core.limits.entry(key).or_default().record(now, before, after);
+                }
+                if core.last_gain.len() > LAST_GAIN_CAP {
+                    let live: std::collections::HashSet<String> = cfg.buses.iter().map(|b| limit_key(&cfg, &b.id)).collect();
+                    core.last_gain.retain(|k, _| live.contains(k));
                 }
                 self.publish(&mut core, cfg);
                 ServerMsg::Ack { id, ok: true, error: None, note: if notes.is_empty() { None } else { Some(notes.join("; ")) } }
