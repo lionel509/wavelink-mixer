@@ -986,27 +986,41 @@ fn pw_volume_on_a_node_missing_from_the_graph_is_refused() {
     assert!(r.fake.pw_log.lock().unwrap().is_empty());
 }
 
-#[test]
-fn breaker_delete_and_readd_resets_the_raise_limiter() {
-    let r = rig("readd");
+fn bus_gain(cfg: &std::path::Path, id: &str) -> f64 {
+    Config::peek(cfg).unwrap().buses.iter().find(|b| b.id == id).unwrap().gain_db
+}
+
+fn readd_case(tag: &str, wait: Option<Duration>) -> f64 {
+    let r = rig_with(tag, |c| {
+        if let Some(b) = c.buses.iter_mut().find(|b| b.id == "a3") {
+            b.kind = BusKind::Hardware { target: "alsa_output.usb-dac".into() };
+        }
+    });
     let (mut a, _) = join(&r);
-    // live raise from -30 is limited
     let _ = cmd(&mut a, 1, Command::SetBusGain { bus: "a3".into(), db: -20.0, unlock: false });
     let base = Config::peek(&r.cfg).unwrap();
     let mut gone = base.clone();
     gone.buses.retain(|b| b.id != "a3");
     send(&mut a, &ClientMsg::SaveConfig { id: 2, base: serde_json::to_value(&base).unwrap(), mine: serde_json::to_value(&gone).unwrap() });
     let _ = ack_for(&mut a, 2);
+    if let Some(w) = wait {
+        std::thread::sleep(w);
+    }
     let base2 = Config::peek(&r.cfg).unwrap();
     let mut back = base2.clone();
     let mut b = base.buses.iter().find(|b| b.id == "a3").unwrap().clone();
-    b.gain_db = -20.0;
+    b.gain_db = 0.0;
     back.buses.push(b);
     send(&mut a, &ClientMsg::SaveConfig { id: 3, base: serde_json::to_value(&base2).unwrap(), mine: serde_json::to_value(&back).unwrap() });
     let _ = ack_for(&mut a, 3);
-    if let Some(b) = Config::peek(&r.cfg).unwrap().buses.iter().find(|b| b.id == "a3") {
-        assert!(b.gain_db <= -30.0 + safety_raise() + 1e-9, "re-added at {}", b.gain_db);
-    }
+    bus_gain(&r.cfg, "a3")
+}
+
+#[test]
+fn breaker_delete_and_readd_within_window_keeps_the_raise_limit() {
+    // last known -20 dB; a re-add inside the window may rise at most 12 dB, so at most -8
+    let g = readd_case("readdnow", None);
+    assert!(g <= -8.0 + 1e-9, "re-added at {g}");
 }
 
 fn safety_raise() -> f64 {
