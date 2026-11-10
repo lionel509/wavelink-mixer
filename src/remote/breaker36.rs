@@ -86,7 +86,7 @@ fn recv_np(ws: &mut Ws) -> Option<ServerMsg> {
 }
 
 fn hello(ws: &mut Ws, token: &str, meters: bool) {
-    send(ws, &ClientMsg::Hello(Hello { protocol: PROTOCOL_VERSION, token: token.into(), client: "breaker".into(), meters, host: None }));
+    send(ws, &ClientMsg::Hello(Hello { protocol: PROTOCOL_VERSION, token: token.into(), client: "breaker".into(), meters, host: None, full: false }));
 }
 
 fn join(r: &Rig) -> (Ws, State) {
