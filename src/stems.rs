@@ -856,7 +856,7 @@ fn transcribe(mut tr: Transcriber, rx: mpsc::Receiver<(u64, [Vec<f32>; 3])>, tx:
 /// Returns the new notes and `(previous end, note with its new dur)` for each extension.
 /// A silent window (`None`) closes every open note at its current end.
 pub fn window_notes(g: Option<&mut Grids>, end_t: f64, open: &mut Vec<Note>) -> (Vec<Note>, Vec<(f64, Note)>) {
-    let ws = end_t - BP_WINDOW as f64 / RATE as f64;
+    let ws = end_t - BP_SAMPLES as f64 / BP_RATE as f64;
     let Some(g) = g else {
         open.clear();
         return (Vec::new(), Vec::new());
@@ -1267,7 +1267,7 @@ mod tests {
         extra_onset: Option<(f64, usize)>,
     ) -> (crate::notes::Timeline, Vec<crate::notes::Note>, usize) {
         let step = CHUNK as f64 / RATE as f64;
-        let win_len = BP_WINDOW as f64 / RATE as f64;
+        let win_len = BP_SAMPLES as f64 / BP_RATE as f64;
         let mut open = Vec::new();
         let mut tl = crate::notes::Timeline::new();
         let mut ext_windows = 0;
@@ -1307,7 +1307,7 @@ mod tests {
     #[test]
     fn window_notes_closes_when_next_window_quiet() {
         let step = CHUNK as f64 / RATE as f64;
-        let win_len = BP_WINDOW as f64 / RATE as f64;
+        let win_len = BP_SAMPLES as f64 / BP_RATE as f64;
         let mut open = Vec::new();
         let mut g4 = held_win(4.0 * step - win_len, &[(1.0, 2.3, 48)]);
         let (new4, _) = window_notes(Some(&mut g4), 4.0 * step, &mut open);
@@ -1338,6 +1338,24 @@ mod tests {
         let (_, out, _) = run_windows(&[(1.0, 5.0, 48)], 4..=14, Some((3.0, 48)));
         assert_eq!(out.len(), 1, "a re-onset inside the sustain must not start a second note: {out:?}");
         assert!((out[0].dur - 4.0).abs() <= 1.0 / crate::sep::FPS + 1e-9, "full length: {}", out[0].dur);
+    }
+
+    /// Pin for the grid origin: frame 0 of a production window sits at `end_t - BP_SAMPLES / BP_RATE`.
+    /// A note onset at frame 100 (inside the kept [end_t - 1, end_t - 0.5) range) must land at that origin plus 100 frames, not 2.0 s before `end_t`.
+    #[test]
+    fn window_notes_uses_production_grid_origin() {
+        let end_t = 10.0;
+        let ws = end_t - BP_SAMPLES as f64 / BP_RATE as f64;
+        let mut g = crate::sep::Grids { note: vec![vec![0.0f32; 88]; 172], onset: vec![vec![0.0f32; 88]; 172] };
+        for f in 100..120 {
+            g.note[f][48] = 0.9;
+        }
+        g.onset[100][48] = 0.9;
+        let mut open = Vec::new();
+        let (new, _) = window_notes(Some(&mut g), end_t, &mut open);
+        assert_eq!(new.len(), 1, "{new:?}");
+        let want = ws + 100.0 / crate::sep::FPS;
+        assert!((new[0].t - want).abs() < 1e-9, "onset {} vs production origin {want}", new[0].t);
     }
 
     #[test]
