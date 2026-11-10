@@ -36,6 +36,9 @@ mod breaker_front;
 #[cfg(test)]
 #[path = "breaker_busvol.rs"]
 mod breaker_busvol;
+#[cfg(test)]
+#[path = "demo_midi.rs"]
+mod demo_midi;
 
 use adw::prelude::*;
 use gtk::glib;
