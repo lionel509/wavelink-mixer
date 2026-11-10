@@ -856,7 +856,7 @@ fn transcribe(mut tr: Transcriber, rx: mpsc::Receiver<(u64, [Vec<f32>; 3])>, tx:
 /// Returns the new notes and `(previous end, note with its new dur)` for each extension.
 /// A silent window (`None`) closes every open note at its current end.
 pub fn window_notes(g: Option<&mut Grids>, end_t: f64, open: &mut Vec<Note>) -> (Vec<Note>, Vec<(f64, Note)>) {
-    let ws = end_t - BP_SAMPLES as f64 / BP_RATE as f64;
+    let ws = end_t - BP_WINDOW as f64 / RATE as f64;
     let Some(g) = g else {
         open.clear();
         return (Vec::new(), Vec::new());
@@ -867,13 +867,13 @@ pub fn window_notes(g: Option<&mut Grids>, end_t: f64, open: &mut Vec<Note>) -> 
     for n in open.drain(..) {
         let p = n.pitch as usize - 21;
         let old_end = n.t + n.dur;
-        let f0 = ((old_end - ws) * FPS).round();
-        if f0 < 0.0 || f0 as usize + 1 >= frames {
+        let f0 = ((old_end - ws) * FPS).floor();
+        if f0 < 1.0 || f0 as usize + 1 >= frames {
             continue;
         }
         let f0 = f0 as usize;
-        let (end, at_edge) = walk_end(&g.note, f0, p);
-        if end <= f0 + 1 {
+        let (end, at_edge) = walk_end(&g.note, f0 - 1, p); // starts by testing frame f0
+        if ws + end as f64 / FPS <= old_end {
             continue;
         }
         let u = Note { dur: ws + end as f64 / FPS - n.t, ..n.clone() };
