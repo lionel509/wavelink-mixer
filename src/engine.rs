@@ -1016,6 +1016,7 @@ mod supervisor_tests {
 
     fn names(n: usize) -> Vec<String> { (0..n).map(|i| format!("n{i}")).collect() }
     #[test]
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
     fn raise_nofile_child_sees_raised_limit_and_parent_is_untouched() {
         let before = nofile::get().unwrap();
         let mut cmd = Command::new("sh");
