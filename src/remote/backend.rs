@@ -26,6 +26,8 @@ pub trait Backend: Send + Sync + 'static {
     fn bus_for_node(&self, _cfg: &Config, _node: u64) -> Option<String> {
         None
     }
+    /// Drop any cached graph so the next read is fresh.
+    fn refresh_graph(&self) {}
     /// Apply a live write that is not a bus volume/mute (those go through `apply`).
     fn pw(&self, _cmd: &p::PwCmd) {}
 }
@@ -74,6 +76,10 @@ impl PwBackend {
 }
 
 impl Backend for PwBackend {
+    fn refresh_graph(&self) {
+        self.graph.lock().unwrap_or_else(|e| e.into_inner()).1 = None;
+    }
+
     fn graph_wire(&self) -> Option<pw::GraphWire> {
         self.graph().as_ref().map(pw::GraphWire::from)
     }

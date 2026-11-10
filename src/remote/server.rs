@@ -661,17 +661,38 @@ impl Inner {
             if let Some(h) = core.cfg.buses.iter().find(|h| h.id == b.id) {
                 b.max_db = h.max_db;
                 b.kind = h.kind.clone();
+            } else if let config::BusKind::Hardware { target } = &b.kind {
+                // a new raop bus never brings its own lift: its ceiling is at most what a local bus would get
+                if b.is_raop(self.backend.node_is_raop(target)) {
+                    b.max_db = Some(b.max_db.filter(|m| m.is_finite()).map_or(config::RAOP_MAX_DB, |m| m.min(config::RAOP_MAX_DB)));
+                }
             }
         }
         // a bus the hub does not know yet has no live state to check against: it is only capped by its own ceiling
         let want: Vec<(String, f64)> = mine
             .buses
             .iter()
-            .filter(|b| core.state.bus(&b.id).is_some())
             .filter(|b| base.buses.iter().find(|o| o.id == b.id).map_or(true, |o| b.gain_db > o.gain_db))
             .map(|b| (b.id.clone(), b.gain_db))
             .collect();
         for (bus, db) in want {
+            if core.state.bus(&bus).is_none() {
+                // not live (offline target, or deleted and re-added): key on config + limiter history, never skip the limit
+                let known = core.cfg.buses.iter().find(|b| b.id == bus).map(|b| b.gain_db);
+                if known.is_none() && !core.limits.contains_key(&bus) {
+                    continue; // a truly new id: ceiling-clamped only
+                }
+                let cur = known.unwrap_or(f64::INFINITY);
+                let allowed = core.limits.entry(bus.clone()).or_default().allowed(now, cur);
+                if db > allowed {
+                    let capped = if known.is_some() { allowed.max(cur) } else { allowed };
+                    if let Some(b) = mine.buses.iter_mut().find(|b| b.id == bus) {
+                        b.gain_db = capped;
+                    }
+                    notes.push(format!("raised at most {} dB per {} s", safety::MAX_RAISE_PER_WINDOW_DB, safety::RAISE_WINDOW_S));
+                }
+                continue;
+            }
             let cmd = p::Command::SetBusGain { bus: bus.clone(), db, unlock: false };
             let mut checked = match safety::check(&cmd, &core.state, unlocked) {
                 Ok(c) => c,
@@ -730,9 +751,22 @@ impl Inner {
             self.backend.bus_for_node(&cfg, n)
         });
         let Some(bus) = bus else {
-            // a node we cannot classify (graph unreadable) could be a bus: refuse rather than write it raw
-            if node.is_some() && self.backend.graph_wire().is_none() {
-                return ServerMsg::Ack { id, ok: false, error: Some("hub can't read the PipeWire graph".into()), note: None };
+            // fail closed: a volume/mute write is raw only to a node the hub can see and that is not a bus or raop node
+            if let Some(n) = node {
+                let find = |w: Option<crate::pw::GraphWire>| w.and_then(|w| w.nodes.into_iter().find(|x| x.id == n)).map(|x| x.name);
+                let mut name = find(self.backend.graph_wire());
+                if name.is_none() {
+                    self.backend.refresh_graph(); // a node under 2 s old is not in the cache yet
+                    name = find(self.backend.graph_wire());
+                }
+                let refuse = |e: &str| ServerMsg::Ack { id, ok: false, error: Some(e.into()), note: None };
+                match name {
+                    None => return refuse("hub can't see that PipeWire node"),
+                    Some(nm) if nm.starts_with("bus_") || config::is_raop_name(&nm) || self.backend.node_is_raop(&nm) => {
+                        return refuse("that node is a bus or speaker the hub does not map: refused");
+                    }
+                    Some(_) => {}
+                }
             }
             self.backend.pw(&cmd);
             return ServerMsg::Ack { id, ok: true, error: None, note: None };

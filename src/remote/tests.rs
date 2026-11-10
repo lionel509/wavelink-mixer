@@ -836,7 +836,7 @@ fn pw_volume_on_unreadable_graph_is_refused_not_written_raw() {
 fn pw_volume_on_a_plain_node_with_a_readable_graph_is_raw() {
     // the refusal above is only for unclassifiable nodes: a readable graph with a non-bus node still writes
     let r = rig("pwplain");
-    *r.fake.graph.lock().unwrap() = Some(graph_fixture(7));
+    *r.fake.graph.lock().unwrap() = Some(graph_with(&[(9, "firefox")]));
     let (mut a, _) = join(&r);
     send(&mut a, &ClientMsg::Pw { id: 3, cmd: PwCmd::SetVolume { id: 9, v: 0.5 } });
     let (ok, _, _) = ack_for(&mut a, 3);
@@ -931,4 +931,84 @@ fn graph_thread_sends_only_on_change() {
     *r.fake.graph.lock().unwrap() = Some(graph_fixture(8)); // changed: one send
     seen.extend(collect(&mut f, Duration::from_millis(1200)));
     assert_eq!(graph_msgs(&seen), 2, "hello snapshot + one change");
+}
+
+fn graph_with(nodes: &[(u64, &str)]) -> pw::GraphWire {
+    pw::GraphWire {
+        nodes: nodes.iter().map(|(id, name)| pw::Node { id: *id, name: name.to_string(), ..Default::default() }).collect(),
+        links: vec![],
+        cookie: 1,
+    }
+}
+
+fn pw_set(r: &Rig, nodes: &[(u64, &str)], node: u64) -> bool {
+    *r.fake.graph.lock().unwrap() = Some(graph_with(nodes));
+    let (mut a, _) = join(r);
+    send(&mut a, &ClientMsg::Pw { id: 3, cmd: PwCmd::SetVolume { id: node, v: 2.0 } });
+    ack_for(&mut a, 3).0
+}
+
+#[test]
+fn breaker_new_raop_bus_cannot_set_its_own_lift_ceiling() {
+    let r = rig("newraopceil");
+    r.fake.raop_nodes.lock().unwrap().push("raop_new".into());
+    let (mut a, _) = join(&r);
+    let base = Config::peek(&r.cfg).unwrap();
+    let mut mine = base.clone();
+    mine.buses.push(Bus { id: "b8".into(), name: "New".into(), color: "#ffffff".into(), kind: BusKind::Hardware { target: "raop_new".into() }, gain_db: 12.0, mute: false, max_db: Some(12.0) });
+    send(&mut a, &ClientMsg::SaveConfig { id: 10, base: serde_json::to_value(&base).unwrap(), mine: serde_json::to_value(&mine).unwrap() });
+    let _ = ack_for(&mut a, 10);
+    let saved = Config::peek(&r.cfg).unwrap();
+    if let Some(nb) = saved.buses.iter().find(|b| b.id == "b8") {
+        assert!(nb.max_db.unwrap() <= -20.0 + 1e-9, "ceiling {:?}", nb.max_db);
+        assert!(nb.gain_db <= -20.0 + 1e-9, "gain {}", nb.gain_db);
+    }
+}
+
+#[test]
+fn breaker_pw_raw_write_to_unmapped_raop_node_is_refused() {
+    let r = rig("pwraopun");
+    assert!(!pw_set(&r, &[(9, "raop_other")], 9));
+    assert!(r.fake.pw_log.lock().unwrap().is_empty());
+}
+
+#[test]
+fn breaker_pw_raw_write_to_stale_bus_node_is_refused() {
+    let r = rig("pwbusstale");
+    assert!(!pw_set(&r, &[(9, "bus_zz")], 9));
+    assert!(r.fake.pw_log.lock().unwrap().is_empty());
+}
+
+#[test]
+fn pw_volume_on_a_node_missing_from_the_graph_is_refused() {
+    let r = rig("pwid77");
+    assert!(!pw_set(&r, &[(9, "firefox")], 77));
+    assert!(r.fake.pw_log.lock().unwrap().is_empty());
+}
+
+#[test]
+fn breaker_delete_and_readd_resets_the_raise_limiter() {
+    let r = rig("readd");
+    let (mut a, _) = join(&r);
+    // live raise from -30 is limited
+    let _ = cmd(&mut a, 1, Command::SetBusGain { bus: "a3".into(), db: -20.0, unlock: false });
+    let base = Config::peek(&r.cfg).unwrap();
+    let mut gone = base.clone();
+    gone.buses.retain(|b| b.id != "a3");
+    send(&mut a, &ClientMsg::SaveConfig { id: 2, base: serde_json::to_value(&base).unwrap(), mine: serde_json::to_value(&gone).unwrap() });
+    let _ = ack_for(&mut a, 2);
+    let base2 = Config::peek(&r.cfg).unwrap();
+    let mut back = base2.clone();
+    let mut b = base.buses.iter().find(|b| b.id == "a3").unwrap().clone();
+    b.gain_db = -20.0;
+    back.buses.push(b);
+    send(&mut a, &ClientMsg::SaveConfig { id: 3, base: serde_json::to_value(&base2).unwrap(), mine: serde_json::to_value(&back).unwrap() });
+    let _ = ack_for(&mut a, 3);
+    if let Some(b) = Config::peek(&r.cfg).unwrap().buses.iter().find(|b| b.id == "a3") {
+        assert!(b.gain_db <= -30.0 + safety_raise() + 1e-9, "re-added at {}", b.gain_db);
+    }
+}
+
+fn safety_raise() -> f64 {
+    wavelink_proto::safety::MAX_RAISE_PER_WINDOW_DB
 }
