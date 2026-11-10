@@ -55,6 +55,16 @@ impl Timeline {
     pub fn drain_all(&mut self) -> [Vec<Note>; 3] {
         [std::mem::take(&mut self.notes[0]), std::mem::take(&mut self.notes[1]), std::mem::take(&mut self.notes[2])]
     }
+
+    /// Lengthens notes that a carry-over window extended: `ext` is (previous end, note with its new dur).
+    /// Matches the first note with the same t and pitch; no match (already drained) is a no-op.
+    pub fn extend(&mut self, stem: usize, ext: &[(f64, Note)]) {
+        for (_, u) in ext {
+            if let Some(m) = self.notes[stem].iter_mut().find(|m| m.t == u.t && m.pitch == u.pitch) {
+                m.dur = u.dur;
+            }
+        }
+    }
 }
 
 /// MIDI key for a note: drum pitch 0 is the GM bass drum (38), everything else is the pitch itself.
@@ -119,13 +129,29 @@ pub fn midi_bytes(tracks: &[Vec<Note>; 3]) -> Vec<u8> {
         if stem != 0 {
             ev.push((0u64, 0u8, vec![0xc0 | ch, prog]));
         }
-        for n in notes {
+        let mut order: Vec<&Note> = notes.iter().collect();
+        order.sort_by(|a, b| a.t.total_cmp(&b.t));
+        // A note of a key ends no later than the next start of that key on this track (ported from the piano branch).
+        let mut offs = vec![0u64; order.len()];
+        let mut next_on: [Option<u64>; 128] = [None; 128];
+        for i in (0..order.len()).rev() {
+            let n = order[i];
             let k = key(stem, n.pitch);
             let dur = if stem == 0 { DRUM_DUR } else { n.dur };
+            let on = tick(n.t);
+            // at least one tick after the note-on, so a zero-length note still stops after it starts
+            let mut off = tick(n.t + dur).max(on + 1);
+            if let Some(nx) = next_on[k as usize] {
+                off = off.min(nx.max(on + 1));
+            }
+            offs[i] = off;
+            next_on[k as usize] = Some(on);
+        }
+        for (i, n) in order.iter().enumerate() {
+            let k = key(stem, n.pitch);
             let vel = n.vel.clamp(1, 127);
             ev.push((tick(n.t), 1, vec![0x90 | ch, k, vel]));
-            // at least one tick after the note-on, so a zero-length note still stops after it starts
-            ev.push((tick(n.t + dur).max(tick(n.t) + 1), 0, vec![0x80 | ch, k, 0]));
+            ev.push((offs[i], 0, vec![0x80 | ch, k, 0]));
         }
         out.extend(track_chunk(&mut ev));
     }
@@ -135,15 +161,43 @@ pub fn midi_bytes(tracks: &[Vec<Note>; 3]) -> Vec<u8> {
 /// Per note: (t + lag, "noteon C K V") and (t + lag + d, "noteoff C K"). Drums: K = 38 if pitch == 0, d = 0.1.
 pub fn synth_events(stem: usize, notes: &[Note], lag: f64) -> Vec<(f64, String)> {
     let (c, _) = PROGRAMS[stem];
-    let mut out = Vec::with_capacity(notes.len() * 2);
-    for n in notes {
-        let k = key(stem, n.pitch);
+    let mut order: Vec<&Note> = notes.iter().collect();
+    order.sort_by(|a, b| a.t.total_cmp(&b.t));
+    // Same rule as midi_bytes: a note ends no later than the next start of its key.
+    let mut offs = vec![0f64; order.len()];
+    let mut next_on: [Option<f64>; 128] = [None; 128];
+    for i in (0..order.len()).rev() {
+        let n = order[i];
+        let k = key(stem, n.pitch) as usize;
         let d = if stem == 0 { DRUM_DUR } else { n.dur };
+        let mut off = n.t + d;
+        if let Some(nx) = next_on[k] {
+            off = off.min(nx.max(n.t));
+        }
+        offs[i] = off;
+        next_on[k] = Some(n.t);
+    }
+    let mut out = Vec::with_capacity(notes.len() * 2);
+    for (i, n) in order.iter().enumerate() {
+        let k = key(stem, n.pitch);
         let vel = n.vel.clamp(1, 127);
         out.push((n.t + lag, format!("noteon {c} {k} {vel}")));
-        out.push((n.t + lag + d, format!("noteoff {c} {k}")));
+        out.push((offs[i] + lag, format!("noteoff {c} {k}")));
     }
     out
+}
+
+/// Moves pending noteoffs of carried notes to their new end. `ext` is (previous end, note with its new dur).
+/// An off that already played is not in `pending` and is left alone.
+pub fn retime_offs(pending: &mut Vec<(f64, String)>, stem: usize, ext: &[(f64, Note)], lag: f64) {
+    let (c, _) = PROGRAMS[stem];
+    for (old_end, u) in ext {
+        let k = key(stem, u.pitch);
+        let line = format!("noteoff {c} {k}");
+        if let Some(e) = pending.iter_mut().find(|e| e.1 == line && (e.0 - (old_end + lag)).abs() < 1e-6) {
+            e.0 = u.t + u.dur + lag;
+        }
+    }
 }
 
 /// Removes and returns the lines with time <= now, in ascending time order (stable).
@@ -225,6 +279,11 @@ impl Synth {
 
     pub fn queue(&mut self, ev: Vec<(f64, String)>) {
         self.pending.extend(ev);
+    }
+
+    /// Moves the pending offs of carried notes; see retime_offs.
+    pub fn retime(&mut self, stem: usize, ext: &[(f64, Note)], lag: f64) {
+        retime_offs(&mut self.pending, stem, ext, lag);
     }
 
     /// Writes the due lines and flushes; returns the count.
