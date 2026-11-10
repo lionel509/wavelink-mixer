@@ -656,9 +656,18 @@ impl Inner {
         let now = self.now_s();
         let mut notes: Vec<String> = vec![];
         let mut raised = vec![];
+        // a remote save never moves a bus's ceiling or kind: the hub's values win (their lift would defeat I1)
+        for b in mine.buses.iter_mut() {
+            if let Some(h) = core.cfg.buses.iter().find(|h| h.id == b.id) {
+                b.max_db = h.max_db;
+                b.kind = h.kind.clone();
+            }
+        }
+        // a bus the hub does not know yet has no live state to check against: it is only capped by its own ceiling
         let want: Vec<(String, f64)> = mine
             .buses
             .iter()
+            .filter(|b| core.state.bus(&b.id).is_some())
             .filter(|b| base.buses.iter().find(|o| o.id == b.id).map_or(true, |o| b.gain_db > o.gain_db))
             .map(|b| (b.id.clone(), b.gain_db))
             .collect();
@@ -688,6 +697,14 @@ impl Inner {
             }
             notes.extend(checked.note);
         }
+        // every bus in the candidate, new ones included, ends at or under its own ceiling (raop ceiling by props)
+        for b in mine.buses.iter_mut() {
+            if let config::BusKind::Hardware { target } = &b.kind {
+                let raop = self.backend.node_is_raop(target);
+                b.persist_raop_ceiling(raop);
+            }
+            b.gain_db = b.clamp_db(b.gain_db);
+        }
         match mine.save_merged_with(&mut base, &self.opts.cfg_path, &|_, _, _| {}) {
             Err(e) => nack(e),
             Ok(_) => {
@@ -713,6 +730,10 @@ impl Inner {
             self.backend.bus_for_node(&cfg, n)
         });
         let Some(bus) = bus else {
+            // a node we cannot classify (graph unreadable) could be a bus: refuse rather than write it raw
+            if node.is_some() && self.backend.graph_wire().is_none() {
+                return ServerMsg::Ack { id, ok: false, error: Some("hub can't read the PipeWire graph".into()), note: None };
+            }
             self.backend.pw(&cmd);
             return ServerMsg::Ack { id, ok: true, error: None, note: None };
         };

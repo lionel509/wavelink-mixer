@@ -822,6 +822,104 @@ fn pw_on_a_plain_node_is_applied_raw() {
 }
 
 #[test]
+fn pw_volume_on_unreadable_graph_is_refused_not_written_raw() {
+    // review finding 3: the hub cannot tell whether node 7 is a bus, so the write fails closed
+    let r = rig("pwnograph");
+    let (mut a, _) = join(&r);
+    send(&mut a, &ClientMsg::Pw { id: 3, cmd: PwCmd::SetVolume { id: 7, v: 2.0 } });
+    let (ok, _, _) = ack_for(&mut a, 3);
+    assert!(!ok, "a volume write with no readable graph must be refused");
+    assert!(r.fake.pw_log.lock().unwrap().is_empty(), "raw write reached PipeWire: {:?}", r.fake.pw_log.lock().unwrap());
+}
+
+#[test]
+fn pw_volume_on_a_plain_node_with_a_readable_graph_is_raw() {
+    // the refusal above is only for unclassifiable nodes: a readable graph with a non-bus node still writes
+    let r = rig("pwplain");
+    *r.fake.graph.lock().unwrap() = Some(graph_fixture(7));
+    let (mut a, _) = join(&r);
+    send(&mut a, &ClientMsg::Pw { id: 3, cmd: PwCmd::SetVolume { id: 9, v: 0.5 } });
+    let (ok, _, _) = ack_for(&mut a, 3);
+    assert!(ok);
+    assert_eq!(r.fake.pw_log.lock().unwrap().as_slice(), &[PwCmd::SetVolume { id: 9, v: 0.5 }]);
+}
+
+#[test]
+fn save_config_cannot_lift_the_speaker_ceiling() {
+    // review finding 1: a remote save that sets max_db to +12 on a speaker keeps the hub's ceiling
+    let r = rig("savelift");
+    let (mut a, _) = join(&r);
+    let mut f = connect(&r);
+    hello_full(&mut f);
+    let base = Config::peek(&r.cfg).unwrap();
+    let mut mine = base.clone();
+    let b = mine.buses.iter_mut().find(|b| b.id == "a3").unwrap();
+    b.max_db = Some(12.0);
+    b.gain_db = 0.0;
+    send(&mut a, &ClientMsg::SaveConfig { id: 7, base: serde_json::to_value(&base).unwrap(), mine: serde_json::to_value(&mine).unwrap() });
+    let (ok, _, _) = ack_for(&mut a, 7);
+    assert!(ok);
+    let saved = Config::peek(&r.cfg).unwrap();
+    let s = saved.buses.iter().find(|b| b.id == "a3").unwrap();
+    // the raop-named speaker keeps its -20 dB RAOP ceiling (#35's rule); the +12 is refused
+    assert!(s.max_db.map_or(true, |m| m <= -20.0), "ceiling lifted to {:?}", s.max_db);
+    assert!(s.gain_db <= s.ceiling_db() + 1e-9, "gain {} above ceiling {}", s.gain_db, s.ceiling_db());
+}
+
+#[test]
+fn save_config_retarget_keeps_the_hub_kind_and_its_cap() {
+    // review finding 1 (by reading): retargeting a bus at another sink cannot skip the cap
+    let r = rig("saveretarget");
+    let (mut a, _) = join(&r);
+    let base = Config::peek(&r.cfg).unwrap();
+    let mut mine = base.clone();
+    let b = mine.buses.iter_mut().find(|b| b.id == "a3").unwrap();
+    b.kind = BusKind::Hardware { target: "alsa_other".into() };
+    b.gain_db = 0.0;
+    send(&mut a, &ClientMsg::SaveConfig { id: 8, base: serde_json::to_value(&base).unwrap(), mine: serde_json::to_value(&mine).unwrap() });
+    let (ok, _, _) = ack_for(&mut a, 8);
+    assert!(ok);
+    let saved = Config::peek(&r.cfg).unwrap();
+    let s = saved.buses.iter().find(|b| b.id == "a3").unwrap();
+    assert!(matches!(&s.kind, BusKind::Hardware { target } if target == "raop_sonos_test"), "kind moved: {:?}", s.kind);
+    assert!(s.gain_db <= s.ceiling_db() + 1e-9, "gain {} above ceiling {}", s.gain_db, s.ceiling_db());
+}
+
+#[test]
+fn full_window_adds_a_bus_and_saves() {
+    // review finding 2: a bus the hub does not know yet saves, clamped to its own ceiling
+    let r = rig("savenewbus");
+    let (mut a, _) = join(&r);
+    let base = Config::peek(&r.cfg).unwrap();
+    let mut mine = base.clone();
+    mine.buses.push(Bus { id: "b9".into(), name: "New".into(), color: "#ffffff".into(), kind: BusKind::Hardware { target: "alsa_new".into() }, gain_db: -10.0, mute: false, max_db: None });
+    send(&mut a, &ClientMsg::SaveConfig { id: 9, base: serde_json::to_value(&base).unwrap(), mine: serde_json::to_value(&mine).unwrap() });
+    let (ok, err, _) = ack_for(&mut a, 9);
+    assert!(ok, "{err:?}");
+    let saved = Config::peek(&r.cfg).unwrap();
+    let nb = saved.buses.iter().find(|b| b.id == "b9").expect("new bus saved");
+    assert_eq!(nb.gain_db, -10.0);
+}
+
+#[test]
+fn full_window_adds_a_raop_bus_capped_at_its_ceiling() {
+    // review finding 2 variant: a new AirPlay bus at +12 is saved at or under its raop ceiling
+    let r = rig("savenewraop");
+    r.fake.raop_nodes.lock().unwrap().push("raop_new".into());
+    let (mut a, _) = join(&r);
+    let base = Config::peek(&r.cfg).unwrap();
+    let mut mine = base.clone();
+    mine.buses.push(Bus { id: "b8".into(), name: "New AirPlay".into(), color: "#ffffff".into(), kind: BusKind::Hardware { target: "raop_new".into() }, gain_db: 12.0, mute: false, max_db: None });
+    send(&mut a, &ClientMsg::SaveConfig { id: 10, base: serde_json::to_value(&base).unwrap(), mine: serde_json::to_value(&mine).unwrap() });
+    let (ok, err, _) = ack_for(&mut a, 10);
+    assert!(ok, "{err:?}");
+    let saved = Config::peek(&r.cfg).unwrap();
+    let nb = saved.buses.iter().find(|b| b.id == "b8").expect("new bus saved");
+    assert!(nb.gain_db <= nb.ceiling_db() + 1e-9, "gain {} above ceiling {}", nb.gain_db, nb.ceiling_db());
+    assert!(nb.gain_db <= -20.0 + 1e-9, "raop bus not capped: {}", nb.gain_db);
+}
+
+#[test]
 fn graph_thread_sends_only_on_change() {
     let r = rig("graphchg");
     *r.fake.graph.lock().unwrap() = Some(graph_fixture(7));
