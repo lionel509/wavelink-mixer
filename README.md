@@ -37,6 +37,45 @@ Config lives at `~/.config/wavelink-mixer/config.json`.
 - The force is system-wide (every app, games included) and stays after the engine stops. To release it: set `"quantum": 0` in `config.json` while the engine runs, or run `pw-metadata -n settings 0 clock.force-quantum 0`; it also clears when PipeWire restarts. Valid values: 0 or 32–2048 (numbers may be quoted); other numbers are clamped to that range and rounded up to a power of two, and an unreadable value falls back to 256.
 - If `config.json` can't be parsed, the mixer saves a copy as `config.json.bad` (or `config.json.bad.1`, `.2`, … if that name is taken) before writing defaults. If the copy can't be written, the file is left alone and defaults are used in memory only.
 
+## Remote control (LAN)
+
+The engine also serves the mixer on the local network so other computers can view and control it (#26).
+
+- `wavelink-mixer engine` listens on port 8790 (WebSocket, JSON) and advertises `_wavelink._tcp` with `avahi-publish`.
+- By default (`"bind": "auto"`) it listens on the IPv4 addresses of this machine's physical Ethernet and Wi-Fi NICs (those with a backing device in `/sys/class/net`; bridges, podman, veths and VPN tunnels have none) and on 127.0.0.1. It never binds 0.0.0.0 by itself. Every 30 s it adds new NIC addresses and retries addresses that failed to bind; 127.0.0.1 comes up even if a LAN address fails. Any network the NIC joins (a café, a hotel) gets a listener too. `"allow_meshnet": true` adds the NordVPN Meshnet (nordlynx) / Tailscale address; `"bind": "addr,addr"` lists addresses explicitly (`0.0.0.0` = everything).
+- Listening on a LAN address is not an interface filter: Linux accepts packets for that address from any interface, so a Meshnet peer with local-network access, or a container routed through this machine, can still reach `192.168.1.x:8790`, and anything sharing the host network (distroboxes) reaches 127.0.0.1. The token is what keeps them out.
+- Clients must send the token from `~/.config/wavelink-mixer/remote.json` (created on first run, mode 600, exclusively, so concurrent first runs agree). `wavelink-mixer remote-token` prints the host name, LAN IPs, the addresses it binds and the token; `wavelink-mixer remote-token --rotate` makes a new one: the engine notices within a second, refuses the old token and closes every session that authenticated with it.
+- `remote.json` keys: `token`, `enabled`, `bind`, `allow_meshnet`, `port`, `mdns`, `caps` (per-bus soft caps in dB, e.g. `{"a1": -6}`; 12 removes a soft cap). Environment overrides: `WAVELINK_REMOTE_PORT`, `WAVELINK_REMOTE_BIND`, `WAVELINK_REMOTE=0` (off), `WAVELINK_REMOTE_MDNS=0`.
+- Transport is plain `ws://` with a static bearer token: fine on a home LAN, not on untrusted networks. Anyone who can sniff the Wi-Fi can capture the token; rotate it if in doubt. TLS (or a challenge-response so the token never crosses the wire) is planned for a later phase.
+- Safety, all enforced by the engine:
+  - one hard ceiling per bus, the mixer's own `max_db` (-20 dB by default for an AirPlay/RAOP speaker, detected by name in any case or by node props, then saved): no writer ever sets the bus louder, the remote included;
+  - a soft cap below it (remote.json `caps`, else -20 dB for AirPlay speakers): a client lifts it only with an explicit unlock, held by the engine for that connection for 60 s, logged, and dropped when the connection closes;
+  - a physical bus rises at most 6 dB per command and at most 12 dB above its lowest level of the last second, across all clients (so the full -60 to +12 dB range takes at least 5 s); lowering is never limited;
+  - unmuting a capped bus above its cap brings it down to the cap first.
+- The engine is the writer for remote edits: each command is applied to the current `config.json` under `config.lock`, saved atomically, applied to the live graph with `wpctl`, and broadcast to every client. The mixer window merges instead of overwriting (its own edits win field by field, except auto-normalize gain moves, which yield to a remote gain), picks up remote edits within a second and before every graph sync, and never writes if a merge fails. When one side deletes a channel the other side is editing, the edit wins and the channel stays.
+- Pre-auth limits: 128 KiB per message, 16 connections, Hello within 5 s of connecting. At most 4 unauthenticated connections (2 per peer IP); when full, a socket is closed from the IP holding the most pending ones (idle ones first, idle = 1 s after its handshake without a Hello) rather than refusing the newcomer, and an IP's only socket is never taken while another IP holds two, so silent sockets can't lock a real client out. Loopback is exempt from the per-IP limit: a local process can flood 127.0.0.1, but any process of the same user can read `remote.json` (the token) anyway.
+- If the window's merge with a newer config.json fails 5 times in a row (on save or reload; it shouldn't happen), it saves its own settings to `config.json.wavelink-failed-<unix time>`, logs a warning, and follows config.json. To restore them: close the mixer window, then `cp ~/.config/wavelink-mixer/config.json.wavelink-failed-<time> ~/.config/wavelink-mixer/config.json` (the engine reloads it within a second), and reopen the window.
+- Protocol: the `wavelink-proto` crate (`proto/`). Hello{protocol, token} -> Welcome + full State; Commands get an Ack and every client gets a Delta; Unlock{bus, on} -> Unlock{bus, seconds}; Subscribe{meters} streams post-fader peak/RMS levels at about 15 fps (pw-record taps, only while a client wants them).
+
+### Wavelink Remote (client app)
+
+`client/` is a native egui app for macOS, Linux and Windows: discovers engines by mDNS (or type `host:port`), asks for the token once, then shows the channel strips (fader, mute, sends coloured per bus with levels, auto-normalize + target), the bus faders and live meters.
+
+- Build: `cargo build --release -p wavelink-remote` (the workspace's default build only builds the mixer).
+- macOS: the `Wavelink Remote (macOS)` GitHub Actions workflow uploads `wavelink-remote-macos-universal.tar.gz` (a universal, ad-hoc signed `Wavelink Remote.app`). It is not notarized: the first time, right-click the app and choose Open (or run `xattr -dr com.apple.quarantine "Wavelink Remote.app"`), and allow Local Network access when macOS asks.
+- Headless check: `WAVELINK_REMOTE_TOKEN=... wavelink-remote --probe HOST[:PORT] ['{"op":"set_bus_gain","bus":"a1","db":-20}' ...]` (or pipe the token on stdin) prints the state, sends the commands, prints acks/deltas and a few meter frames.
+
+### Mac panel (MacBook output)
+
+The Mac can join the mixer as one extra output, the **MacBook** strip. Its fader and mute set the Mac's own system output volume, and changing the volume keys on the Mac shows up on the strip. The strip appears at the end of the OUTPUTS row, on the bazzite window and on the Mac window.
+
+- Build the Mac window (needs Homebrew `gtk4 libadwaita`): `cargo build --release`.
+- Connect it once, using the token from the PC: `wavelink-mixer remote-token` on bazzite, then on the Mac `wavelink-mixer remote lionelweng-himalayas.nord --label MacBook --save`. `--save` writes the address, token and label to `~/.config/wavelink-mixer/remote-client.json` (mode 0600) on the Mac only; `config.json` is never touched. Later runs need no arguments.
+- The Mac window is the only thing that makes the strip live: it reads OFFLINE while the Mac window is closed, and its volume is the Mac's real system volume.
+- Step rule: the engine limits each raise to 25 points per `SetHostVolume` command. A single raise (a click on the fader, a probe) moves the Mac at most 25 points, but a drag sends a command every 40 ms, so it climbs 25 points per step and can reach full in a few hundred ms. Lowering is never limited. The engine clamps every value to 0 to 100.
+- The engine keeps the MacBook only while it runs. After a bazzite restart the strip returns when the Mac window reconnects.
+- Deploy note: bazzite needs the new engine build, `systemctl --user restart wavelink-engine`. An older engine ignores the Mac's registration, so no MacBook strip appears until it is updated.
+
 ## Stems models
 Downloaded on first use into `~/.local/share/wavelink/models/`, checked against pinned SHA-256.
 - Live engine: StemgenRT v0.7 independent streaming HS-TasNet by Axel Delafosse, weights CC BY-NC-SA 4.0 (non-commercial), https://github.com/sweetspotsoundsystem/StemgenRT-5.8. Fetched from upstream, never redistributed by this repo.
