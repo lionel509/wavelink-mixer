@@ -184,7 +184,7 @@ fn demo_held_notes() {
         reference.add(1, &new);
         reference.extend(1, &ext);
         windows += 1;
-        if !mid_done && end_t >= total_s / 2.0 {
+        if !mid_done && end_t >= total_s / 2.0 && !open.is_empty() {
             let (mid_taken, held_now) = take_for_save(&mut shared.timeline.lock().unwrap(), true); // PR-ONLY
             // MAIN: let (mid_taken, held_now) = (shared.timeline.lock().unwrap().drain_all(), open.len());
             mid = mid_taken;
@@ -193,6 +193,9 @@ fn demo_held_notes() {
             mid_done = true;
         }
         played += CHUNK;
+    }
+    if !mid_done {
+        println!("held at mid: 0 (no held window found)");
     }
     release(&shared); // PR-ONLY
     let (fin, _) = take_for_save(&mut shared.timeline.lock().unwrap(), true); // PR-ONLY
