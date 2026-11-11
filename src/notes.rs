@@ -31,27 +31,53 @@ pub struct Timeline {
     notes: [Vec<Note>; 3],
     /// Per stem, the (t, pitch) of notes a later window may still change (held at the last window).
     open: [Vec<(f64, u8)>; 3],
+    /// Per stem, the longest dur ever added or extended (an upper bound, never lowered): `add` stops looking back
+    /// once no earlier note can still sound at the new onset.
+    longest: [f64; 3],
 }
 
 impl Timeline {
     pub fn new() -> Self {
-        Timeline { notes: [Vec::new(), Vec::new(), Vec::new()], open: [Vec::new(), Vec::new(), Vec::new()] }
+        Timeline {
+            notes: [Vec::new(), Vec::new(), Vec::new()],
+            open: [Vec::new(), Vec::new(), Vec::new()],
+            longest: [0.0; 3],
+        }
     }
 
-    /// A new note that starts inside an earlier note of the same pitch ends that note where the new one starts
-    /// (an earlier window closed it past a strike it did not see, #71). Only recent notes are checked.
+    /// Adds notes and keeps the stem in time order. Of two notes of one pitch that overlap, the earlier one ends
+    /// where the later one starts (an earlier window closed it past a strike it did not see, #71), and two notes
+    /// with the same onset collapse into the longer one. Only the notes that can overlap are looked at.
     pub fn add(&mut self, stem: usize, notes: &[Note]) {
-        for n in notes {
-            for m in self.notes[stem].iter_mut().rev() {
-                if m.t < n.t - 4.0 {
+        for new in notes {
+            let longest = self.longest[stem];
+            let v = &mut self.notes[stem];
+            let mut n = new.clone();
+            let at = v.partition_point(|m| m.t <= n.t);
+            let mut merged = false;
+            for m in v[..at].iter_mut().rev() {
+                if m.t + longest < n.t {
                     break;
                 }
-                if m.pitch == n.pitch && m.t < n.t && n.t < m.t + m.dur {
+                if m.pitch != n.pitch {
+                    continue;
+                }
+                if m.t == n.t {
+                    m.dur = m.dur.max(n.dur);
+                    merged = true;
+                } else if n.t < m.t + m.dur {
                     m.dur = n.t - m.t;
                 }
             }
+            if !merged {
+                // a note already sounding at this one's start is started later: this note ends there
+                if let Some(m) = v[at..].iter().take_while(|m| m.t < n.t + n.dur).find(|m| m.pitch == n.pitch) {
+                    n.dur = m.t - n.t;
+                }
+                v.insert(at, n.clone());
+            }
+            self.longest[stem] = self.longest[stem].max(n.dur);
         }
-        self.notes[stem].extend_from_slice(notes);
     }
 
     /// Notes with t < to and t + dur >= from.
@@ -115,6 +141,7 @@ impl Timeline {
     /// Matches the first note with the same t and pitch; no match (already drained) is a no-op.
     pub fn extend(&mut self, stem: usize, ext: &[(f64, Note)]) {
         for (_, u) in ext {
+            self.longest[stem] = self.longest[stem].max(u.dur);
             if let Some(m) = self.notes[stem].iter_mut().find(|m| m.t == u.t && m.pitch == u.pitch) {
                 m.dur = u.dur;
             }
