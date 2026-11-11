@@ -4,7 +4,7 @@
 use super::App;
 use crate::config::{glib_home, names};
 use crate::dash::{hex_rgb, Spectrum};
-use crate::notes::{midi_bytes, COLORS, STEMS};
+use crate::notes::{midi_bytes, save_status, take_for_save, COLORS, STEMS};
 use crate::stemcfg::{self, Plays, SepEngine, StemsCfg};
 use crate::stems::{Opts, Session, Shared};
 use gtk::prelude::*;
@@ -462,10 +462,11 @@ fn stop(app: &App) {
 }
 
 fn save_midi(app: &Rc<App>, v: &View) {
-    let tracks = app.stems.shared.timeline.lock().unwrap().drain_all();
+    let running = app.stems.session.borrow().is_some();
+    let (tracks, held) = take_for_save(&mut app.stems.shared.timeline.lock().unwrap(), running);
     let n: usize = tracks.iter().map(|t| t.len()).sum();
     if n == 0 {
-        v.status.set_text("no notes yet");
+        v.status.set_text(&save_status("", 0, held));
         return;
     }
     let src = source_id(app, v).unwrap_or_else(|| "spotify".into());
@@ -476,13 +477,11 @@ fn save_midi(app: &Rc<App>, v: &View) {
     let bytes = midi_bytes(&tracks);
     let written = create_midi(&glib_home(), &src, &stamp).and_then(|(path, mut f)| f.write_all(&bytes).map(|_| path));
     match written {
-        Ok(path) => v.status.set_text(&format!("saved {} ({} notes)", path.display(), n)),
+        Ok(path) => v.status.set_text(&save_status(&path.display().to_string(), n, held)),
         Err(e) => {
             // put the notes back so a retry can still save them
             let mut tl = app.stems.shared.timeline.lock().unwrap();
-            for (i, t) in tracks.iter().enumerate() {
-                tl.add(i, t);
-            }
+            tl.put_back(&tracks);
             v.status.set_text(&format!("save failed: {e}"));
         }
     }

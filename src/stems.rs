@@ -6,7 +6,7 @@ use crate::dsp::{envelope, onsets, xcorr_lag, BP_RATE};
 use crate::models::{self, ModelSet, S_FILES, U_FILES};
 use crate::notes::{synth_events, Note, Synth, Timeline, MIDI_LAG, STEMS};
 use crate::pw::{die_with_parent, Graph};
-use crate::sep::{calibrate, deinterleave, frames_to_notes_open, walk_end, Grids, FRAME_THRESH, ONSET_THRESH, Separator, Streamer, Transcriber, BLOCK, BLOCK_MS, BP_SAMPLES, FPS, PARALLEL};
+use crate::sep::{calibrate, deinterleave, frames_to_notes_open, next_strike, walk_end, Grids, FRAME_THRESH, MIN_NOTE_FRAMES, Separator, Streamer, Transcriber, BLOCK, BLOCK_MS, BP_SAMPLES, FPS, PARALLEL};
 use crate::stemcfg::{self, Plays, SepEngine};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -221,6 +221,9 @@ pub struct ChunkHeader {
     pub frames: usize,
     pub stems: [&'static str; 3],
     pub notes: BTreeMap<&'static str, Vec<[f64; 4]>>,
+    /// Lengthened notes sent again: [t - t0, dur, pitch, vel]. Absent when empty.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub ext: BTreeMap<&'static str, Vec<[f64; 4]>>,
 }
 
 /// t0 = id * 22016 / 44100; notes as [t - t0, dur, pitch, vel].
@@ -231,7 +234,7 @@ pub fn chunk_header(id: u64, notes: &[Vec<Note>; 3]) -> ChunkHeader {
         let v = notes[i].iter().map(|n| [n.t - t0, n.dur, n.pitch as f64, n.vel as f64]).collect();
         map.insert(*name, v);
     }
-    ChunkHeader { op: "chunk", id, t0, rate: RATE as u32, frames: CHUNK, stems: STEMS, notes: map }
+    ChunkHeader { op: "chunk", id, t0, rate: RATE as u32, frames: CHUNK, stems: STEMS, notes: map, ext: BTreeMap::new() }
 }
 
 /// Shared with the UI: bands are 3 x BANDS; played is in frames at 44.1 kHz.
@@ -835,17 +838,16 @@ fn transcribe(mut tr: Transcriber, rx: mpsc::Receiver<(u64, [Vec<f32>; 3])>, tx:
                     Ok(mut g) => window_notes(g.as_mut(), end_t, &mut open[stem]),
                     Err(e) => {
                         set_status(shared, format!("notes off: {e}"));
+                        release(shared);
                         return;
                     }
                 }
             };
-            if let Some(mut tl) = shared.live() {
-                tl.add(stem, &kept);
-                tl.extend(stem, &ext);
-            }
+            commit(shared, stem, &kept, &ext, &open[stem]);
             let _ = tx.send((stem, kept, ext));
         }
     }
+    release(shared);
 }
 
 /// Notes of one stem for the window ending at `end_t`, with the carry-over of held notes.
@@ -871,7 +873,7 @@ pub fn window_notes(g: Option<&mut Grids>, end_t: f64, open: &mut Vec<Note>) -> 
         if f0 < 1.0 {
             // Windows were dropped and this one starts past the note's last known end: bridge the gap
             // when the pitch is still sounding at the window start, else the note is over.
-            if old_end >= ws || g.note.len() < 2 || g.note[1][p] < FRAME_THRESH {
+            if g.note.len() < 2 || g.note[1][p] < FRAME_THRESH {
                 continue;
             }
             f0 = 1.0;
@@ -881,31 +883,36 @@ pub fn window_notes(g: Option<&mut Grids>, end_t: f64, open: &mut Vec<Note>) -> 
         }
         let f0 = f0 as usize;
         let (mut end, mut at_edge) = walk_end(&g.note, f0 - 1, p); // starts by testing frame f0
-        // A same-pitch onset peak inside the walk is a re-strike: the carried note ends where it
-        // went quiet, and the re-strike is left on the grid for a new note.
-        let restrike = (f0 + 1..end).find(|&f| {
-            let v = g.onset[f][p];
-            v >= ONSET_THRESH && v >= g.onset[f - 1][p] && g.onset.get(f + 1).map_or(true, |r| v >= r[p]) && g.note[f - 1][p] < FRAME_THRESH
-        });
-        if let Some(fr) = restrike {
-            end = (f0..fr).rev().find(|&f| g.note[f][p] >= FRAME_THRESH).map_or(f0, |f| f + 1);
-            at_edge = false;
+        // A raw strike of this pitch (#59) ends the carried note where it goes quiet, and is left for a new note.
+        // Only a strike this window keeps may close the note; a later one leaves the note open up to it.
+        let own = ((n.t - ws) * FPS).round() as i64 + MIN_NOTE_FRAMES as i64 + 1;
+        let keep0 = ((end_t - 1.0 - ws) * FPS).ceil() as i64;
+        let from = own.max(keep0).max(1) as usize;
+        let strike = next_strike(&g.note, &g.onset, p, from, end);
+        if let Some(fr) = strike {
+            end = (0..fr).rev().find(|&f| g.note[f][p] >= FRAME_THRESH).map_or(fr, |f| f + 1);
+            at_edge = !in_window(ws + fr as f64 / FPS, end_t);
         }
-        if ws + end as f64 / FPS <= old_end {
+        let new_end = ws + end as f64 / FPS;
+        if strike.is_none() && new_end <= old_end {
             continue;
         }
-        let u = Note { dur: ws + end as f64 / FPS - n.t, ..n.clone() };
-        ext.push((old_end, u.clone()));
+        let u = Note { dur: new_end - n.t, ..n.clone() };
+        if (new_end - old_end).abs() > 1e-9 {
+            ext.push((old_end, u.clone()));
+        }
         if at_edge {
             still.push(u);
         }
-        for row in g.note.iter_mut().take(end) {
+        for row in g.note.iter_mut().take(strike.unwrap_or(end)) {
             row[p] = 0.0;
         }
     }
     *open = still;
     let mut new: Vec<Note> = Vec::new();
-    for (n, at_edge) in frames_to_notes_open(&g.note, &g.onset) {
+    // A new note whose re-strike is past this window's keep slice stays open for the next window (review #69 f2).
+    let keep_end = ((end_t - 0.5 - ws) * crate::sep::FPS).ceil() as usize;
+    for (n, at_edge) in crate::sep::frames_to_notes_open_keep(&g.note, &g.onset, keep_end) {
         let t = ws + n.t;
         if !in_window(t, end_t) {
             continue;
@@ -917,6 +924,59 @@ pub fn window_notes(g: Option<&mut Grids>, end_t: f64, open: &mut Vec<Note>) -> 
         new.push(n);
     }
     (new, ext)
+}
+
+/// Hands one window's notes to the timeline: `kept` are added, `ext` lengthens, `open` are the notes a later
+/// window may still change (Save leaves them for the next Save).
+pub(crate) fn commit(shared: &Shared, stem: usize, kept: &[Note], ext: &[(f64, Note)], open: &[Note]) {
+    if let Some(mut tl) = shared.live() {
+        tl.add(stem, kept);
+        tl.extend(stem, ext);
+        tl.set_open(stem, open);
+    }
+}
+
+/// The stream of this session ends: every held note is closed, so the next Save or chunk writes it.
+pub(crate) fn release(shared: &Shared) {
+    if let Some(mut tl) = shared.live() {
+        tl.close_all();
+    }
+}
+
+/// Splits the closed and held notes of one chunk into the rows to send as notes and as ext. A note already sent
+/// is sent again only when its length changed. `sent` becomes this chunk's held notes.
+pub fn stream_split(sent: &mut [Vec<Note>; 3], closed: [Vec<Note>; 3], held: [Vec<Note>; 3]) -> ([Vec<Note>; 3], [Vec<Note>; 3]) {
+    let mut notes: [Vec<Note>; 3] = Default::default();
+    let mut ext: [Vec<Note>; 3] = Default::default();
+    for stem in 0..3 {
+        for n in closed[stem].iter().chain(held[stem].iter()) {
+            match sent[stem].iter().find(|s| s.t == n.t && s.pitch == n.pitch) {
+                Some(s) if s.dur != n.dur => ext[stem].push(n.clone()),
+                Some(_) => {}
+                None => notes[stem].push(n.clone()),
+            }
+        }
+        sent[stem] = held[stem].clone();
+    }
+    (notes, ext)
+}
+
+/// The JSON line of one engine chunk: the notes that are new, and the ext rows of the held notes that grew.
+pub(crate) fn chunk_line(shared: &Shared, sent: &mut [Vec<Note>; 3], id: u64) -> String {
+    let (closed, held) = {
+        let mut tl = lock(&shared.timeline);
+        (tl.drain_closed(), tl.held())
+    };
+    let (notes, ext) = stream_split(sent, closed, held);
+    let mut header = chunk_header(id, &notes);
+    for (i, name) in STEMS.iter().enumerate() {
+        if ext[i].is_empty() {
+            continue;
+        }
+        let rows = ext[i].iter().map(|n| [n.t - header.t0, n.dur, n.pitch as f64, n.vel as f64]).collect();
+        header.ext.insert(*name, rows);
+    }
+    serde_json::to_string(&header).unwrap_or_default()
 }
 
 pub(crate) fn in_window(t: f64, end_t: f64) -> bool {
@@ -1049,6 +1109,7 @@ pub fn cli(args: Vec<String>) -> i32 {
         });
     }
     let mut out = std::io::stdout().lock();
+    let mut sent: [Vec<Note>; 3] = Default::default();
     loop {
         if eof.load(Ordering::Relaxed) {
             break;
@@ -1058,9 +1119,7 @@ pub fn cli(args: Vec<String>) -> i32 {
             Err(RecvTimeoutError::Timeout) => continue,
             Err(_) => break,
         };
-        let notes = lock(&shared.timeline).drain_all();
-        let header = chunk_header(id, &notes);
-        let line = serde_json::to_string(&header).unwrap_or_default();
+        let line = chunk_line(&shared, &mut sent, id);
         if writeln!(out, "{line}").is_err() {
             break;
         }
@@ -1352,13 +1411,6 @@ mod tests {
     }
 
     #[test]
-    fn window_notes_does_not_duplicate_the_held_pitch() {
-        let (_, out, _) = run_windows(&[(1.0, 5.0, 48)], 4..=14, Some((3.0, 48)));
-        assert_eq!(out.len(), 1, "a re-onset inside the sustain must not start a second note: {out:?}");
-        assert!((out[0].dur - 4.0).abs() <= 1.0 / crate::sep::FPS + 1e-9, "full length: {}", out[0].dur);
-    }
-
-    #[test]
     fn window_notes_bridges_four_or_more_dropped_windows() {
         let ks: Vec<usize> = (4..=14).filter(|k| !(15..=18).contains(k)).chain(19..=24).collect();
         let (_, out, _) = run_windows(&[(1.0, 12.0, 48)], 4..=4, None);
@@ -1434,6 +1486,391 @@ mod tests {
             let m = out.iter().find(|m| m.pitch as usize == p + 21).unwrap_or_else(|| panic!("pitch {} missing", p + 21));
             assert!((m.t - on).abs() <= tol, "onset of pitch {}: {} vs {on}", p + 21, m.t);
             assert!((m.dur - (off - on)).abs() <= tol, "length of pitch {}: {} vs {}", p + 21, m.dur, off - on);
+        }
+    }
+
+    /// Uniform [0, 1) from an LCG, as f64.
+    fn lcg_f(s: &mut u64) -> f64 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*s >> 33) as f64) / (1u64 << 31) as f64
+    }
+
+    /// Back-to-back notes of columns 40 and 52 from one seed, as (on, off, column). A third of the gaps are zero.
+    fn chain_notes(seed: u64) -> Vec<(f64, f64, usize)> {
+        let mut s = seed;
+        let mut out = Vec::new();
+        for p in [40usize, 52] {
+            let mut t = 0.6 + lcg_f(&mut s) * 0.9;
+            while t < 9.0 {
+                let dur = 0.25 + lcg_f(&mut s) * 2.75;
+                out.push((t, t + dur, p));
+                let g = lcg_f(&mut s);
+                let gap = if g < 1.0 / 3.0 {
+                    0.0
+                } else if g < 2.0 / 3.0 {
+                    0.03 + lcg_f(&mut s) * 0.07
+                } else {
+                    0.3 + lcg_f(&mut s) * 0.7
+                };
+                t += dur + gap;
+            }
+        }
+        out
+    }
+
+    /// Feeds the windows `ks` (any subset, in order) through window_notes and returns the timeline's notes.
+    fn carry_out(notes: &[(f64, f64, usize)], ks: &[usize]) -> Vec<crate::notes::Note> {
+        let step = CHUNK as f64 / RATE as f64;
+        let win_len = BP_SAMPLES as f64 / BP_RATE as f64;
+        let mut open = Vec::new();
+        let mut tl = crate::notes::Timeline::new();
+        for &k in ks {
+            let end_t = k as f64 * step;
+            let mut g = held_win(end_t - win_len, notes);
+            let (new, ext) = window_notes(Some(&mut g), end_t, &mut open);
+            tl.add(1, &new);
+            tl.extend(1, &ext);
+        }
+        tl.window(1, 0.0, 100.0)
+    }
+
+    /// The engine client of the chunk stream (bass rows only): adds each `notes` row, and lengthens the note
+    /// that an `ext` row names by its t and pitch.
+    fn apply_chunk(client: &mut Vec<Note>, line: &str) {
+        let v: serde_json::Value = serde_json::from_str(line).expect("chunk line is JSON");
+        let t0 = v["t0"].as_f64().expect("t0");
+        for r in v["notes"]["bass"].as_array().into_iter().flatten() {
+            let r: Vec<f64> = r.as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+            client.push(Note { t: t0 + r[0], dur: r[1], pitch: r[2] as u8, vel: r[3] as u8 });
+        }
+        for r in v["ext"]["bass"].as_array().into_iter().flatten() {
+            let r: Vec<f64> = r.as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+            let t = t0 + r[0];
+            if let Some(m) = client.iter_mut().find(|m| m.pitch == r[2] as u8 && (m.t - t).abs() < 1e-6) {
+                m.dur = r[1];
+            }
+        }
+    }
+
+    #[test]
+    fn breaker59_touching_same_pitch_notes_stay_two() {
+        let (_, mut out, _) = run_windows(&[(1.0, 3.0, 48), (3.0, 5.0, 48)], 4..=14, None);
+        out.sort_by(|a, b| a.t.total_cmp(&b.t));
+        assert_eq!(out.len(), 2, "{out:?}");
+        let tol = 1.5 / crate::sep::FPS;
+        assert!((out[0].t + out[0].dur - 3.0).abs() <= tol, "first note must end at 3.0: {out:?}");
+        assert!((out[1].t - 3.0).abs() <= tol && (out[1].dur - 2.0).abs() <= tol, "second note must be 3.0 + 2.0: {out:?}");
+    }
+
+    #[test]
+    fn breaker59_restrike_onset_inside_sustain_starts_new_note() {
+        let (_, mut out, _) = run_windows(&[(1.0, 5.0, 48)], 4..=14, Some((3.0, 48)));
+        out.sort_by(|a, b| a.t.total_cmp(&b.t));
+        assert_eq!(out.len(), 2, "a re-strike is a new note: {out:?}");
+        let tol = 1.5 / crate::sep::FPS;
+        assert!((out[0].t + out[0].dur - out[1].t).abs() <= tol, "the first ends where the re-strike starts: {out:?}");
+        let total: f64 = out.iter().map(|n| n.dur).sum();
+        assert!((total - 4.0).abs() <= 2.0 / crate::sep::FPS, "the two lengths sum to the sustain: {total}");
+    }
+
+    #[test]
+    fn window_notes_restrike_within_one_keep_slice_is_kept() {
+        let (_, out, _) = run_windows(&[(1.0, 1.3, 48), (1.3, 3.0, 48)], 4..=12, None);
+        assert_eq!(out.len(), 2, "re-strike inside one keep slice swallowed: {out:?}");
+    }
+
+    #[test]
+    fn window_notes_restrike_near_the_window_edge_shortens_the_carried_note() {
+        let (_, mut out, _) = run_windows(&[(1.2, 1.95, 48), (1.95, 3.0, 48)], 4..=12, None);
+        out.sort_by(|a, b| a.t.total_cmp(&b.t));
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!((out[0].t + out[0].dur - 1.95).abs() <= 1.5 / crate::sep::FPS, "carried note must end at the re-strike: {out:?}");
+    }
+
+    /// #62b: a carried note whose last known end is exactly the window start is bridged, not dropped.
+    #[test]
+    fn window_notes_bridge_at_the_exact_boundary() {
+        let end_t = 10.0;
+        let ws = end_t - BP_SAMPLES as f64 / BP_RATE as f64;
+        let fresh = || crate::sep::Grids { note: vec![vec![0.9f32; 88]; 172], onset: vec![vec![0.0f32; 88]; 172] };
+        for end in [ws + 0.5 / crate::sep::FPS, ws] {
+            let mut open = vec![Note { t: ws - 0.5, dur: end - (ws - 0.5), pitch: 69, vel: 100 }];
+            let mut g = fresh();
+            let (_, ext) = window_notes(Some(&mut g), end_t, &mut open);
+            assert_eq!(ext.len(), 1, "carried note with old end {end}: {ext:?}");
+            assert_eq!(open.len(), 1, "the note still sounds, so it stays open");
+        }
+    }
+
+    /// Pins #62a: the repeat's onset was never delivered, so the gap is bridged into one note.
+    #[test]
+    fn window_notes_gap_bridge_is_one_note_when_the_repeat_onset_was_dropped() {
+        let ks: Vec<usize> = (4..=7).chain(16..=22).collect();
+        let out = carry_out(&[(1.0, 5.6, 48), (5.8, 10.0, 48)], &ks);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!((out[0].t - 1.0).abs() <= 1.5 / crate::sep::FPS, "{out:?}");
+        assert!((out[0].dur - 9.0).abs() <= 0.1, "{out:?}");
+    }
+
+    /// Review finding 2 (#69): a new note whose re-strike is past the window's keep slice (2.3 s, keep [1.6, 2.1))
+    /// is seen once, and gone in the next window. The note must stay open and come out whole.
+    #[test]
+    fn window_notes_new_note_restrike_past_keep_seen_once_stays_whole() {
+        let win_len = BP_SAMPLES as f64 / BP_RATE as f64;
+        let notes = [(1.6, 3.0, 48)];
+        let mut open = Vec::new();
+        let mut tl = crate::notes::Timeline::new();
+        for end_t in [2.1, 2.6, 3.1, 3.6] {
+            let ws = end_t - win_len;
+            let mut g = held_win(ws, &notes);
+            if (end_t - 2.6f64).abs() < 1e-9 {
+                g.onset[((2.3 - ws) * crate::sep::FPS).round() as usize][48] = 0.6;
+            }
+            let (new, ext) = window_notes(Some(&mut g), end_t, &mut open);
+            tl.add(1, &new);
+            tl.extend(1, &ext);
+        }
+        let out = tl.window(1, 0.0, 100.0);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!((out[0].t - 1.6).abs() <= 1.5 / crate::sep::FPS, "{out:?}");
+        assert!((out[0].dur - 1.4).abs() <= 1.5 / crate::sep::FPS, "{out:?}");
+    }
+
+    /// I59 and I62 on generated chains: one note per strike, no same-pitch overlap, at most one open note per pitch.
+    #[test]
+    fn carry_invariant_one_note_per_strike() {
+        let tol = 1.5 / crate::sep::FPS;
+        let step = CHUNK as f64 / RATE as f64;
+        let win_len = BP_SAMPLES as f64 / BP_RATE as f64;
+        for seed in 1..=40u64 {
+            let chain = chain_notes(seed);
+            let mut open: Vec<Note> = Vec::new();
+            let mut tl = crate::notes::Timeline::new();
+            for k in 1..=28usize {
+                let end_t = k as f64 * step;
+                let mut g = held_win(end_t - win_len, &chain);
+                let (new, ext) = window_notes(Some(&mut g), end_t, &mut open);
+                tl.add(1, &new);
+                tl.extend(1, &ext);
+                let mut ps: Vec<u8> = open.iter().map(|n| n.pitch).collect();
+                ps.sort();
+                ps.dedup();
+                assert_eq!(ps.len(), open.len(), "seed {seed} window {k}: two open notes share a pitch");
+            }
+            let out = tl.window(1, 0.0, 100.0);
+            for p in [40usize, 52] {
+                let mut want: Vec<(f64, f64)> = chain.iter().filter(|c| c.2 == p).map(|c| (c.0, c.1)).collect();
+                let mut got: Vec<(f64, f64)> = out.iter().filter(|n| n.pitch as usize == p + 21).map(|n| (n.t, n.t + n.dur)).collect();
+                want.sort_by(|a, b| a.0.total_cmp(&b.0));
+                got.sort_by(|a, b| a.0.total_cmp(&b.0));
+                assert_eq!(got.len(), want.len(), "seed {seed} pitch {}: {got:?} vs {want:?}", p + 21);
+                for i in 0..got.len() {
+                    assert!((got[i].0 - want[i].0).abs() <= tol, "seed {seed} pitch {} note {i}: onset {} vs {}", p + 21, got[i].0, want[i].0);
+                    assert!((got[i].1 - want[i].1).abs() <= tol, "seed {seed} pitch {} note {i}: end {} vs {}", p + 21, got[i].1, want[i].1);
+                    if i > 0 {
+                        assert!(got[i].0 >= got[i - 1].1 - 1e-9, "seed {seed} pitch {}: notes {} and {} overlap", p + 21, i - 1, i);
+                    }
+                }
+            }
+        }
+    }
+
+    /// I62 on generated held notes: a run of dropped windows never splits or shortens the note.
+    #[test]
+    fn carry_invariant_held_note_survives_dropped_windows() {
+        let tol = 1.5 / crate::sep::FPS;
+        for seed in 1..=40u64 {
+            let mut s = seed;
+            let on = 0.6 + lcg_f(&mut s) * 1.0;
+            let len = 8.0 + lcg_f(&mut s) * 4.0;
+            let k0 = 8 + (lcg_f(&mut s) * 4.0) as usize;
+            let d = 1 + (lcg_f(&mut s) * 7.0) as usize;
+            let ks: Vec<usize> = (1..=30usize).filter(|k| !(k0..k0 + d).contains(k)).collect();
+            let out = carry_out(&[(on, on + len, 48)], &ks);
+            assert_eq!(out.len(), 1, "seed {seed}, dropped {k0}..{}: {out:?}", k0 + d);
+            let m = &out[0];
+            assert!((m.t - on).abs() <= tol, "seed {seed}: onset {} vs {on}", m.t);
+            assert!((m.t + m.dur - (on + len)).abs() <= tol, "seed {seed}: end {} vs {}", m.t + m.dur, on + len);
+        }
+    }
+
+    /// I60 with the Save path: mid-song take plus the final take equal one final save of the reference timeline,
+    /// and a stopped session writes everything it has.
+    #[test]
+    fn save_invariant_mid_save_plus_final_is_the_single_save() {
+        let step = CHUNK as f64 / RATE as f64;
+        let win_len = BP_SAMPLES as f64 / BP_RATE as f64;
+        for seed in 1..=40u64 {
+            let chain = chain_notes(seed);
+            let mut s = seed ^ 0x5555;
+            let mid_k = 3 + (lcg_f(&mut s) * 23.0) as usize;
+            // running: the session is live at the mid-song Save, then stops and saves again
+            {
+                let shared = Shared::new();
+                let mut reference = crate::notes::Timeline::new();
+                let mut open: Vec<Note> = Vec::new();
+                let mut mid: Vec<Note> = Vec::new();
+                for k in 1..=28usize {
+                    let end_t = k as f64 * step;
+                    let mut g = held_win(end_t - win_len, &chain);
+                    let (new, ext) = window_notes(Some(&mut g), end_t, &mut open);
+                    commit(&shared, 1, &new, &ext, &open);
+                    reference.add(1, &new);
+                    reference.extend(1, &ext);
+                    if k == mid_k {
+                        let (tracks, held) = crate::notes::take_for_save(&mut lock(&shared.timeline), true);
+                        assert!(held >= open.len(), "seed {seed}: every open note is counted as held");
+                        mid = tracks[1].clone();
+                    }
+                }
+                release(&shared);
+                let (fin, held_end) = crate::notes::take_for_save(&mut lock(&shared.timeline), true);
+                assert_eq!(held_end, 0, "seed {seed}: nothing is held after release");
+                let mut single: Vec<Note> = reference.drain_all().into_iter().nth(1).unwrap();
+                let mut both: Vec<Note> = mid.iter().cloned().chain(fin[1].iter().cloned()).collect();
+                let by_start = |a: &Note, b: &Note| a.t.total_cmp(&b.t).then(a.pitch.cmp(&b.pitch));
+                single.sort_by(by_start);
+                both.sort_by(by_start);
+                assert_eq!(both, single, "seed {seed} mid save at window {mid_k}: mid + final differ from one final save");
+            }
+            // stopped at the mid-song Save: that Save writes every note so far, and nothing is held
+            {
+                let shared = Shared::new();
+                let mut open: Vec<Note> = Vec::new();
+                let mut added = 0usize;
+                for k in 1..=mid_k {
+                    let end_t = k as f64 * step;
+                    let mut g = held_win(end_t - win_len, &chain);
+                    let (new, ext) = window_notes(Some(&mut g), end_t, &mut open);
+                    commit(&shared, 1, &new, &ext, &open);
+                    added += new.len();
+                }
+                let (tracks, held) = crate::notes::take_for_save(&mut lock(&shared.timeline), false);
+                assert_eq!(held, 0, "seed {seed}: a stopped session holds nothing");
+                assert_eq!(tracks[1].len(), added, "seed {seed}: a stopped Save writes every note so far");
+            }
+        }
+    }
+
+    #[test]
+    fn commit_marks_held_and_release_clears() {
+        let shared = Shared::new();
+        let a = Note { t: 1.0, dur: 0.5, pitch: 60, vel: 90 };
+        commit(&shared, 1, &[a.clone()], &[], &[a.clone()]);
+        let (tracks, held) = crate::notes::take_for_save(&mut lock(&shared.timeline), true);
+        assert_eq!(held, 1, "the open note is held");
+        assert!(tracks.iter().all(|v| v.is_empty()), "a held note is not written: {tracks:?}");
+        release(&shared);
+        let (tracks, held) = crate::notes::take_for_save(&mut lock(&shared.timeline), true);
+        assert_eq!(held, 0);
+        assert_eq!(tracks[1], vec![a], "after release the note is closed and written");
+    }
+
+    #[test]
+    fn stream_split_sends_each_note_once_then_its_changes() {
+        let a = Note { t: 1.0, dur: 0.5, pitch: 60, vel: 90 };
+        let mut sent: [Vec<Note>; 3] = Default::default();
+        let (n1, e1) = stream_split(&mut sent, [vec![], vec![], vec![]], [vec![], vec![a.clone()], vec![]]);
+        assert_eq!(n1[1], vec![a.clone()], "a new held note is sent as a note");
+        assert!(e1.iter().all(|v| v.is_empty()));
+        let a2 = Note { dur: 1.0, ..a.clone() };
+        let (n2, e2) = stream_split(&mut sent, [vec![], vec![], vec![]], [vec![], vec![a2.clone()], vec![]]);
+        assert!(n2.iter().all(|v| v.is_empty()), "a lengthened held note is not sent again as a note: {n2:?}");
+        assert_eq!(e2[1], vec![a2.clone()], "a lengthened held note goes out as ext");
+        let (n3, e3) = stream_split(&mut sent, [vec![], vec![a2.clone()], vec![]], [vec![], vec![], vec![]]);
+        assert!(n3.iter().all(|v| v.is_empty()) && e3.iter().all(|v| v.is_empty()), "an unchanged note is sent once: {n3:?} {e3:?}");
+        let a3 = Note { dur: 1.4, ..a.clone() };
+        let (_, _) = stream_split(&mut sent, [vec![], vec![], vec![]], [vec![], vec![a3.clone()], vec![]]);
+        let (n4, e4) = stream_split(&mut sent, [vec![], vec![a3.clone()], vec![]], [vec![], vec![], vec![]]);
+        assert!(n4.iter().all(|v| v.is_empty()), "{n4:?}");
+        assert!(e4[1].is_empty(), "closed at the dur it was last sent with: {e4:?}");
+    }
+
+    #[test]
+    fn chunk_line_has_no_ext_key_without_extensions() {
+        let shared = Shared::new();
+        let a = Note { t: 1.0, dur: 0.5, pitch: 60, vel: 90 };
+        commit(&shared, 1, &[a.clone()], &[], &[a.clone()]);
+        let mut sent: [Vec<Note>; 3] = Default::default();
+        let line = chunk_line(&shared, &mut sent, 2);
+        assert!(!line.contains("\"ext\""), "{line}");
+        assert!(line.contains("\"notes\""), "{line}");
+        assert_eq!(sent[1], vec![a], "the held note is recorded as sent");
+    }
+
+    #[test]
+    fn chunk_line_carries_an_extension() {
+        let shared = Shared::new();
+        let a = Note { t: 1.0, dur: 0.5, pitch: 60, vel: 90 };
+        commit(&shared, 1, &[a.clone()], &[], &[a.clone()]);
+        let mut sent: [Vec<Note>; 3] = Default::default();
+        let first = chunk_line(&shared, &mut sent, 2);
+        assert!(first.contains("\"notes\""), "{first}");
+        let a2 = Note { dur: 1.0, ..a.clone() };
+        commit(&shared, 1, &[], &[(1.5, a2.clone())], &[a2.clone()]);
+        let line = chunk_line(&shared, &mut sent, 3);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let t0 = v["t0"].as_f64().unwrap();
+        let row: Vec<f64> = v["ext"]["bass"][0].as_array().expect("an ext row for bass").iter().map(|x| x.as_f64().unwrap()).collect();
+        assert!((row[0] - (1.0 - t0)).abs() < 1e-9 && (row[1] - 1.0).abs() < 1e-9 && row[2] == 60.0 && row[3] == 90.0, "{row:?}");
+    }
+
+    #[test]
+    fn stream_held_note_stops_at_a_restrike_already_sent() {
+        let shared = Shared::new();
+        let a = Note { t: 10.0, dur: 0.5, pitch: 40, vel: 90 };
+        let s = Note { t: 10.125, dur: 0.3, pitch: 40, vel: 90 };
+        let mut sent: [Vec<Note>; 3] = Default::default();
+        let mut client: Vec<Note> = Vec::new();
+        commit(&shared, 1, &[a.clone(), s.clone()], &[], &[a.clone()]);
+        apply_chunk(&mut client, &chunk_line(&shared, &mut sent, 21));
+        let a2 = Note { dur: 2.0, ..a.clone() };
+        commit(&shared, 1, &[], &[(10.5, a2.clone())], &[a2.clone()]);
+        apply_chunk(&mut client, &chunk_line(&shared, &mut sent, 22));
+        let a3 = Note { dur: 2.5, ..a.clone() };
+        commit(&shared, 1, &[], &[(12.0, a3.clone())], &[a3.clone()]);
+        apply_chunk(&mut client, &chunk_line(&shared, &mut sent, 23));
+        release(&shared);
+        apply_chunk(&mut client, &chunk_line(&shared, &mut sent, 24));
+        client.sort_by(|x, y| x.t.total_cmp(&y.t));
+        assert_eq!(client.len(), 2, "{client:?}");
+        assert!((client[0].dur - 0.125).abs() < 1e-6, "{client:?}");
+        assert!((client[1].t - 10.125).abs() < 1e-6 && (client[1].dur - 0.3).abs() < 1e-6, "{client:?}");
+    }
+
+    /// I60 for the engine: a client that applies every chunk ends with the same whole notes as a final save.
+    #[test]
+    fn stream_invariant_client_ends_with_whole_notes() {
+        let step = CHUNK as f64 / RATE as f64;
+        let win_len = BP_SAMPLES as f64 / BP_RATE as f64;
+        for seed in 1..=40u64 {
+            let chain = chain_notes(seed);
+            let shared = Shared::new();
+            let mut reference = crate::notes::Timeline::new();
+            let mut open: Vec<Note> = Vec::new();
+            let mut sent: [Vec<Note>; 3] = Default::default();
+            let mut client: Vec<Note> = Vec::new();
+            for k in 1..=28usize {
+                let end_t = k as f64 * step;
+                let mut g = held_win(end_t - win_len, &chain);
+                let (new, ext) = window_notes(Some(&mut g), end_t, &mut open);
+                commit(&shared, 1, &new, &ext, &open);
+                reference.add(1, &new);
+                reference.extend(1, &ext);
+                let line = chunk_line(&shared, &mut sent, k as u64);
+                apply_chunk(&mut client, &line);
+            }
+            release(&shared);
+            let line = chunk_line(&shared, &mut sent, 29);
+            apply_chunk(&mut client, &line);
+            let mut want: Vec<Note> = reference.drain_all().into_iter().nth(1).unwrap();
+            let by_start = |a: &Note, b: &Note| a.t.total_cmp(&b.t).then(a.pitch.cmp(&b.pitch));
+            want.sort_by(by_start);
+            client.sort_by(by_start);
+            assert_eq!(client.len(), want.len(), "seed {seed}: client {client:?} vs {want:?}");
+            for (c, w) in client.iter().zip(want.iter()) {
+                assert!(c.pitch == w.pitch && (c.t - w.t).abs() < 1e-6 && (c.dur - w.dur).abs() < 1e-6, "seed {seed}: client {c:?} vs {w:?}");
+            }
         }
     }
 }

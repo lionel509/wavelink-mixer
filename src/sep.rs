@@ -364,6 +364,20 @@ pub fn walk_end(work: &[Vec<f32>], f: usize, p: usize) -> (usize, bool) {
     }
 }
 
+/// The next raw onset peak of pitch column `p` in `from..end` that starts a new note (#59). `onset` is the
+/// raw model grid: a peak on a sounding frame, more than MIN_NOTE_FRAMES frames before `end`.
+pub fn next_strike(note: &[Vec<f32>], onset: &[Vec<f32>], p: usize, from: usize, end: usize) -> Option<usize> {
+    let end = end.min(onset.len()).min(note.len());
+    (from..end).find(|&fr| {
+        let v = onset[fr][p];
+        v >= ONSET_THRESH
+            && (fr == 0 || v >= onset[fr - 1][p])
+            && (fr + 1 >= onset.len() || v >= onset[fr + 1][p])
+            && note[fr][p] >= FRAME_THRESH
+            && end - fr > MIN_NOTE_FRAMES
+    })
+}
+
 /// note and onset are [frame][pitch] grids (172 x 88).
 pub fn frames_to_notes(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<Note> {
     frames_to_notes_open(note, onset).into_iter().map(|(n, _)| n).collect()
@@ -372,12 +386,19 @@ pub fn frames_to_notes(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<Note> {
 /// As `frames_to_notes`, and each note carries a flag: true when its walk reached the last frame,
 /// so the note may still be sounding past the window.
 pub fn frames_to_notes_open(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<(Note, bool)> {
+    frames_to_notes_open_keep(note, onset, usize::MAX)
+}
+
+/// As `frames_to_notes_open`, where a re-strike at frame `keep_end` or later is past this window's keep slice:
+/// the next window may not see it, so the note it ends stays open (flag true) for the carry-over.
+pub fn frames_to_notes_open_keep(note: &[Vec<f32>], onset: &[Vec<f32>], keep_end: usize) -> Vec<(Note, bool)> {
     let frames = note.len();
     if frames == 0 {
         return Vec::new();
     }
     let pitches = note[0].len();
     let mut work: Vec<Vec<f32>> = note.to_vec();
+    let raw = onset;
     let inferred = infer_onsets(note, onset);
     let onset = &inferred[..];
 
@@ -404,7 +425,12 @@ pub fn frames_to_notes_open(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<(Note,
         if work[f][p] < FRAME_THRESH {
             continue;
         }
-        let (end, at_edge) = walk_end(&work, f, p);
+        let (mut end, mut at_edge) = walk_end(&work, f, p);
+        // a raw re-strike of this pitch ends the note where it goes quiet (#59)
+        if let Some(fr) = next_strike(&work, raw, p, f + MIN_NOTE_FRAMES + 1, end) {
+            end = (f..fr).rev().find(|&x| work[x][p] >= FRAME_THRESH).map_or(fr, |x| x + 1);
+            at_edge = fr >= keep_end;
+        }
         // upstream: `if i - note_start_idx <= min_note_len: continue`, so a note needs at least 12 frames
         if end - f <= MIN_NOTE_FRAMES {
             continue;
@@ -893,5 +919,44 @@ mod tests {
                 assert_eq!((p.t, p.dur, p.pitch, p.vel), (f.t, f.dur, f.pitch, f.vel));
             }
         }
+    }
+
+    #[test]
+    fn next_strike_wants_a_raw_peak_on_a_sounding_frame() {
+        let mut note = grid(172, 88);
+        let mut onset = grid(172, 88);
+        for f in 20..120 {
+            note[f][48] = 0.9;
+        }
+        onset[20][48] = 0.9;
+        onset[70][48] = 0.6;
+        assert_eq!(next_strike(&note, &onset, 48, 32, 120), Some(70));
+        let mut weak = onset.clone();
+        weak[70][48] = 0.4;
+        assert_eq!(next_strike(&note, &weak, 48, 32, 120), None, "below ONSET_THRESH");
+        assert_eq!(next_strike(&note, &onset, 48, 71, 120), None, "starts after `from`");
+        let mut silent = note.clone();
+        silent[70][48] = 0.1;
+        assert_eq!(next_strike(&silent, &onset, 48, 32, 120), None, "not a sounding frame");
+        let mut late = grid(172, 88);
+        late[20][48] = 0.9;
+        late[112][48] = 0.6;
+        assert_eq!(next_strike(&note, &late, 48, 32, 120), None, "too close to the end");
+    }
+
+    #[test]
+    fn frames_to_notes_splits_at_a_weaker_raw_restrike() {
+        let mut note = grid(172, 88);
+        let mut onset = grid(172, 88);
+        for f in 20..120 {
+            note[f][48] = 0.9;
+        }
+        onset[20][48] = 0.9;
+        onset[70][48] = 0.6;
+        let ns = frames_to_notes(&note, &onset);
+        assert_eq!(ns.len(), 2, "{ns:?}");
+        assert!((ns[0].t - 20.0 / FPS).abs() < 1.5 / FPS, "{ns:?}");
+        assert!((ns[1].t - 70.0 / FPS).abs() < 1.5 / FPS, "{ns:?}");
+        assert!((ns[0].dur - 50.0 / FPS).abs() < 1.5 / FPS, "{ns:?}");
     }
 }
