@@ -54,6 +54,11 @@ impl Timeline {
             let v = &mut self.notes[stem];
             let mut n = new.clone();
             let at = v.partition_point(|m| m.t <= n.t);
+            // a note already sounding at this one's start is started later: this note ends there (before the merge,
+            // so a same-onset merge takes the clipped length)
+            if let Some(m) = v[at..].iter().take_while(|m| m.t < n.t + n.dur).find(|m| m.pitch == n.pitch) {
+                n.dur = m.t - n.t;
+            }
             let mut merged = false;
             for m in v[..at].iter_mut().rev() {
                 if m.t + longest < n.t {
@@ -70,10 +75,6 @@ impl Timeline {
                 }
             }
             if !merged {
-                // a note already sounding at this one's start is started later: this note ends there
-                if let Some(m) = v[at..].iter().take_while(|m| m.t < n.t + n.dur).find(|m| m.pitch == n.pitch) {
-                    n.dur = m.t - n.t;
-                }
                 v.insert(at, n.clone());
             }
             self.longest[stem] = self.longest[stem].max(n.dur);
@@ -141,10 +142,17 @@ impl Timeline {
     /// Matches the first note with the same t and pitch; no match (already drained) is a no-op.
     pub fn extend(&mut self, stem: usize, ext: &[(f64, Note)]) {
         for (_, u) in ext {
-            self.longest[stem] = self.longest[stem].max(u.dur);
-            if let Some(m) = self.notes[stem].iter_mut().find(|m| m.t == u.t && m.pitch == u.pitch) {
-                m.dur = u.dur;
+            let v = &mut self.notes[stem];
+            let mut dur = u.dur;
+            if let Some(i) = v.iter().position(|m| m.t == u.t && m.pitch == u.pitch) {
+                let t = v[i].t;
+                // the note stops at the first later strike of its pitch that is already in the timeline
+                if let Some(j) = v[i + 1..].iter().take_while(|m| m.t < t + u.dur).find(|m| m.pitch == u.pitch) {
+                    dur = j.t - t;
+                }
+                v[i].dur = dur;
             }
+            self.longest[stem] = self.longest[stem].max(dur);
         }
     }
 }
