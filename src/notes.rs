@@ -29,11 +29,13 @@ const DRUM_DUR: f64 = 0.1;
 /// Notes per stem, in insertion order.
 pub struct Timeline {
     notes: [Vec<Note>; 3],
+    /// Per stem, the (t, pitch) of notes a later window may still change (held at the last window).
+    open: [Vec<(f64, u8)>; 3],
 }
 
 impl Timeline {
     pub fn new() -> Self {
-        Timeline { notes: [Vec::new(), Vec::new(), Vec::new()] }
+        Timeline { notes: [Vec::new(), Vec::new(), Vec::new()], open: [Vec::new(), Vec::new(), Vec::new()] }
     }
 
     pub fn add(&mut self, stem: usize, notes: &[Note]) {
@@ -56,22 +58,45 @@ impl Timeline {
         [std::mem::take(&mut self.notes[0]), std::mem::take(&mut self.notes[1]), std::mem::take(&mut self.notes[2])]
     }
 
-    /// Marks the notes a later window may still change, by (t, pitch) per stem. Stub: does nothing.
+    /// Marks the notes a later window may still change, by (t, pitch) per stem. Reuses the stem's Vec.
     pub fn set_open(&mut self, stem: usize, open: &[Note]) {
-        let _ = (stem, open);
+        self.open[stem].clear();
+        self.open[stem].extend(open.iter().map(|n| (n.t, n.pitch)));
     }
 
-    /// Every note is closed (a stopped session). Stub: does nothing.
-    pub fn close_all(&mut self) {}
+    /// Every note is closed (a stopped session).
+    pub fn close_all(&mut self) {
+        for v in self.open.iter_mut() {
+            v.clear();
+        }
+    }
 
-    /// Removes and returns the closed notes; held notes stay in the timeline. Stub: drains everything.
+    /// Removes and returns the closed notes; held notes stay in the timeline, in order.
     pub fn drain_closed(&mut self) -> [Vec<Note>; 3] {
-        self.drain_all()
+        let mut out: [Vec<Note>; 3] = Default::default();
+        for stem in 0..3 {
+            let open = &self.open[stem];
+            let mut kept = Vec::new();
+            for n in std::mem::take(&mut self.notes[stem]) {
+                if open.iter().any(|&(t, p)| t == n.t && p == n.pitch) {
+                    kept.push(n);
+                } else {
+                    out[stem].push(n);
+                }
+            }
+            self.notes[stem] = kept;
+        }
+        out
     }
 
-    /// Clones of the held notes, per stem. Stub: none.
+    /// Clones of the held notes, per stem.
     pub fn held(&self) -> [Vec<Note>; 3] {
-        Default::default()
+        let mut out: [Vec<Note>; 3] = Default::default();
+        for stem in 0..3 {
+            let open = &self.open[stem];
+            out[stem] = self.notes[stem].iter().filter(|n| open.iter().any(|&(t, p)| t == n.t && p == n.pitch)).cloned().collect();
+        }
+        out
     }
 
     /// Lengthens notes that a carry-over window extended: `ext` is (previous end, note with its new dur).
@@ -86,16 +111,23 @@ impl Timeline {
 }
 
 /// What Save writes: the closed notes, and how many notes are still held. A stopped session closes every note
-/// first. Stub: drains everything, holds nothing.
+/// first.
 pub fn take_for_save(tl: &mut Timeline, running: bool) -> ([Vec<Note>; 3], usize) {
-    let _ = running;
-    (tl.drain_all(), 0)
+    if !running {
+        tl.close_all();
+    }
+    let held = tl.held().iter().map(|v| v.len()).sum();
+    (tl.drain_closed(), held)
 }
 
-/// The status line after a Save. Stub: empty.
+/// The status line after a Save.
 pub fn save_status(path: &str, n: usize, held: usize) -> String {
-    let _ = (path, n, held);
-    String::new()
+    match (n, held) {
+        (0, 0) => "no notes yet".to_string(),
+        (0, h) => format!("no finished notes yet ({h} held)"),
+        (n, 0) => format!("saved {path} ({n} notes)"),
+        (n, h) => format!("saved {path} ({n} notes, {h} held for the next save)"),
+    }
 }
 
 /// MIDI key for a note: drum pitch 0 is the GM bass drum (38), everything else is the pitch itself.
@@ -162,27 +194,42 @@ pub fn midi_bytes(tracks: &[Vec<Note>; 3]) -> Vec<u8> {
         }
         let mut order: Vec<&Note> = notes.iter().collect();
         order.sort_by(|a, b| a.t.total_cmp(&b.t));
-        // A note of a key ends no later than the next start of that key on this track (ported from the piano branch).
-        let mut offs = vec![0u64; order.len()];
-        let mut next_on: [Option<u64>; 128] = [None; 128];
-        for i in (0..order.len()).rev() {
-            let n = order[i];
+        // One entry per (key, on tick): same-key notes that start on one tick collapse to the longer, the louder.
+        // (on tick, off tick, key, vel) in on order.
+        let mut hits: Vec<(u64, u64, u8, u8)> = Vec::with_capacity(order.len());
+        let mut last: [Option<usize>; 128] = [None; 128];
+        for n in order.iter() {
             let k = key(stem, n.pitch);
             let dur = if stem == 0 { DRUM_DUR } else { n.dur };
             let on = tick(n.t);
             // at least one tick after the note-on, so a zero-length note still stops after it starts
-            let mut off = tick(n.t + dur).max(on + 1);
+            let off = tick(n.t + dur).max(on + 1);
+            let vel = n.vel.clamp(1, 127);
+            match last[k as usize] {
+                Some(i) if hits[i].0 == on => {
+                    hits[i].1 = hits[i].1.max(off);
+                    hits[i].3 = hits[i].3.max(vel);
+                }
+                _ => {
+                    last[k as usize] = Some(hits.len());
+                    hits.push((on, off, k, vel));
+                }
+            }
+        }
+        // A note of a key ends no later than the next start of that key on this track (ported from the piano branch).
+        let mut next_on: [Option<u64>; 128] = [None; 128];
+        for i in (0..hits.len()).rev() {
+            let (on, off, k, _) = hits[i];
+            let mut off = off;
             if let Some(nx) = next_on[k as usize] {
                 off = off.min(nx.max(on + 1));
             }
-            offs[i] = off;
+            hits[i].1 = off;
             next_on[k as usize] = Some(on);
         }
-        for (i, n) in order.iter().enumerate() {
-            let k = key(stem, n.pitch);
-            let vel = n.vel.clamp(1, 127);
-            ev.push((tick(n.t), 1, vec![0x90 | ch, k, vel]));
-            ev.push((offs[i], 0, vec![0x80 | ch, k, 0]));
+        for (on, off, k, vel) in hits {
+            ev.push((on, 1, vec![0x90 | ch, k, vel]));
+            ev.push((off, 0, vec![0x80 | ch, k, 0]));
         }
         out.extend(track_chunk(&mut ev));
     }
