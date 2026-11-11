@@ -38,7 +38,19 @@ impl Timeline {
         Timeline { notes: [Vec::new(), Vec::new(), Vec::new()], open: [Vec::new(), Vec::new(), Vec::new()] }
     }
 
+    /// A new note that starts inside an earlier note of the same pitch ends that note where the new one starts
+    /// (an earlier window closed it past a strike it did not see, #71). Only recent notes are checked.
     pub fn add(&mut self, stem: usize, notes: &[Note]) {
+        for n in notes {
+            for m in self.notes[stem].iter_mut().rev() {
+                if m.t < n.t - 4.0 {
+                    break;
+                }
+                if m.pitch == n.pitch && m.t < n.t && n.t < m.t + m.dur {
+                    m.dur = n.t - m.t;
+                }
+            }
+        }
         self.notes[stem].extend_from_slice(notes);
     }
 
@@ -395,6 +407,17 @@ mod tests {
 
     fn n(t: f64, dur: f64, pitch: u8, vel: u8) -> Note {
         Note { t, dur, pitch, vel }
+    }
+
+    #[test]
+    fn add_clips_earlier_same_pitch_note_at_new_strike() {
+        let mut tl = Timeline::new();
+        tl.add(1, &[n(1.0, 0.5, 43, 90), n(1.0, 0.9, 50, 90)]);
+        tl.add(1, &[n(1.3, 0.2, 43, 90)]);
+        let w = tl.window(1, 0.0, 9.0);
+        assert!((w[0].dur - 0.3).abs() < 1e-9, "{}", w[0].dur);
+        assert!((w[1].dur - 0.9).abs() < 1e-9);
+        assert_eq!(w.len(), 3);
     }
 
     fn vlq(b: &[u8], mut i: usize) -> (usize, usize) {
