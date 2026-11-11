@@ -481,9 +481,7 @@ fn save_midi(app: &Rc<App>, v: &View) {
         Err(e) => {
             // put the notes back so a retry can still save them
             let mut tl = app.stems.shared.timeline.lock().unwrap();
-            for (i, t) in tracks.iter().enumerate() {
-                tl.add(i, t);
-            }
+            tl.put_back(&tracks);
             v.status.set_text(&format!("save failed: {e}"));
         }
     }

@@ -26,139 +26,185 @@ const TICKS_PER_SEC: f64 = 960.0;
 /// Drum hits are written with a fixed length, as in `synth_events`.
 const DRUM_DUR: f64 = 0.1;
 
-/// Notes per stem, in insertion order.
+/// A note that can still change. `cap` is the earliest later onset of its pitch ever accepted (`f64::INFINITY`
+/// when none). `cool` is set when the note was not listed at the last `set_open`.
+struct Live {
+    n: Note,
+    cap: f64,
+    cool: bool,
+}
+
+/// Notes per stem. INVARIANT: a note can change only while it is live (from its `add` until the second `set_open`
+/// that does not list it, or `close_all`); while it is live it ends no later than the next onset of its pitch the
+/// timeline has accepted (a strike always wins over an earlier live note); once it leaves live it is final, is never
+/// read or changed again, and no later note of its pitch may start before its end.
 pub struct Timeline {
-    notes: [Vec<Note>; 3],
-    /// Per stem, the (t, pitch) of notes a later window may still change (held at the last window).
-    open: [Vec<(f64, u8)>; 3],
-    /// Per stem, the longest dur ever added or extended (an upper bound, never lowered): `add` stops looking back
-    /// once no earlier note can still sound at the new onset.
-    longest: [f64; 3],
+    live: [Vec<Live>; 3],
+    done: [Vec<Note>; 3],
+    /// Per stem and pitch, the end of the last final note of that pitch.
+    floor: [[f64; 256]; 3],
+}
+
+/// The only write to a note's `dur`: the note ends at `want`, or at its `cap`.
+fn fit(m: &mut Live, want: f64) {
+    m.n.dur = want.min(m.cap - m.n.t);
+}
+
+/// The only way a note becomes final.
+fn retire(done: &mut Vec<Note>, floor: &mut [f64; 256], n: Note) {
+    let p = n.pitch as usize;
+    floor[p] = floor[p].max(n.t + n.dur);
+    done.push(n);
 }
 
 impl Timeline {
     pub fn new() -> Self {
         Timeline {
-            notes: [Vec::new(), Vec::new(), Vec::new()],
-            open: [Vec::new(), Vec::new(), Vec::new()],
-            longest: [0.0; 3],
+            live: [Vec::new(), Vec::new(), Vec::new()],
+            done: [Vec::new(), Vec::new(), Vec::new()],
+            floor: [[f64::NEG_INFINITY; 256]; 3],
         }
     }
 
-    /// Adds notes and keeps the stem in time order. Of two notes of one pitch that overlap, the earlier one ends
-    /// where the later one starts (an earlier window closed it past a strike it did not see, #71), and two notes
-    /// with the same onset collapse into the longer one. Only the notes that can overlap are looked at.
+    /// Adds notes. Of two notes of one pitch that overlap, the earlier one ends where the later one starts (an earlier
+    /// window closed it past a strike it did not see, #71), and two notes with the same onset collapse into the
+    /// longer one. A note that starts inside a final note of its pitch keeps only the part after that note's end.
     pub fn add(&mut self, stem: usize, notes: &[Note]) {
         for new in notes {
-            let longest = self.longest[stem];
-            let v = &mut self.notes[stem];
-            let mut n = new.clone();
-            let at = v.partition_point(|m| m.t <= n.t);
-            // a note already sounding at this one's start is started later: this note ends there (before the merge,
-            // so a same-onset merge takes the clipped length)
-            if let Some(m) = v[at..].iter().take_while(|m| m.t < n.t + n.dur).find(|m| m.pitch == n.pitch) {
-                n.dur = m.t - n.t;
-            }
-            let mut merged = false;
-            for m in v[..at].iter_mut().rev() {
-                if m.t + longest < n.t {
-                    break;
-                }
-                if m.pitch != n.pitch {
+            let p = new.pitch as usize;
+            let mut t = new.t;
+            let mut want = new.dur;
+            let floor = self.floor[stem][p];
+            if t < floor {
+                let end = t + want;
+                if end <= floor {
                     continue;
                 }
-                if m.t == n.t {
-                    m.dur = m.dur.max(n.dur);
-                    merged = true;
-                } else if n.t < m.t + m.dur {
-                    m.dur = n.t - m.t;
+                want = end - floor;
+                t = floor;
+            }
+            let mut cap = f64::INFINITY;
+            let mut same: Option<usize> = None;
+            let live = &mut self.live[stem];
+            for (i, m) in live.iter_mut().enumerate() {
+                if m.n.pitch != new.pitch {
+                    continue;
+                }
+                if m.n.t < t {
+                    m.cap = m.cap.min(t);
+                    let d = m.n.dur;
+                    fit(m, d);
+                } else if m.n.t > t {
+                    cap = cap.min(m.n.t);
+                } else {
+                    same = Some(i);
                 }
             }
-            if !merged {
-                v.insert(at, n.clone());
+            match same {
+                Some(i) => {
+                    let d = live[i].n.dur.max(want);
+                    fit(&mut live[i], d);
+                }
+                None => {
+                    let mut m = Live { n: Note { t, dur: 0.0, pitch: new.pitch, vel: new.vel }, cap, cool: false };
+                    fit(&mut m, want);
+                    live.push(m);
+                }
             }
-            self.longest[stem] = self.longest[stem].max(n.dur);
         }
     }
 
-    /// Notes with t < to and t + dur >= from.
+    /// Notes with t < to and t + dur >= from, in time order.
     pub fn window(&self, stem: usize, from: f64, to: f64) -> Vec<Note> {
-        self.notes[stem].iter().filter(|n| n.t < to && n.t + n.dur >= from).cloned().collect()
+        let mut v: Vec<Note> = self.done[stem]
+            .iter()
+            .cloned()
+            .chain(self.live[stem].iter().map(|m| m.n.clone()))
+            .filter(|n| n.t < to && n.t + n.dur >= from)
+            .collect();
+        v.sort_by(|a, b| a.t.total_cmp(&b.t));
+        v
     }
 
     /// Drops notes with t + dur < before.
     pub fn prune(&mut self, before: f64) {
-        for v in self.notes.iter_mut() {
+        for v in self.done.iter_mut() {
             v.retain(|n| n.t + n.dur >= before);
         }
-    }
-
-    pub fn drain_all(&mut self) -> [Vec<Note>; 3] {
-        [std::mem::take(&mut self.notes[0]), std::mem::take(&mut self.notes[1]), std::mem::take(&mut self.notes[2])]
-    }
-
-    /// Marks the notes a later window may still change, by (t, pitch) per stem. Reuses the stem's Vec.
-    pub fn set_open(&mut self, stem: usize, open: &[Note]) {
-        self.open[stem].clear();
-        self.open[stem].extend(open.iter().map(|n| (n.t, n.pitch)));
-    }
-
-    /// Every note is closed (a stopped session).
-    pub fn close_all(&mut self) {
-        for v in self.open.iter_mut() {
-            v.clear();
+        for v in self.live.iter_mut() {
+            v.retain(|m| m.n.t + m.n.dur >= before);
         }
     }
 
-    /// Removes and returns the closed notes; held notes stay in the timeline, in order.
+    /// Takes every note, final or not, after closing all of them.
+    pub fn drain_all(&mut self) -> [Vec<Note>; 3] {
+        self.close_all();
+        self.drain_closed()
+    }
+
+    /// The window tick: marks the notes a later window may still change, by (t, pitch) per stem. A live note not
+    /// listed cools for one window; a cooling note not listed again is retired.
+    pub fn set_open(&mut self, stem: usize, open: &[Note]) {
+        let Timeline { live, done, floor } = self;
+        live[stem].retain_mut(|m| {
+            let listed = open.iter().any(|o| o.t == m.n.t && o.pitch == m.n.pitch);
+            if listed {
+                m.cool = false;
+                true
+            } else if !m.cool {
+                m.cool = true;
+                true
+            } else {
+                retire(&mut done[stem], &mut floor[stem], m.n.clone());
+                false
+            }
+        });
+    }
+
+    /// Every note is closed (a stopped session): all live notes become final.
+    pub fn close_all(&mut self) {
+        let Timeline { live, done, floor } = self;
+        for stem in 0..3 {
+            for m in live[stem].drain(..) {
+                retire(&mut done[stem], &mut floor[stem], m.n);
+            }
+        }
+    }
+
+    /// Removes and returns the final notes, per stem, in time order.
     pub fn drain_closed(&mut self) -> [Vec<Note>; 3] {
         let mut out: [Vec<Note>; 3] = Default::default();
         for stem in 0..3 {
-            let open = &self.open[stem];
-            let mut kept = Vec::new();
-            for n in std::mem::take(&mut self.notes[stem]) {
-                if open.iter().any(|&(t, p)| t == n.t && p == n.pitch) {
-                    kept.push(n);
-                } else {
-                    out[stem].push(n);
-                }
-            }
-            self.notes[stem] = kept;
+            let mut v = std::mem::take(&mut self.done[stem]);
+            v.sort_by(|a, b| a.t.total_cmp(&b.t));
+            out[stem] = v;
         }
         out
     }
 
-    /// Clones of the held notes, per stem.
+    /// Clones of the live (held) notes, per stem.
     pub fn held(&self) -> [Vec<Note>; 3] {
         let mut out: [Vec<Note>; 3] = Default::default();
         for stem in 0..3 {
-            let open = &self.open[stem];
-            out[stem] = self.notes[stem].iter().filter(|n| open.iter().any(|&(t, p)| t == n.t && p == n.pitch)).cloned().collect();
+            out[stem] = self.live[stem].iter().map(|m| m.n.clone()).collect();
         }
         out
     }
 
-    /// Lengthens notes that a carry-over window extended: `ext` is (previous end, note with its new dur).
-    /// Matches the first note with the same t and pitch; no match (already drained) is a no-op.
+    /// Lengthens live notes that a carry-over window extended: `ext` is (previous end, note with its new dur).
+    /// A note that is already final is not changed; a live note stops at a later strike already accepted.
     pub fn extend(&mut self, stem: usize, ext: &[(f64, Note)]) {
         for (_, u) in ext {
-            let v = &mut self.notes[stem];
-            let mut dur = u.dur;
-            if let Some(i) = v.iter().position(|m| m.t == u.t && m.pitch == u.pitch) {
-                let t = v[i].t;
-                // the note stops at the first later strike of its pitch that is already in the timeline
-                if let Some(j) = v[i + 1..].iter().take_while(|m| m.t < t + u.dur).find(|m| m.pitch == u.pitch) {
-                    dur = j.t - t;
-                }
-                v[i].dur = dur;
+            if let Some(m) = self.live[stem].iter_mut().find(|m| m.n.t == u.t && m.n.pitch == u.pitch) {
+                fit(m, u.dur);
             }
-            self.longest[stem] = self.longest[stem].max(dur);
         }
     }
 
+    /// A failed Save hands its notes back unchanged; they were final when taken.
     pub fn put_back(&mut self, tracks: &[Vec<Note>; 3]) {
-        for (i, t) in tracks.iter().enumerate() {
-            self.add(i, t);
+        for i in 0..3 {
+            self.done[i].extend(tracks[i].iter().cloned());
         }
     }
 }
@@ -1082,6 +1128,22 @@ mod tests {
             assert_eq!(single_out, expected, "seed {seed}: single save against the oracle");
             assert_eq!(mid_out, expected, "seed {seed}: mid + final against the oracle");
         }
+    }
+
+    #[test]
+    fn live_list_stays_small_under_a_long_held_note() {
+        let mut tl = Timeline::new();
+        let d = n(0.0, 600.0, 30, 90);
+        tl.add(1, &[d.clone()]);
+        tl.set_open(1, &[d.clone()]);
+        for w in 1..=2000 {
+            let t = 0.5 * w as f64;
+            tl.add(1, &[n(t, 0.25, 40, 90), n(t + 0.25, 0.25, 41, 90)]);
+            assert!(tl.live[1].len() <= 5, "window {w}: {} live", tl.live[1].len());
+            tl.set_open(1, &[d.clone()]);
+        }
+        assert_eq!(tl.done[1].len(), 3998);
+        assert_eq!(tl.held()[1].len(), 3);
     }
 
     #[test]
