@@ -6,7 +6,7 @@ use crate::dsp::{envelope, onsets, xcorr_lag, BP_RATE};
 use crate::models::{self, ModelSet, S_FILES, U_FILES};
 use crate::notes::{synth_events, Note, Synth, Timeline, MIDI_LAG, STEMS};
 use crate::pw::{die_with_parent, Graph};
-use crate::sep::{calibrate, deinterleave, frames_to_notes_open, walk_end, Grids, FRAME_THRESH, ONSET_THRESH, Separator, Streamer, Transcriber, BLOCK, BLOCK_MS, BP_SAMPLES, FPS, PARALLEL};
+use crate::sep::{calibrate, deinterleave, frames_to_notes_open, next_strike, walk_end, Grids, FRAME_THRESH, MIN_NOTE_FRAMES, Separator, Streamer, Transcriber, BLOCK, BLOCK_MS, BP_SAMPLES, FPS, PARALLEL};
 use crate::stemcfg::{self, Plays, SepEngine};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -221,6 +221,9 @@ pub struct ChunkHeader {
     pub frames: usize,
     pub stems: [&'static str; 3],
     pub notes: BTreeMap<&'static str, Vec<[f64; 4]>>,
+    /// Lengthened notes sent again: [t - t0, dur, pitch, vel]. Absent when empty.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub ext: BTreeMap<&'static str, Vec<[f64; 4]>>,
 }
 
 /// t0 = id * 22016 / 44100; notes as [t - t0, dur, pitch, vel].
@@ -231,7 +234,7 @@ pub fn chunk_header(id: u64, notes: &[Vec<Note>; 3]) -> ChunkHeader {
         let v = notes[i].iter().map(|n| [n.t - t0, n.dur, n.pitch as f64, n.vel as f64]).collect();
         map.insert(*name, v);
     }
-    ChunkHeader { op: "chunk", id, t0, rate: RATE as u32, frames: CHUNK, stems: STEMS, notes: map }
+    ChunkHeader { op: "chunk", id, t0, rate: RATE as u32, frames: CHUNK, stems: STEMS, notes: map, ext: BTreeMap::new() }
 }
 
 /// Shared with the UI: bands are 3 x BANDS; played is in frames at 44.1 kHz.
@@ -835,17 +838,16 @@ fn transcribe(mut tr: Transcriber, rx: mpsc::Receiver<(u64, [Vec<f32>; 3])>, tx:
                     Ok(mut g) => window_notes(g.as_mut(), end_t, &mut open[stem]),
                     Err(e) => {
                         set_status(shared, format!("notes off: {e}"));
+                        release(shared);
                         return;
                     }
                 }
             };
-            if let Some(mut tl) = shared.live() {
-                tl.add(stem, &kept);
-                tl.extend(stem, &ext);
-            }
+            commit(shared, stem, &kept, &ext, &open[stem]);
             let _ = tx.send((stem, kept, ext));
         }
     }
+    release(shared);
 }
 
 /// Notes of one stem for the window ending at `end_t`, with the carry-over of held notes.
@@ -871,7 +873,7 @@ pub fn window_notes(g: Option<&mut Grids>, end_t: f64, open: &mut Vec<Note>) -> 
         if f0 < 1.0 {
             // Windows were dropped and this one starts past the note's last known end: bridge the gap
             // when the pitch is still sounding at the window start, else the note is over.
-            if old_end >= ws || g.note.len() < 2 || g.note[1][p] < FRAME_THRESH {
+            if g.note.len() < 2 || g.note[1][p] < FRAME_THRESH {
                 continue;
             }
             f0 = 1.0;
@@ -881,25 +883,28 @@ pub fn window_notes(g: Option<&mut Grids>, end_t: f64, open: &mut Vec<Note>) -> 
         }
         let f0 = f0 as usize;
         let (mut end, mut at_edge) = walk_end(&g.note, f0 - 1, p); // starts by testing frame f0
-        // A same-pitch onset peak inside the walk is a re-strike: the carried note ends where it
-        // went quiet, and the re-strike is left on the grid for a new note.
-        let restrike = (f0 + 1..end).find(|&f| {
-            let v = g.onset[f][p];
-            v >= ONSET_THRESH && v >= g.onset[f - 1][p] && g.onset.get(f + 1).map_or(true, |r| v >= r[p]) && g.note[f - 1][p] < FRAME_THRESH
-        });
-        if let Some(fr) = restrike {
-            end = (f0..fr).rev().find(|&f| g.note[f][p] >= FRAME_THRESH).map_or(f0, |f| f + 1);
-            at_edge = false;
+        // A raw strike of this pitch (#59) ends the carried note where it goes quiet, and is left for a new note.
+        // Only a strike this window keeps may close the note; a later one leaves the note open up to it.
+        let own = ((n.t - ws) * FPS).round() as i64 + MIN_NOTE_FRAMES as i64 + 1;
+        let keep0 = ((end_t - 1.0 - ws) * FPS).ceil() as i64;
+        let from = own.max(keep0).max(1) as usize;
+        let strike = next_strike(&g.note, &g.onset, p, from, end);
+        if let Some(fr) = strike {
+            end = (0..fr).rev().find(|&f| g.note[f][p] >= FRAME_THRESH).map_or(fr, |f| f + 1);
+            at_edge = !in_window(ws + fr as f64 / FPS, end_t);
         }
-        if ws + end as f64 / FPS <= old_end {
+        let new_end = ws + end as f64 / FPS;
+        if strike.is_none() && new_end <= old_end {
             continue;
         }
-        let u = Note { dur: ws + end as f64 / FPS - n.t, ..n.clone() };
-        ext.push((old_end, u.clone()));
+        let u = Note { dur: new_end - n.t, ..n.clone() };
+        if (new_end - old_end).abs() > 1e-9 {
+            ext.push((old_end, u.clone()));
+        }
         if at_edge {
             still.push(u);
         }
-        for row in g.note.iter_mut().take(end) {
+        for row in g.note.iter_mut().take(strike.unwrap_or(end)) {
             row[p] = 0.0;
         }
     }
@@ -920,31 +925,56 @@ pub fn window_notes(g: Option<&mut Grids>, end_t: f64, open: &mut Vec<Note>) -> 
 }
 
 /// Hands one window's notes to the timeline: `kept` are added, `ext` lengthens, `open` are the notes a later
-/// window may still change. Stub until unit A lands: today's add + extend, `open` ignored.
+/// window may still change (Save leaves them for the next Save).
 pub(crate) fn commit(shared: &Shared, stem: usize, kept: &[Note], ext: &[(f64, Note)], open: &[Note]) {
     if let Some(mut tl) = shared.live() {
         tl.add(stem, kept);
         tl.extend(stem, ext);
+        tl.set_open(stem, open);
     }
-    let _ = open;
 }
 
-/// The stream of this session ends: every note is closed. Stub: does nothing.
+/// The stream of this session ends: every held note is closed, so the next Save or chunk writes it.
 pub(crate) fn release(shared: &Shared) {
-    let _ = shared;
+    if let Some(mut tl) = shared.live() {
+        tl.close_all();
+    }
 }
 
-/// Splits the closed and held notes of one chunk into the rows to send as notes and as ext. Stub.
+/// Splits the closed and held notes of one chunk into the rows to send as notes and as ext. A note already sent
+/// is sent again only when its length changed. `sent` becomes this chunk's held notes.
 pub fn stream_split(sent: &mut [Vec<Note>; 3], closed: [Vec<Note>; 3], held: [Vec<Note>; 3]) -> ([Vec<Note>; 3], [Vec<Note>; 3]) {
-    let _ = (sent, held);
-    (closed, Default::default())
+    let mut notes: [Vec<Note>; 3] = Default::default();
+    let mut ext: [Vec<Note>; 3] = Default::default();
+    for stem in 0..3 {
+        for n in closed[stem].iter().chain(held[stem].iter()) {
+            match sent[stem].iter().find(|s| s.t == n.t && s.pitch == n.pitch) {
+                Some(s) if s.dur != n.dur => ext[stem].push(n.clone()),
+                Some(_) => {}
+                None => notes[stem].push(n.clone()),
+            }
+        }
+        sent[stem] = held[stem].clone();
+    }
+    (notes, ext)
 }
 
-/// The JSON line of one engine chunk. Stub: whole drain, no ext, no sent bookkeeping.
+/// The JSON line of one engine chunk: the notes that are new, and the ext rows of the held notes that grew.
 pub(crate) fn chunk_line(shared: &Shared, sent: &mut [Vec<Note>; 3], id: u64) -> String {
-    let _ = sent;
-    let notes = lock(&shared.timeline).drain_all();
-    serde_json::to_string(&chunk_header(id, &notes)).unwrap_or_default()
+    let (closed, held) = {
+        let mut tl = lock(&shared.timeline);
+        (tl.drain_closed(), tl.held())
+    };
+    let (notes, ext) = stream_split(sent, closed, held);
+    let mut header = chunk_header(id, &notes);
+    for (i, name) in STEMS.iter().enumerate() {
+        if ext[i].is_empty() {
+            continue;
+        }
+        let rows = ext[i].iter().map(|n| [n.t - header.t0, n.dur, n.pitch as f64, n.vel as f64]).collect();
+        header.ext.insert(*name, rows);
+    }
+    serde_json::to_string(&header).unwrap_or_default()
 }
 
 pub(crate) fn in_window(t: f64, end_t: f64) -> bool {
@@ -1077,6 +1107,7 @@ pub fn cli(args: Vec<String>) -> i32 {
         });
     }
     let mut out = std::io::stdout().lock();
+    let mut sent: [Vec<Note>; 3] = Default::default();
     loop {
         if eof.load(Ordering::Relaxed) {
             break;
@@ -1086,9 +1117,7 @@ pub fn cli(args: Vec<String>) -> i32 {
             Err(RecvTimeoutError::Timeout) => continue,
             Err(_) => break,
         };
-        let notes = lock(&shared.timeline).drain_all();
-        let header = chunk_header(id, &notes);
-        let line = serde_json::to_string(&header).unwrap_or_default();
+        let line = chunk_line(&shared, &mut sent, id);
         if writeln!(out, "{line}").is_err() {
             break;
         }

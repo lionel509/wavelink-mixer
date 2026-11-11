@@ -365,10 +365,17 @@ pub fn walk_end(work: &[Vec<f32>], f: usize, p: usize) -> (usize, bool) {
 }
 
 /// The next raw onset peak of pitch column `p` in `from..end` that starts a new note (#59). `onset` is the
-/// raw model grid. Stub until unit A lands: always None.
+/// raw model grid: a peak on a sounding frame, more than MIN_NOTE_FRAMES frames before `end`.
 pub fn next_strike(note: &[Vec<f32>], onset: &[Vec<f32>], p: usize, from: usize, end: usize) -> Option<usize> {
-    let _ = (note, onset, p, from, end);
-    None
+    let end = end.min(onset.len()).min(note.len());
+    (from..end).find(|&fr| {
+        let v = onset[fr][p];
+        v >= ONSET_THRESH
+            && (fr == 0 || v >= onset[fr - 1][p])
+            && (fr + 1 >= onset.len() || v >= onset[fr + 1][p])
+            && note[fr][p] >= FRAME_THRESH
+            && end - fr > MIN_NOTE_FRAMES
+    })
 }
 
 /// note and onset are [frame][pitch] grids (172 x 88).
@@ -385,6 +392,7 @@ pub fn frames_to_notes_open(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<(Note,
     }
     let pitches = note[0].len();
     let mut work: Vec<Vec<f32>> = note.to_vec();
+    let raw = onset;
     let inferred = infer_onsets(note, onset);
     let onset = &inferred[..];
 
@@ -411,7 +419,12 @@ pub fn frames_to_notes_open(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<(Note,
         if work[f][p] < FRAME_THRESH {
             continue;
         }
-        let (end, at_edge) = walk_end(&work, f, p);
+        let (mut end, mut at_edge) = walk_end(&work, f, p);
+        // a raw re-strike of this pitch ends the note where it goes quiet (#59)
+        if let Some(fr) = next_strike(&work, raw, p, f + MIN_NOTE_FRAMES + 1, end) {
+            end = (f..fr).rev().find(|&x| work[x][p] >= FRAME_THRESH).map_or(fr, |x| x + 1);
+            at_edge = false;
+        }
         // upstream: `if i - note_start_idx <= min_note_len: continue`, so a note needs at least 12 frames
         if end - f <= MIN_NOTE_FRAMES {
             continue;
