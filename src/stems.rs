@@ -331,7 +331,8 @@ impl Kids {
         cmd.args(args)
             .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
             .stdout(if stdout { Stdio::piped() } else { Stdio::null() })
-            .stderr(Stdio::null());
+            // pw-cat keeps its quiet stderr; our own capture children (mac-tap, wav-tap) show why they died.
+            .stderr(if bin == TAP_BIN { Stdio::null() } else { Stdio::inherit() });
         die_with_parent(&mut cmd);
         let mut child = cmd.spawn().map_err(|e| format!("{bin}: {e}"))?;
         let pipes = (child.stdin.take(), child.stdout.take());
@@ -367,6 +368,7 @@ impl Kids {
 pub struct Session {
     stop: Arc<AtomicBool>,
     kids: Arc<Kids>,
+    current: Arc<AtomicU64>,
 }
 
 impl Session {
@@ -374,6 +376,7 @@ impl Session {
         let stop = Arc::new(AtomicBool::new(false));
         let kids = Arc::new(Kids::new());
         let gen = ui.current.fetch_add(1, Ordering::SeqCst) + 1;
+        let current = ui.current.clone();
         let shared = Shared { gen, ..ui };
         // A new run starts from nothing: no notes, no bands, clock at 0. Notes from the last run stay
         // until this point, so Stop → Save MIDI still works.
@@ -393,7 +396,7 @@ impl Session {
                 }
             }
         });
-        Session { stop, kids }
+        Session { stop, kids, current }
     }
 }
 
@@ -401,6 +404,8 @@ impl Drop for Session {
     /// Stop flag; kill and wait every child; never blocks the GTK thread on a join.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // No later write from this session: a block still in separation is refused by `Shared::live`.
+        self.current.fetch_add(1, Ordering::SeqCst);
         self.kids.kill_all();
     }
 }
@@ -619,10 +624,15 @@ fn run_live(o: &Opts, shared: &Shared, stop: &Arc<AtomicBool>, kids: &Kids, m: &
     let (mut blocks, mut late) = (0u64, 0u64);
     let (mut win_min, mut base) = (f64::INFINITY, 0.0f64);
     let mut calls: Vec<f64> = Vec::new();
+    let mut dead = 0u32;
     while !stop.load(Ordering::Relaxed) {
         if tap.read_exact(&mut raw).is_err() {
             if stop.load(Ordering::Relaxed) {
                 break;
+            }
+            dead += 1;
+            if dead >= 3 {
+                return Err(format!("the capture exited {dead} times in a row with no audio; see the message above"));
             }
             s.reset();
             std::thread::sleep(Duration::from_millis(500));
@@ -631,6 +641,7 @@ fn run_live(o: &Opts, shared: &Shared, stop: &Arc<AtomicBool>, kids: &Kids, m: &
             set_status(shared, "tap restarted");
             continue;
         }
+        dead = 0;
         t_first.get_or_insert_with(Instant::now);
         let planar = deinterleave(&bytes_to_f32(&raw));
         let t = Instant::now();

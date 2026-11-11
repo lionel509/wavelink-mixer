@@ -99,7 +99,7 @@ run() {
   }
   trap cleanup EXIT
 
-  "$BIN" listen "${flags[@]}" < "$fifo" > "$out" 2> "$log" &
+  "$BIN" listen ${flags[@]+"${flags[@]}"} < "$fifo" > "$out" 2> "$log" &
   pid=$!
   exec 3<> "$fifo"   # read-write so opening the fifo never blocks
 

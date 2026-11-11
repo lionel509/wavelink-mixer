@@ -65,6 +65,7 @@ pub fn parse(args: &[String]) -> Result<(String, SepEngine), String> {
 #[derive(Debug, PartialEq)]
 pub enum Cmd {
     Save(String),
+    Start,
     Stop,
     Stats,
     Quit,
@@ -77,10 +78,19 @@ pub fn cmd(line: &str) -> Cmd {
     let (w, rest) = t.split_once(' ').unwrap_or((t, ""));
     match w {
         "save" if !rest.is_empty() => Cmd::Save(rest.to_string()),
+        "start" => Cmd::Start,
         "stop" => Cmd::Stop,
         "stats" => Cmd::Stats,
         "quit" => Cmd::Quit,
         _ => Cmd::Unknown(w.to_string()),
+    }
+}
+
+/// A typed path: stdin gets no shell, so a leading `~/` is expanded here.
+pub fn expand_home(p: &str) -> PathBuf {
+    match (p.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => PathBuf::from(p),
     }
 }
 
@@ -187,6 +197,11 @@ fn poll(m: &mut Meter, shared: &Shared, chunks: &mpsc::Receiver<(u64, [Vec<f32>;
     }
 }
 
+fn start_session(tap: &str, engine: SepEngine, shared: &Shared, ctx: mpsc::Sender<(u64, [Vec<f32>; 3])>) -> Session {
+    let opts = Opts { tap: tap.to_string(), tap_sink: false, engine, plays: Plays::Nothing, out: String::new(), buf_ms: 0, tier: None };
+    Session::start(opts, shared.clone(), Some(ctx))
+}
+
 /// The `listen` command. Exit code.
 pub fn run(args: &[String]) -> i32 {
     let (tap, engine) = match parse(args) {
@@ -212,8 +227,7 @@ pub fn run(args: &[String]) -> i32 {
 
     let shared = Shared::new();
     let (ctx, crx) = mpsc::channel::<(u64, [Vec<f32>; 3])>();
-    let opts = Opts { tap, tap_sink: false, engine, plays: Plays::Nothing, out: String::new(), buf_ms: 0, tier: None };
-    let mut session: Option<Session> = Some(Session::start(opts, shared.clone(), Some(ctx)));
+    let mut session: Option<Session> = Some(start_session(&tap, engine, &shared, ctx));
     let mut chunks: Option<mpsc::Receiver<(u64, [Vec<f32>; 3])>> = Some(crx);
     let mut meter = Meter::default();
     let mut last_status = String::new();
@@ -238,8 +252,9 @@ pub fn run(args: &[String]) -> i32 {
                 Cmd::Save(path) => {
                     let running = session.is_some();
                     let res = save_once(&shared.timeline, running, || {
+                        let path = expand_home(&path);
                         let f = OpenOptions::new().write(true).create_new(true).open(&path)?;
-                        Ok((PathBuf::from(&path), f))
+                        Ok((path, f))
                     });
                     match res {
                         Ok(s) if s.path.as_os_str().is_empty() => println!("save: no notes (held={})", s.held),
@@ -256,16 +271,27 @@ pub fn run(args: &[String]) -> i32 {
                         Err(e) => println!("save failed: {e} (notes kept)"),
                     }
                 }
+                Cmd::Start => {
+                    if session.is_some() {
+                        eprintln!("listen: already running");
+                    } else {
+                        let (ctx, crx) = mpsc::channel::<(u64, [Vec<f32>; 3])>();
+                        session = Some(start_session(&tap, engine, &shared, ctx));
+                        chunks = Some(crx);
+                        meter = Meter::default();
+                        println!("started");
+                    }
+                }
                 Cmd::Stop => {
                     if let (Some(_), Some(rx)) = (session.as_ref(), chunks.as_ref()) {
                         poll(&mut meter, &shared, rx, &mut last_status, &mut warned);
                         let end = mark(&shared);
                         let state = timeline_bytes(&shared);
                         meter.end = Some((end, state));
-                        let st = stats_of(&meter, &shared);
+                        // Drop first, so the child is reaped and its CPU and RSS are in the line.
                         session = None;
                         chunks = None;
-                        println!("{}", stats_line(&st));
+                        println!("{}", stats_line(&stats_of(&meter, &shared)));
                     } else {
                         eprintln!("listen: not running");
                     }
@@ -327,6 +353,7 @@ mod tests {
     #[test]
     fn cmd_parses_lines() {
         assert_eq!(cmd("save /tmp/out dir/x.mid"), Cmd::Save("/tmp/out dir/x.mid".to_string()));
+        assert_eq!(cmd("start"), Cmd::Start);
         assert_eq!(cmd("stop"), Cmd::Stop);
         assert_eq!(cmd("stats"), Cmd::Stats);
         assert_eq!(cmd("quit"), Cmd::Quit);
@@ -350,6 +377,15 @@ mod tests {
             stats_line(&st),
             "stats audio_s=60.00 wall_s=60.00 cpu_self_s=1.500 cpu_tap_s=0.500 cpu_per_min_s=2.00 cpu_total_s=2.250 rss_peak_mb=120.0 tap_rss_mb=30.0 state_bytes=36000 state_bytes_per_hour=2160000 peak=0.5000"
         );
+    }
+
+    #[test]
+    fn save_path_expands_a_typed_home() {
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(expand_home("~/x.mid"), PathBuf::from(&home).join("x.mid"));
+        }
+        assert_eq!(expand_home("/tmp/x.mid"), PathBuf::from("/tmp/x.mid"));
+        assert_eq!(expand_home("~other/x.mid"), PathBuf::from("~other/x.mid"));
     }
 
     #[test]
