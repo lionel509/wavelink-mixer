@@ -55,6 +55,16 @@ impl Timeline {
     pub fn drain_all(&mut self) -> [Vec<Note>; 3] {
         [std::mem::take(&mut self.notes[0]), std::mem::take(&mut self.notes[1]), std::mem::take(&mut self.notes[2])]
     }
+
+    /// Lengthens notes that a carry-over window extended: `ext` is (previous end, note with its new dur).
+    /// Matches the first note with the same t and pitch; no match (already drained) is a no-op.
+    pub fn extend(&mut self, stem: usize, ext: &[(f64, Note)]) {
+        for (_, u) in ext {
+            if let Some(m) = self.notes[stem].iter_mut().find(|m| m.t == u.t && m.pitch == u.pitch) {
+                m.dur = u.dur;
+            }
+        }
+    }
 }
 
 /// MIDI key for a note: drum pitch 0 is the GM bass drum (38), everything else is the pitch itself.
@@ -119,13 +129,29 @@ pub fn midi_bytes(tracks: &[Vec<Note>; 3]) -> Vec<u8> {
         if stem != 0 {
             ev.push((0u64, 0u8, vec![0xc0 | ch, prog]));
         }
-        for n in notes {
+        let mut order: Vec<&Note> = notes.iter().collect();
+        order.sort_by(|a, b| a.t.total_cmp(&b.t));
+        // A note of a key ends no later than the next start of that key on this track (ported from the piano branch).
+        let mut offs = vec![0u64; order.len()];
+        let mut next_on: [Option<u64>; 128] = [None; 128];
+        for i in (0..order.len()).rev() {
+            let n = order[i];
             let k = key(stem, n.pitch);
             let dur = if stem == 0 { DRUM_DUR } else { n.dur };
+            let on = tick(n.t);
+            // at least one tick after the note-on, so a zero-length note still stops after it starts
+            let mut off = tick(n.t + dur).max(on + 1);
+            if let Some(nx) = next_on[k as usize] {
+                off = off.min(nx.max(on + 1));
+            }
+            offs[i] = off;
+            next_on[k as usize] = Some(on);
+        }
+        for (i, n) in order.iter().enumerate() {
+            let k = key(stem, n.pitch);
             let vel = n.vel.clamp(1, 127);
             ev.push((tick(n.t), 1, vec![0x90 | ch, k, vel]));
-            // at least one tick after the note-on, so a zero-length note still stops after it starts
-            ev.push((tick(n.t + dur).max(tick(n.t) + 1), 0, vec![0x80 | ch, k, 0]));
+            ev.push((offs[i], 0, vec![0x80 | ch, k, 0]));
         }
         out.extend(track_chunk(&mut ev));
     }
@@ -135,15 +161,43 @@ pub fn midi_bytes(tracks: &[Vec<Note>; 3]) -> Vec<u8> {
 /// Per note: (t + lag, "noteon C K V") and (t + lag + d, "noteoff C K"). Drums: K = 38 if pitch == 0, d = 0.1.
 pub fn synth_events(stem: usize, notes: &[Note], lag: f64) -> Vec<(f64, String)> {
     let (c, _) = PROGRAMS[stem];
-    let mut out = Vec::with_capacity(notes.len() * 2);
-    for n in notes {
-        let k = key(stem, n.pitch);
+    let mut order: Vec<&Note> = notes.iter().collect();
+    order.sort_by(|a, b| a.t.total_cmp(&b.t));
+    // Same rule as midi_bytes: a note ends no later than the next start of its key.
+    let mut offs = vec![0f64; order.len()];
+    let mut next_on: [Option<f64>; 128] = [None; 128];
+    for i in (0..order.len()).rev() {
+        let n = order[i];
+        let k = key(stem, n.pitch) as usize;
         let d = if stem == 0 { DRUM_DUR } else { n.dur };
+        let mut off = n.t + d;
+        if let Some(nx) = next_on[k] {
+            off = off.min(nx.max(n.t));
+        }
+        offs[i] = off;
+        next_on[k] = Some(n.t);
+    }
+    let mut out = Vec::with_capacity(notes.len() * 2);
+    for (i, n) in order.iter().enumerate() {
+        let k = key(stem, n.pitch);
         let vel = n.vel.clamp(1, 127);
         out.push((n.t + lag, format!("noteon {c} {k} {vel}")));
-        out.push((n.t + lag + d, format!("noteoff {c} {k}")));
+        out.push((offs[i] + lag, format!("noteoff {c} {k}")));
     }
     out
+}
+
+/// Moves pending noteoffs of carried notes to their new end. `ext` is (previous end, note with its new dur).
+/// An off that already played is not in `pending` and is left alone.
+pub fn retime_offs(pending: &mut Vec<(f64, String)>, stem: usize, ext: &[(f64, Note)], lag: f64) {
+    let (c, _) = PROGRAMS[stem];
+    for (old_end, u) in ext {
+        let k = key(stem, u.pitch);
+        let line = format!("noteoff {c} {k}");
+        if let Some(e) = pending.iter_mut().find(|e| e.1 == line && (e.0 - (old_end + lag)).abs() < 1e-6) {
+            e.0 = u.t + u.dur + lag;
+        }
+    }
 }
 
 /// Removes and returns the lines with time <= now, in ascending time order (stable).
@@ -225,6 +279,11 @@ impl Synth {
 
     pub fn queue(&mut self, ev: Vec<(f64, String)>) {
         self.pending.extend(ev);
+    }
+
+    /// Moves the pending offs of carried notes; see retime_offs.
+    pub fn retime(&mut self, stem: usize, ext: &[(f64, Note)], lag: f64) {
+        retime_offs(&mut self.pending, stem, ext, lag);
     }
 
     /// Writes the due lines and flushes; returns the count.
@@ -401,5 +460,114 @@ mod tests {
         let offs: Vec<usize> = bytes.windows(3).enumerate().filter(|(_, w)| (w[0] & 0xf0) == 0x80 && w[1] == 50).map(|(i, _)| i).collect();
         assert_eq!((ons.len(), offs.len()), (2, 2));
         assert!(offs[0] < ons[1], "the first note's off must come before the second note's on at the shared tick");
+    }
+
+    /// (abs_tick, status & 0xf0, key) of every note on/off in one MTrk chunk (0 = tempo map, 1 = drums, 2 = bass, 3 = other).
+    fn track_events(bytes: &[u8], track: usize) -> Vec<(u64, u8, u8)> {
+        let mut pos = 14usize;
+        for idx in 0..=track {
+            assert_eq!(&bytes[pos..pos + 4], b"MTrk");
+            let len = u32::from_be_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            let body = &bytes[pos + 8..pos + 8 + len];
+            pos += 8 + len;
+            if idx != track {
+                continue;
+            }
+            let mut out = Vec::new();
+            let (mut i, mut tick) = (0usize, 0u64);
+            while i < body.len() {
+                let (delta, next) = vlq(body, i);
+                i = next;
+                tick += delta as u64;
+                let st = body[i];
+                if st == 0xff {
+                    let (plen, next) = vlq(body, i + 2);
+                    i = next + plen;
+                } else if st & 0xf0 == 0xc0 || st & 0xf0 == 0xd0 {
+                    i += 2;
+                } else {
+                    if st & 0xf0 == 0x80 || st & 0xf0 == 0x90 {
+                        out.push((tick, st & 0xf0, body[i + 1]));
+                    }
+                    i += 3;
+                }
+            }
+            return out;
+        }
+        panic!("no track {track}");
+    }
+
+    fn lcg(s: &mut u64) -> f64 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*s >> 33) as f64) / (1u64 << 31) as f64
+    }
+
+    #[test]
+    fn midi_same_pitch_overlap_clips_first_at_second_onset() {
+        let tracks = [vec![], vec![n(1.0, 1.0, 50, 100), n(1.5, 1.0, 50, 100)], vec![]];
+        let b = midi_bytes(&tracks);
+        let ev: Vec<(u64, u8, u8)> = track_events(&b, 2).into_iter().filter(|e| e.2 == 50).collect();
+        assert_eq!(ev, vec![(0, 0x90, 50), (480, 0x80, 50), (480, 0x90, 50), (1440, 0x80, 50)]);
+    }
+
+    #[test]
+    fn midi_never_stacks_same_key() {
+        let mut s = 7u64;
+        let mut notes = Vec::new();
+        for _ in 0..30 {
+            let k = 50 + (lcg(&mut s) * 4.0) as u8;
+            let t = lcg(&mut s) * 5.0;
+            let dur = 0.05 + lcg(&mut s) * 1.45;
+            notes.push(n(t, dur, k, 100));
+        }
+        let b = midi_bytes(&[vec![], notes, vec![]]);
+        let ev = track_events(&b, 2);
+        assert_eq!(ev.len(), 60, "one on and one off per note");
+        for k in 50..54u8 {
+            let seq: Vec<(u64, u8)> = ev.iter().filter(|e| e.2 == k).map(|e| (e.0, e.1)).collect();
+            for pair in seq.chunks(2) {
+                assert_eq!(pair.len(), 2, "key {k} has an unmatched event");
+                assert_eq!(pair[0].1, 0x90, "key {k} starts with an on");
+                assert_eq!(pair[1].1, 0x80, "key {k}: an on is followed by its off, never another on");
+                assert!(pair[1].0 >= pair[0].0 + 1, "key {k}: off must come after its on");
+            }
+            assert_eq!(seq.len() % 2, 0);
+        }
+    }
+
+    #[test]
+    fn synth_same_pitch_overlap_clips_first() {
+        let mut ev = synth_events(1, &[n(1.0, 1.0, 50, 100), n(1.5, 1.0, 50, 100)], 0.0);
+        let off_a = ev.iter().filter(|e| e.1 == "noteoff 1 50").map(|e| e.0).fold(f64::INFINITY, f64::min);
+        assert!((off_a - 1.5).abs() < 1e-9, "first off must land at the second on: {off_a}");
+        let got = due(&mut ev, 1e9);
+        assert_eq!(got, vec!["noteon 1 50 100", "noteoff 1 50", "noteon 1 50 100", "noteoff 1 50"]);
+    }
+
+    #[test]
+    fn retime_offs_moves_pending_off() {
+        let mut pending = synth_events(1, &[n(10.0, 0.9, 60, 100)], 1.5);
+        retime_offs(&mut pending, 1, &[(10.9, n(10.0, 2.4, 60, 100))], 1.5);
+        let off = pending.iter().find(|e| e.1 == "noteoff 1 60").unwrap().0;
+        let on = pending.iter().find(|e| e.1 == "noteon 1 60 100").unwrap().0;
+        assert!((off - 13.9).abs() < 1e-9, "off moves to new end + lag: {off}");
+        assert!((on - 11.5).abs() < 1e-9, "on is untouched: {on}");
+        // the old off has already played: nothing to move, nothing added
+        let before = pending.clone();
+        retime_offs(&mut pending, 1, &[(99.0, n(10.0, 5.0, 60, 100))], 1.5);
+        assert_eq!(pending, before);
+    }
+
+    #[test]
+    fn timeline_extend_lengthens_matching_note() {
+        let mut tl = Timeline::new();
+        tl.add(1, &[n(10.0, 0.9, 60, 100), n(10.0, 0.9, 62, 100)]);
+        tl.extend(1, &[(10.9, n(10.0, 2.4, 60, 100)), (10.9, n(10.0, 2.4, 64, 100))]);
+        let got = tl.window(1, 0.0, 100.0);
+        assert_eq!(got.len(), 2, "no note is created for pitch 64");
+        let p60 = got.iter().find(|m| m.pitch == 60).unwrap();
+        let p62 = got.iter().find(|m| m.pitch == 62).unwrap();
+        assert_eq!(p60.dur, 2.4);
+        assert_eq!(p62.dur, 0.9);
     }
 }

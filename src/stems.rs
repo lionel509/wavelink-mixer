@@ -6,7 +6,7 @@ use crate::dsp::{envelope, onsets, xcorr_lag, BP_RATE};
 use crate::models::{self, ModelSet, S_FILES, U_FILES};
 use crate::notes::{synth_events, Note, Synth, Timeline, MIDI_LAG, STEMS};
 use crate::pw::{die_with_parent, Graph};
-use crate::sep::{calibrate, deinterleave, Separator, Streamer, Transcriber, BLOCK, BLOCK_MS, BP_SAMPLES, PARALLEL};
+use crate::sep::{calibrate, deinterleave, frames_to_notes_open, walk_end, Grids, FRAME_THRESH, ONSET_THRESH, Separator, Streamer, Transcriber, BLOCK, BLOCK_MS, BP_SAMPLES, FPS, PARALLEL};
 use crate::stemcfg::{self, Plays, SepEngine};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -397,7 +397,7 @@ struct Out {
     shared: Shared,
     tx: mpsc::SyncSender<(u64, [Vec<f32>; 3])>,
     chunks: Option<mpsc::Sender<(u64, [Vec<f32>; 3])>>,
-    notes_rx: mpsc::Receiver<(usize, Vec<Note>)>,
+    notes_rx: mpsc::Receiver<(usize, Vec<Note>, Vec<(f64, Note)>)>,
     synth: Option<Synth>,
 }
 
@@ -471,10 +471,11 @@ impl Out {
                 let _ = c.send((id, part));
             }
         }
-        while let Ok((stem, notes)) = self.notes_rx.try_recv() {
+        while let Ok((stem, notes, ext)) = self.notes_rx.try_recv() {
             if self.plays == Plays::Midi {
                 if let Some(s) = self.synth.as_mut() {
                     s.queue(synth_events(stem, &notes, MIDI_LAG));
+                    s.retime(stem, &ext, MIDI_LAG);
                 }
             }
         }
@@ -526,7 +527,7 @@ fn session_main(o: &Opts, shared: &Shared, chunks: Option<mpsc::Sender<(u64, [Ve
     let m = models::ensure(names, &|s: String| set_status(shared, s))?;
     set_status(shared, "loading…");
 
-    let (ntx, nrx) = mpsc::channel::<(usize, Vec<Note>)>();
+    let (ntx, nrx) = mpsc::channel::<(usize, Vec<Note>, Vec<(f64, Note)>)>();
     let (rtx, rrx) = mpsc::sync_channel::<(u64, [Vec<f32>; 3])>(1);
     match Transcriber::load(&m) {
         Ok(tr) => {
@@ -807,16 +808,17 @@ fn open_tap_for(kids: &Kids, name: &str, sink: bool) -> Result<ChildStdout, Stri
 }
 
 /// Consumes finished blocks: keeps notes for the window ending at `end`, adds them to the timeline and the MIDI queue.
-fn transcribe(mut tr: Transcriber, rx: mpsc::Receiver<(u64, [Vec<f32>; 3])>, tx: mpsc::Sender<(usize, Vec<Note>)>, shared: &Shared, stop: &AtomicBool) {
+fn transcribe(mut tr: Transcriber, rx: mpsc::Receiver<(u64, [Vec<f32>; 3])>, tx: mpsc::Sender<(usize, Vec<Note>, Vec<(f64, Note)>)>, shared: &Shared, stop: &AtomicBool) {
+    let mut open: [Vec<Note>; 3] = Default::default();
     while let Ok((end, rings)) = rx.recv() {
         if stop.load(Ordering::Relaxed) {
             break;
         }
         let end_t = end as f64 / RATE as f64;
         for stem in 0..3 {
-            let kept: Vec<Note> = if stem == 0 {
+            let (kept, ext): (Vec<Note>, Vec<(f64, Note)>) = if stem == 0 {
                 let mono = mono_tail(&rings[0], DRUM_WINDOW);
-                onsets(&mono, RATE)
+                let kept = onsets(&mono, RATE)
                     .into_iter()
                     .map(|(t, s)| Note {
                         t: end_t - DRUM_WINDOW as f64 / RATE as f64 + t,
@@ -825,15 +827,12 @@ fn transcribe(mut tr: Transcriber, rx: mpsc::Receiver<(u64, [Vec<f32>; 3])>, tx:
                         vel: (127.0 * s).round().clamp(0.0, 127.0) as u8,
                     })
                     .filter(|n| in_window(n.t, end_t))
-                    .collect()
+                    .collect();
+                (kept, Vec::new())
             } else {
                 let mono = mono_tail(&rings[stem], BP_WINDOW);
-                match tr.notes(&mono) {
-                    Ok(ns) => ns
-                        .into_iter()
-                        .map(|n| Note { t: end_t - BP_SAMPLES as f64 / BP_RATE as f64 + n.t, ..n })
-                        .filter(|n| in_window(n.t, end_t))
-                        .collect(),
+                match tr.grids(&mono) {
+                    Ok(mut g) => window_notes(g.as_mut(), end_t, &mut open[stem]),
                     Err(e) => {
                         set_status(shared, format!("notes off: {e}"));
                         return;
@@ -842,18 +841,90 @@ fn transcribe(mut tr: Transcriber, rx: mpsc::Receiver<(u64, [Vec<f32>; 3])>, tx:
             };
             if let Some(mut tl) = shared.live() {
                 tl.add(stem, &kept);
+                tl.extend(stem, &ext);
             }
-            let _ = tx.send((stem, kept));
+            let _ = tx.send((stem, kept, ext));
         }
     }
 }
 
-fn in_window(t: f64, end_t: f64) -> bool {
+/// Notes of one stem for the window ending at `end_t`, with the carry-over of held notes.
+///
+/// A note whose scan reaches the window edge is emitted where its onset lands and kept in `open`.
+/// In the next window the open note is walked on the fresh grid from its last known end, with the
+/// same ENERGY_TOL rule as Basic Pitch; its grid cells are zeroed so no duplicate note is made.
+/// Returns the new notes and `(previous end, note with its new dur)` for each extension.
+/// A silent window (`None`) closes every open note at its current end.
+pub fn window_notes(g: Option<&mut Grids>, end_t: f64, open: &mut Vec<Note>) -> (Vec<Note>, Vec<(f64, Note)>) {
+    let ws = end_t - BP_SAMPLES as f64 / BP_RATE as f64;
+    let Some(g) = g else {
+        open.clear();
+        return (Vec::new(), Vec::new());
+    };
+    let frames = g.note.len();
+    let mut ext: Vec<(f64, Note)> = Vec::new();
+    let mut still: Vec<Note> = Vec::new();
+    for n in open.drain(..) {
+        let p = n.pitch as usize - 21;
+        let old_end = n.t + n.dur;
+        let mut f0 = ((old_end - ws) * FPS).floor();
+        if f0 < 1.0 {
+            // Windows were dropped and this one starts past the note's last known end: bridge the gap
+            // when the pitch is still sounding at the window start, else the note is over.
+            if old_end >= ws || g.note.len() < 2 || g.note[1][p] < FRAME_THRESH {
+                continue;
+            }
+            f0 = 1.0;
+        }
+        if f0 as usize + 1 >= frames {
+            continue;
+        }
+        let f0 = f0 as usize;
+        let (mut end, mut at_edge) = walk_end(&g.note, f0 - 1, p); // starts by testing frame f0
+        // A same-pitch onset peak inside the walk is a re-strike: the carried note ends where it
+        // went quiet, and the re-strike is left on the grid for a new note.
+        let restrike = (f0 + 1..end).find(|&f| {
+            let v = g.onset[f][p];
+            v >= ONSET_THRESH && v >= g.onset[f - 1][p] && g.onset.get(f + 1).map_or(true, |r| v >= r[p]) && g.note[f - 1][p] < FRAME_THRESH
+        });
+        if let Some(fr) = restrike {
+            end = (f0..fr).rev().find(|&f| g.note[f][p] >= FRAME_THRESH).map_or(f0, |f| f + 1);
+            at_edge = false;
+        }
+        if ws + end as f64 / FPS <= old_end {
+            continue;
+        }
+        let u = Note { dur: ws + end as f64 / FPS - n.t, ..n.clone() };
+        ext.push((old_end, u.clone()));
+        if at_edge {
+            still.push(u);
+        }
+        for row in g.note.iter_mut().take(end) {
+            row[p] = 0.0;
+        }
+    }
+    *open = still;
+    let mut new: Vec<Note> = Vec::new();
+    for (n, at_edge) in frames_to_notes_open(&g.note, &g.onset) {
+        let t = ws + n.t;
+        if !in_window(t, end_t) {
+            continue;
+        }
+        let n = Note { t, ..n };
+        if at_edge {
+            open.push(n.clone());
+        }
+        new.push(n);
+    }
+    (new, ext)
+}
+
+pub(crate) fn in_window(t: f64, end_t: f64) -> bool {
     t >= end_t - 1.0 && t < end_t - 0.5
 }
 
 /// Mono of the last `frames` frames of an interleaved stereo ring, zero-padded at the front.
-fn mono_tail(stereo: &[f32], frames: usize) -> Vec<f32> {
+pub(crate) fn mono_tail(stereo: &[f32], frames: usize) -> Vec<f32> {
     let have = (stereo.len() / CH).min(frames);
     let mut m = vec![0.0f32; frames - have];
     m.extend(stereo[stereo.len() - have * CH..].chunks_exact(CH).map(|c| 0.5 * (c[0] + c[1])));
@@ -1184,5 +1255,185 @@ mod tests {
         assert_eq!(*lock(&ui.status), "old run", "a stale status write got through");
         let n: usize = newer.live().expect("the newer handle is current").drain_all().iter().map(|v| v.len()).sum();
         assert_eq!(n, 1, "only the note written before the replacement may be there");
+    }
+
+    /// Grids for one 2 s window starting at `ws`: each (on, off, column) is held at 0.9 on the frames it covers,
+    /// with an onset at the first frame when the note starts inside this window.
+    fn held_win(ws: f64, notes: &[(f64, f64, usize)]) -> crate::sep::Grids {
+        let mut note = vec![vec![0.0f32; 88]; 172];
+        let mut onset = vec![vec![0.0f32; 88]; 172];
+        for &(on, off, p) in notes {
+            let mut first = true;
+            for f in 0..172 {
+                let t = ws + f as f64 / crate::sep::FPS;
+                if t >= on && t < off {
+                    note[f][p] = 0.9;
+                    if first && on >= ws {
+                        onset[f][p] = 0.9;
+                    }
+                    first = false;
+                }
+            }
+        }
+        crate::sep::Grids { note, onset }
+    }
+
+    /// Runs the carry-over over windows k in ks (window k ends at k * CHUNK / RATE) and feeds a Timeline.
+    fn run_windows(
+        notes: &[(f64, f64, usize)],
+        ks: std::ops::RangeInclusive<usize>,
+        extra_onset: Option<(f64, usize)>,
+    ) -> (crate::notes::Timeline, Vec<crate::notes::Note>, usize) {
+        let step = CHUNK as f64 / RATE as f64;
+        let win_len = BP_SAMPLES as f64 / BP_RATE as f64;
+        let mut open = Vec::new();
+        let mut tl = crate::notes::Timeline::new();
+        let mut ext_windows = 0;
+        for k in ks {
+            let end_t = k as f64 * step;
+            let ws = end_t - win_len;
+            let mut g = held_win(ws, notes);
+            if let Some((at, p)) = extra_onset {
+                let f = ((at - ws) * crate::sep::FPS).round();
+                if f >= 0.0 && (f as usize) < 172 {
+                    g.onset[f as usize][p] = 0.95;
+                }
+            }
+            let (new, ext) = window_notes(Some(&mut g), end_t, &mut open);
+            tl.add(1, &new);
+            if !ext.is_empty() {
+                ext_windows += 1;
+            }
+            tl.extend(1, &ext);
+        }
+        let out = tl.window(1, 0.0, 100.0);
+        (tl, out, ext_windows)
+    }
+
+    #[test]
+    fn window_notes_joins_held_note_across_windows() {
+        let (_, out, ext_windows) = run_windows(&[(1.0, 5.0, 48)], 4..=14, None);
+        assert_eq!(out.len(), 1, "one held note must come out as one note: {out:?}");
+        let m = &out[0];
+        assert_eq!(m.pitch, 69);
+        assert!((m.t - 1.0).abs() <= 1.0 / crate::sep::FPS, "onset kept: {}", m.t);
+        assert!((m.dur - 4.0).abs() <= 1.0 / crate::sep::FPS + 1e-9, "full length: {}", m.dur);
+        assert_eq!(m.vel, 114);
+        assert!(ext_windows >= 6, "the note was extended in {ext_windows} windows");
+    }
+
+    #[test]
+    fn window_notes_closes_when_next_window_quiet() {
+        let step = CHUNK as f64 / RATE as f64;
+        let win_len = BP_SAMPLES as f64 / BP_RATE as f64;
+        let mut open = Vec::new();
+        let mut g4 = held_win(4.0 * step - win_len, &[(1.0, 2.3, 48)]);
+        let (new4, _) = window_notes(Some(&mut g4), 4.0 * step, &mut open);
+        let mut tl = crate::notes::Timeline::new();
+        tl.add(1, &new4);
+        let mut g5 = held_win(5.0 * step - win_len, &[(1.0, 2.3, 48)]);
+        let (new5, ext5) = window_notes(Some(&mut g5), 5.0 * step, &mut open);
+        tl.add(1, &new5);
+        tl.extend(1, &ext5);
+        let out = tl.window(1, 0.0, 100.0);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!((out[0].dur - 1.3).abs() <= 1.0 / crate::sep::FPS, "closed at the real end: {}", out[0].dur);
+        assert!(open.is_empty());
+
+        // a silent window closes the open note at its current end, with no extension
+        let mut open = Vec::new();
+        let mut g4 = held_win(4.0 * step - win_len, &[(1.0, 2.3, 48)]);
+        let (first, _) = window_notes(Some(&mut g4), 4.0 * step, &mut open);
+        assert_eq!(open.len(), 1);
+        let (none_new, none_ext) = window_notes(None, 5.0 * step, &mut open);
+        assert!(none_new.is_empty() && none_ext.is_empty());
+        assert!(open.is_empty());
+        assert!(first[0].dur > 0.9, "keeps its first-window length: {}", first[0].dur);
+    }
+
+    #[test]
+    fn window_notes_does_not_duplicate_the_held_pitch() {
+        let (_, out, _) = run_windows(&[(1.0, 5.0, 48)], 4..=14, Some((3.0, 48)));
+        assert_eq!(out.len(), 1, "a re-onset inside the sustain must not start a second note: {out:?}");
+        assert!((out[0].dur - 4.0).abs() <= 1.0 / crate::sep::FPS + 1e-9, "full length: {}", out[0].dur);
+    }
+
+    #[test]
+    fn window_notes_bridges_four_or_more_dropped_windows() {
+        let ks: Vec<usize> = (4..=14).filter(|k| !(15..=18).contains(k)).chain(19..=24).collect();
+        let (_, out, _) = run_windows(&[(1.0, 12.0, 48)], 4..=4, None);
+        let _ = out;
+        for drop in 1..=7usize {
+            let ks: Vec<usize> = ks.iter().copied().filter(|k| !(15..15 + drop).contains(k)).chain(15 + drop..=24).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+            let step = CHUNK as f64 / RATE as f64;
+            let win_len = BP_SAMPLES as f64 / BP_RATE as f64;
+            let mut open = Vec::new();
+            let mut tl = crate::notes::Timeline::new();
+            for k in ks {
+                let end_t = k as f64 * step;
+                let mut g = held_win(end_t - win_len, &[(1.0, 12.0, 48)]);
+                let (new, ext) = window_notes(Some(&mut g), end_t, &mut open);
+                tl.add(1, &new);
+                tl.extend(1, &ext);
+            }
+            let out = tl.window(1, 0.0, 100.0);
+            let total: f64 = out.iter().map(|n| n.dur).sum();
+            assert_eq!(out.len(), 1, "drop {drop}: {out:?}");
+            assert!((total - 11.0).abs() < 0.1, "drop {drop}: dur {total:.3}");
+        }
+    }
+
+    #[test]
+    fn window_notes_restrike_inside_carry_tail_is_kept() {
+        let ks: Vec<usize> = (4..=14).collect();
+        let (_, out, _) = run_windows(&[(1.0, 3.0, 48), (3.1, 5.0, 48)], 4..=14, None);
+        let _ = ks;
+        assert_eq!(out.len(), 2, "re-strike swallowed: {out:?}");
+    }
+
+    /// Pin for the grid origin: frame 0 of a production window sits at `end_t - BP_SAMPLES / BP_RATE`.
+    /// A note onset at frame 100 (inside the kept [end_t - 1, end_t - 0.5) range) must land at that origin plus 100 frames, not 2.0 s before `end_t`.
+    #[test]
+    fn window_notes_uses_production_grid_origin() {
+        let end_t = 10.0;
+        let ws = end_t - BP_SAMPLES as f64 / BP_RATE as f64;
+        let mut g = crate::sep::Grids { note: vec![vec![0.0f32; 88]; 172], onset: vec![vec![0.0f32; 88]; 172] };
+        for f in 100..120 {
+            g.note[f][48] = 0.9;
+        }
+        g.onset[100][48] = 0.9;
+        let mut open = Vec::new();
+        let (new, _) = window_notes(Some(&mut g), end_t, &mut open);
+        assert_eq!(new.len(), 1, "{new:?}");
+        let want = ws + 100.0 / crate::sep::FPS;
+        assert!((new[0].t - want).abs() < 1e-9, "onset {} vs production origin {want}", new[0].t);
+    }
+
+    #[test]
+    fn window_notes_random_held_notes_come_out_whole() {
+        let mut s = 11u64;
+        let mut lcg = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) as f64) / (1u64 << 31) as f64
+        };
+        let mut notes: Vec<(f64, f64, usize)> = Vec::new();
+        while notes.len() < 5 {
+            let p = 30 + (lcg() * 40.0) as usize;
+            if notes.iter().any(|x| x.2 == p) {
+                continue;
+            }
+            let on = 0.5 + lcg() * 2.5;
+            let dur = 0.3 + lcg() * 3.7;
+            notes.push((on, on + dur, p));
+        }
+        // from k = 1: a note starting before 1.0 s is emitted by window k = 3 and must not be skipped
+        let (_, out, _) = run_windows(&notes, 1..=20, None);
+        assert_eq!(out.len(), 5, "{out:?}");
+        let tol = 1.0 / crate::sep::FPS + 1e-9;
+        for &(on, off, p) in &notes {
+            let m = out.iter().find(|m| m.pitch as usize == p + 21).unwrap_or_else(|| panic!("pitch {} missing", p + 21));
+            assert!((m.t - on).abs() <= tol, "onset of pitch {}: {} vs {on}", p + 21, m.t);
+            assert!((m.dur - (off - on)).abs() <= tol, "length of pitch {}: {} vs {}", p + 21, m.dur, off - on);
+        }
     }
 }
