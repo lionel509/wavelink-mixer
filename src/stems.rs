@@ -400,6 +400,11 @@ impl Session {
     }
 }
 
+/// Our own capture children (mac-tap, wav-tap) give up after 3 quick deaths; `pw-cat` keeps restarting as on main.
+pub fn gives_up(bin: &str, dead: u32) -> bool {
+    dead >= 3 && bin != TAP_BIN
+}
+
 impl Drop for Session {
     /// Stop flag; kill and wait every child; never blocks the GTK thread on a join.
     fn drop(&mut self) {
@@ -631,7 +636,7 @@ fn run_live(o: &Opts, shared: &Shared, stop: &Arc<AtomicBool>, kids: &Kids, m: &
                 break;
             }
             dead += 1;
-            if dead >= 3 {
+            if gives_up(&tap_cmd(&o.tap, o.tap_sink, "stems_tap").0, dead) {
                 return Err(format!("the capture exited {dead} times in a row with no audio; see the message above"));
             }
             s.reset();
@@ -1308,6 +1313,25 @@ mod tests {
         let pl = play_args("ch_stems");
         assert_eq!(&sv(&pl)[..3], &["--playback", "--target", "ch_stems"]);
         assert_eq!(TAP_BIN, "pw-cat");
+    }
+
+    #[test]
+    fn gives_up_only_for_our_own_capture() {
+        assert!(!gives_up(TAP_BIN, 100));
+        let me = std::env::current_exe().unwrap().to_string_lossy().to_string();
+        assert!(gives_up(&me, 3));
+        assert!(!gives_up(&me, 2));
+    }
+
+    #[test]
+    fn dropped_session_cannot_write() {
+        let shared = Shared::new();
+        let kids = Arc::new(Kids::new());
+        let current = shared.current.clone();
+        let old = Shared { gen: current.fetch_add(1, Ordering::SeqCst) + 1, ..shared.clone() };
+        assert!(old.live().is_some());
+        drop(Session { stop: Arc::new(AtomicBool::new(false)), kids, current });
+        assert!(old.live().is_none());
     }
 
     #[test]

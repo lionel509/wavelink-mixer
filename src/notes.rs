@@ -185,6 +185,11 @@ impl Timeline {
     }
 
     /// Clones of the live (held) notes, per stem.
+    /// Notes a Save would still find: finished and held.
+    pub fn unsaved(&self) -> usize {
+        (0..3).map(|i| self.done[i].len() + self.live[i].len()).sum()
+    }
+
     pub fn held(&self) -> [Vec<Note>; 3] {
         let mut out: [Vec<Note>; 3] = Default::default();
         for stem in 0..3 {

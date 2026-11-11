@@ -65,7 +65,8 @@ pub fn parse(args: &[String]) -> Result<(String, SepEngine), String> {
 #[derive(Debug, PartialEq)]
 pub enum Cmd {
     Save(String),
-    Start,
+    /// `start` refuses over unsaved notes; `start new` (true) drops them.
+    Start(bool),
     Stop,
     Stats,
     Quit,
@@ -78,12 +79,17 @@ pub fn cmd(line: &str) -> Cmd {
     let (w, rest) = t.split_once(' ').unwrap_or((t, ""));
     match w {
         "save" if !rest.is_empty() => Cmd::Save(rest.to_string()),
-        "start" => Cmd::Start,
+        "start" => Cmd::Start(rest.trim() == "new"),
         "stop" => Cmd::Stop,
         "stats" => Cmd::Stats,
         "quit" => Cmd::Quit,
         _ => Cmd::Unknown(w.to_string()),
     }
+}
+
+/// Why `start` must not go ahead: it would throw away unsaved notes (#75).
+pub fn start_refusal(unsaved: usize, new: bool) -> Option<String> {
+    (unsaved > 0 && !new).then(|| format!("listen: {unsaved} unsaved notes; save PATH first, or \"start new\" to drop them"))
 }
 
 /// A typed path: stdin gets no shell, so a leading `~/` is expanded here.
@@ -271,9 +277,12 @@ pub fn run(args: &[String]) -> i32 {
                         Err(e) => println!("save failed: {e} (notes kept)"),
                     }
                 }
-                Cmd::Start => {
+                Cmd::Start(new) => {
+                    let unsaved = shared.timeline.lock().unwrap_or_else(|p| p.into_inner()).unsaved();
                     if session.is_some() {
                         eprintln!("listen: already running");
+                    } else if let Some(m) = start_refusal(unsaved, new) {
+                        eprintln!("{m}");
                     } else {
                         let (ctx, crx) = mpsc::channel::<(u64, [Vec<f32>; 3])>();
                         session = Some(start_session(&tap, engine, &shared, ctx));
@@ -336,6 +345,13 @@ mod tests {
     }
 
     #[test]
+    fn start_refuses_over_unsaved_notes() {
+        assert!(start_refusal(5, false).unwrap().contains("5 unsaved notes"));
+        assert_eq!(start_refusal(5, true), None);
+        assert_eq!(start_refusal(0, false), None);
+    }
+
+    #[test]
     fn parse_picks_the_tap() {
         let (tap, eng) = parse(&s(&["--wav", "/tmp/a.wav"])).unwrap();
         assert_eq!(tap, format!("{}/tmp/a.wav", crate::stems::WAV_TAP));
@@ -353,7 +369,8 @@ mod tests {
     #[test]
     fn cmd_parses_lines() {
         assert_eq!(cmd("save /tmp/out dir/x.mid"), Cmd::Save("/tmp/out dir/x.mid".to_string()));
-        assert_eq!(cmd("start"), Cmd::Start);
+        assert_eq!(cmd("start"), Cmd::Start(false));
+        assert_eq!(cmd("start new"), Cmd::Start(true));
         assert_eq!(cmd("stop"), Cmd::Stop);
         assert_eq!(cmd("stats"), Cmd::Stats);
         assert_eq!(cmd("quit"), Cmd::Quit);
