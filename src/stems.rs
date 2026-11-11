@@ -910,7 +910,9 @@ pub fn window_notes(g: Option<&mut Grids>, end_t: f64, open: &mut Vec<Note>) -> 
     }
     *open = still;
     let mut new: Vec<Note> = Vec::new();
-    for (n, at_edge) in frames_to_notes_open(&g.note, &g.onset) {
+    // A new note whose re-strike is past this window's keep slice stays open for the next window (review #69 f2).
+    let keep_end = ((end_t - 0.5 - ws) * crate::sep::FPS).ceil() as usize;
+    for (n, at_edge) in crate::sep::frames_to_notes_open_keep(&g.note, &g.onset, keep_end) {
         let t = ws + n.t;
         if !in_window(t, end_t) {
             continue;
@@ -1608,6 +1610,30 @@ mod tests {
         assert_eq!(out.len(), 1, "{out:?}");
         assert!((out[0].t - 1.0).abs() <= 1.5 / crate::sep::FPS, "{out:?}");
         assert!((out[0].dur - 9.0).abs() <= 0.1, "{out:?}");
+    }
+
+    /// Review finding 2 (#69): a new note whose re-strike is past the window's keep slice (2.3 s, keep [1.6, 2.1))
+    /// is seen once, and gone in the next window. The note must stay open and come out whole.
+    #[test]
+    fn window_notes_new_note_restrike_past_keep_seen_once_stays_whole() {
+        let win_len = BP_SAMPLES as f64 / BP_RATE as f64;
+        let notes = [(1.6, 3.0, 48)];
+        let mut open = Vec::new();
+        let mut tl = crate::notes::Timeline::new();
+        for end_t in [2.1, 2.6, 3.1, 3.6] {
+            let ws = end_t - win_len;
+            let mut g = held_win(ws, &notes);
+            if (end_t - 2.6f64).abs() < 1e-9 {
+                g.onset[((2.3 - ws) * crate::sep::FPS).round() as usize][48] = 0.6;
+            }
+            let (new, ext) = window_notes(Some(&mut g), end_t, &mut open);
+            tl.add(1, &new);
+            tl.extend(1, &ext);
+        }
+        let out = tl.window(1, 0.0, 100.0);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!((out[0].t - 1.6).abs() <= 1.5 / crate::sep::FPS, "{out:?}");
+        assert!((out[0].dur - 1.4).abs() <= 1.5 / crate::sep::FPS, "{out:?}");
     }
 
     /// I59 and I62 on generated chains: one note per strike, no same-pitch overlap, at most one open note per pitch.

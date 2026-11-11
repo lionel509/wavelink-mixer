@@ -386,6 +386,12 @@ pub fn frames_to_notes(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<Note> {
 /// As `frames_to_notes`, and each note carries a flag: true when its walk reached the last frame,
 /// so the note may still be sounding past the window.
 pub fn frames_to_notes_open(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<(Note, bool)> {
+    frames_to_notes_open_keep(note, onset, usize::MAX)
+}
+
+/// As `frames_to_notes_open`, where a re-strike at frame `keep_end` or later is past this window's keep slice:
+/// the next window may not see it, so the note it ends stays open (flag true) for the carry-over.
+pub fn frames_to_notes_open_keep(note: &[Vec<f32>], onset: &[Vec<f32>], keep_end: usize) -> Vec<(Note, bool)> {
     let frames = note.len();
     if frames == 0 {
         return Vec::new();
@@ -423,7 +429,7 @@ pub fn frames_to_notes_open(note: &[Vec<f32>], onset: &[Vec<f32>]) -> Vec<(Note,
         // a raw re-strike of this pitch ends the note where it goes quiet (#59)
         if let Some(fr) = next_strike(&work, raw, p, f + MIN_NOTE_FRAMES + 1, end) {
             end = (f..fr).rev().find(|&x| work[x][p] >= FRAME_THRESH).map_or(fr, |x| x + 1);
-            at_edge = false;
+            at_edge = fr >= keep_end;
         }
         // upstream: `if i - note_start_idx <= min_note_len: continue`, so a note needs at least 12 frames
         if end - f <= MIN_NOTE_FRAMES {
