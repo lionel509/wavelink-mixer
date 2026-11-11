@@ -56,7 +56,7 @@ The source is `src/demo_midi.rs`, and `WAVELINK_DEMO_WAV` is read there.
 ## Gotchas
 
 - PipeWire child fd limit (#22, #29): the graph child inherits the soft `RLIMIT_NOFILE`, which is 1024 by default. Once the graph grows, it restarts every few seconds and stays capped. `raise_nofile` and `spawn_graph_child` in `engine.rs` exist for this. Repros are in `scripts/repro22/` and `scripts/repro33/`.
-- The Linux gtk4 build cannot be built or tested from macOS (#44). A green macOS `cargo check` says nothing about Linux-only code.
+- The Linux gtk4 build cannot be built or tested from macOS (#45). A green macOS `cargo check` says nothing about Linux-only code.
 - `cfg(linux)` tests (for example the `nofile` tests in `engine.rs`) skip silently on macOS. A green macOS run does not cover them.
 - A known macOS failure exists: `remote::breaker36::r2_auto_bind_excludes_vpn_interfaces_not_named_like_tun_or_wg` depends on the host's network interfaces. A VPN can make it fail, so compare test results against a baseline on the same machine.
 - Test names are module paths. Moving a test module renames its tests, so compare pass/fail sets by full name.
