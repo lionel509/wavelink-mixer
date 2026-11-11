@@ -492,6 +492,29 @@ mod tests {
         assert!((w[0].dur - 2.0).abs() < 1e-9, "{}", w[0].dur);
     }
 
+    #[test]
+    fn add_same_onset_merge_is_clipped_by_a_later_strike() {
+        let mut tl = Timeline::new();
+        tl.add(1, &[n(1.0, 0.2, 60, 90), n(1.3, 0.4, 60, 90)]);
+        tl.add(1, &[n(1.0, 0.5, 60, 90)]);
+        let w = tl.window(1, 0.0, 9.0);
+        assert_eq!(w.len(), 2);
+        assert!((w[0].dur - 0.3).abs() < 1e-9, "overlap: {:?}", w);
+        assert!(w[0].t + w[0].dur <= w[1].t + 1e-9, "overlap: {:?}", w);
+    }
+
+    #[test]
+    fn extend_stops_at_a_strike_already_in_the_timeline() {
+        let mut tl = Timeline::new();
+        tl.add(1, &[n(0.0, 0.5, 60, 90)]);
+        tl.add(1, &[n(1.3, 0.4, 60, 90)]);
+        tl.extend(1, &[(0.5, n(0.0, 3.0, 60, 90))]);
+        let w = tl.window(1, 0.0, 9.0);
+        assert_eq!(w.len(), 2);
+        assert!((w[0].dur - 1.3).abs() < 1e-9, "overlap after ext: {:?}", w);
+        assert!(w[0].t + w[0].dur <= w[1].t + 1e-9, "overlap after ext: {:?}", w);
+    }
+
     fn vlq(b: &[u8], mut i: usize) -> (usize, usize) {
         let mut v = 0usize;
         loop {
