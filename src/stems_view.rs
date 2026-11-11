@@ -4,7 +4,7 @@
 use super::App;
 use crate::config::{glib_home, names};
 use crate::dash::{hex_rgb, Spectrum};
-use crate::notes::{midi_bytes, save_status, take_for_save, COLORS, STEMS};
+use crate::notes::{save_once, save_status, COLORS, STEMS};
 use crate::stemcfg::{self, Plays, SepEngine, StemsCfg};
 use crate::stems::{Opts, Session, Shared};
 use gtk::prelude::*;
@@ -463,27 +463,18 @@ fn stop(app: &App) {
 
 fn save_midi(app: &Rc<App>, v: &View) {
     let running = app.stems.session.borrow().is_some();
-    let (tracks, held) = take_for_save(&mut app.stems.shared.timeline.lock().unwrap(), running);
-    let n: usize = tracks.iter().map(|t| t.len()).sum();
-    if n == 0 {
-        v.status.set_text(&save_status("", 0, held));
-        return;
-    }
     let src = source_id(app, v).unwrap_or_else(|| "spotify".into());
-    let stamp = glib::DateTime::now_local()
-        .and_then(|d| d.format("%Y%m%d-%H%M%S"))
-        .map(|s| s.to_string())
-        .unwrap_or_else(|_| "unknown-time".into());
-    let bytes = midi_bytes(&tracks);
-    let written = create_midi(&glib_home(), &src, &stamp).and_then(|(path, mut f)| f.write_all(&bytes).map(|_| path));
-    match written {
-        Ok(path) => v.status.set_text(&save_status(&path.display().to_string(), n, held)),
-        Err(e) => {
-            // put the notes back so a retry can still save them
-            let mut tl = app.stems.shared.timeline.lock().unwrap();
-            tl.put_back(&tracks);
-            v.status.set_text(&format!("save failed: {e}"));
-        }
+    let res = save_once(&app.stems.shared.timeline, running, || {
+        let stamp = glib::DateTime::now_local()
+            .and_then(|d| d.format("%Y%m%d-%H%M%S"))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| "unknown-time".into());
+        create_midi(&glib_home(), &src, &stamp)
+    });
+    match res {
+        Ok(s) if s.path.as_os_str().is_empty() => v.status.set_text(&save_status("", 0, s.held)),
+        Ok(s) => v.status.set_text(&save_status(&s.path.display().to_string(), s.per_stem.iter().sum(), s.held)),
+        Err(e) => v.status.set_text(&format!("save failed: {e}")),
     }
 }
 

@@ -4,6 +4,9 @@
 //!   wavelink-mixer remote-token [--rotate]   print the host/port/token a remote client needs (new token with --rotate)
 //!   wavelink-mixer remote [ADDR]             the mixer console for another computer (a MacBook), a client of the engine
 //!   wavelink-mixer fake-engine [PORT]        a test engine (no PipeWire) for the remote console demo
+//!   wavelink-mixer listen [--wav FILE | --mute] [--engine live|quality]   headless listening session (#77)
+//!   wavelink-mixer mac-tap [--mute]          Mac system-audio capture child, raw f32 stereo 44.1 kHz on stdout (#77)
+//!   wavelink-mixer wav-tap FILE              the same stdout contract fed from a WAV at real-time pace (#77)
 mod config;
 mod dash;
 mod dsp;
@@ -101,6 +104,15 @@ fn main() -> glib::ExitCode {
     }
     if std::env::args().nth(1).as_deref() == Some("fake-engine") {
         std::process::exit(remote::fake_engine(&std::env::args().skip(2).collect::<Vec<_>>()));
+    }
+    if std::env::args().nth(1).as_deref() == Some("mac-tap") {
+        std::process::exit(mactap::run(&std::env::args().skip(2).collect::<Vec<_>>()));
+    }
+    if std::env::args().nth(1).as_deref() == Some("wav-tap") {
+        std::process::exit(mactap::wav_run(&std::env::args().skip(2).collect::<Vec<_>>()));
+    }
+    if std::env::args().nth(1).as_deref() == Some("listen") {
+        std::process::exit(listen::run(&std::env::args().skip(2).collect::<Vec<_>>()));
     }
     if std::env::args().nth(1).as_deref() == Some("stems") {
         std::process::exit(stems::cli(std::env::args().skip(2).collect()));
