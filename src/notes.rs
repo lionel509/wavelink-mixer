@@ -420,6 +420,51 @@ mod tests {
         assert_eq!(w.len(), 3);
     }
 
+    #[test]
+    fn add_clips_long_note_at_restrike_past_four_seconds() {
+        let mut tl = Timeline::new();
+        tl.add(1, &[n(0.0, 5.0, 60, 90)]);
+        tl.add(1, &[n(4.9, 0.3, 60, 90)]);
+        let w = tl.window(1, 0.0, 10.0);
+        assert!((w[0].dur - 4.9).abs() < 1e-9, "{}", w[0].dur);
+    }
+
+    #[test]
+    fn add_same_onset_same_pitch_keeps_only_the_longer() {
+        let mut tl = Timeline::new();
+        tl.add(1, &[n(1.0, 0.5, 60, 90)]);
+        tl.add(1, &[n(1.0, 0.2, 60, 90)]);
+        let w = tl.window(1, 0.0, 9.0);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].dur, 0.5);
+        let mut rev = Timeline::new();
+        rev.add(1, &[n(1.0, 0.2, 60, 90), n(1.0, 0.5, 60, 90)]);
+        let w = rev.window(1, 0.0, 9.0);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].dur, 0.5);
+    }
+
+    #[test]
+    fn add_clips_within_one_batch() {
+        let mut tl = Timeline::new();
+        tl.add(1, &[n(1.0, 1.0, 60, 90), n(1.5, 0.2, 60, 90)]);
+        let w = tl.window(1, 0.0, 9.0);
+        assert_eq!(w.len(), 2);
+        assert!((w[0].dur - 0.5).abs() < 1e-9, "{}", w[0].dur);
+    }
+
+    #[test]
+    fn put_back_after_a_failed_save_is_clipped_by_a_strike_added_meanwhile() {
+        let mut tl = Timeline::new();
+        tl.add(1, &[n(0.0, 3.0, 60, 90)]);
+        let taken = tl.drain_all()[1].clone();
+        tl.add(1, &[n(2.0, 0.2, 60, 90)]);
+        tl.add(1, &taken);
+        let w = tl.window(1, 0.0, 9.0);
+        assert_eq!(w.len(), 2);
+        assert!((w[0].dur - 2.0).abs() < 1e-9, "{}", w[0].dur);
+    }
+
     fn vlq(b: &[u8], mut i: usize) -> (usize, usize) {
         let mut v = 0usize;
         loop {
