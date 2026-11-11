@@ -28,6 +28,24 @@ pub const BP_WINDOW: usize = 88200;
 pub const DRUM_WINDOW: usize = 66150;
 /// Not pw-record: the leak watch counts the GUI's pw-record children.
 pub const TAP_BIN: &str = "pw-cat";
+/// #77: the Mac capture children. Same stdout contract as pw-cat: raw f32 LE, 44100 Hz, 2 ch.
+pub const MAC_TAP: &str = "mac:system";
+pub const MAC_TAP_MUTE: &str = "mac:system:mute";
+pub const WAV_TAP: &str = "wav:";
+/// The capture child for a tap target: (program, args). Compile-only skeleton for #77 U4.
+pub fn tap_cmd(target: &str, capture_sink: bool, name: &str) -> (String, Vec<String>) {
+    let me = || std::env::current_exe().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| "wavelink-mixer".into());
+    if let Some(file) = target.strip_prefix(WAV_TAP) {
+        return (me(), vec!["wav-tap".to_string(), file.to_string()]);
+    }
+    if target == MAC_TAP {
+        return (me(), vec!["mac-tap".to_string()]);
+    }
+    if target == MAC_TAP_MUTE {
+        return (me(), vec!["mac-tap".to_string(), "--mute".to_string()]);
+    }
+    (TAP_BIN.to_string(), tap_args(target, capture_sink, name))
+}
 /// (left, hop, pad) in seconds, from the most to the least demanding.
 pub const LADDER: [(f64, f64, f64); 5] = [(1.0, 0.5, 0.5), (1.0, 0.25, 0.25), (1.0, 0.2, 0.2), (1.0, 0.1, 0.15), (1.0, 0.1, 0.1)];
 
@@ -304,18 +322,19 @@ impl Kids {
         Kids(Mutex::new(KidList::default()))
     }
 
-    fn spawn(&self, role: &'static str, args: &[String], stdin: bool, stdout: bool) -> Result<Pipes, String> {
+    fn spawn(&self, role: &'static str, bin: &str, args: &[String], stdin: bool, stdout: bool) -> Result<Pipes, String> {
         let mut g = lock(&self.0);
         if g.dead {
             return Err("stopped".into());
         }
-        let mut cmd = Command::new(TAP_BIN);
+        let mut cmd = Command::new(bin);
         cmd.args(args)
             .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
             .stdout(if stdout { Stdio::piped() } else { Stdio::null() })
-            .stderr(Stdio::null());
+            // pw-cat keeps its quiet stderr; our own capture children (mac-tap, wav-tap) show why they died.
+            .stderr(if bin == TAP_BIN { Stdio::null() } else { Stdio::inherit() });
         die_with_parent(&mut cmd);
-        let mut child = cmd.spawn().map_err(|e| format!("{TAP_BIN}: {e}"))?;
+        let mut child = cmd.spawn().map_err(|e| format!("{bin}: {e}"))?;
         let pipes = (child.stdin.take(), child.stdout.take());
         g.kids.push((role, child));
         Ok(pipes)
@@ -349,6 +368,7 @@ impl Kids {
 pub struct Session {
     stop: Arc<AtomicBool>,
     kids: Arc<Kids>,
+    current: Arc<AtomicU64>,
 }
 
 impl Session {
@@ -356,6 +376,7 @@ impl Session {
         let stop = Arc::new(AtomicBool::new(false));
         let kids = Arc::new(Kids::new());
         let gen = ui.current.fetch_add(1, Ordering::SeqCst) + 1;
+        let current = ui.current.clone();
         let shared = Shared { gen, ..ui };
         // A new run starts from nothing: no notes, no bands, clock at 0. Notes from the last run stay
         // until this point, so Stop → Save MIDI still works.
@@ -375,14 +396,21 @@ impl Session {
                 }
             }
         });
-        Session { stop, kids }
+        Session { stop, kids, current }
     }
+}
+
+/// Our own capture children (mac-tap, wav-tap) give up after 3 quick deaths; `pw-cat` keeps restarting as on main.
+pub fn gives_up(bin: &str, dead: u32) -> bool {
+    dead >= 3 && bin != TAP_BIN
 }
 
 impl Drop for Session {
     /// Stop flag; kill and wait every child; never blocks the GTK thread on a join.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // No later write from this session: a block still in separation is refused by `Shared::live`.
+        self.current.fetch_add(1, Ordering::SeqCst);
         self.kids.kill_all();
     }
 }
@@ -543,7 +571,7 @@ fn session_main(o: &Opts, shared: &Shared, chunks: Option<mpsc::Sender<(u64, [Ve
     let mut play = None;
     if o.plays == Plays::Stems {
         wait_node(&o.out, stop)?;
-        let (i, _) = kids.spawn("play", &play_args(&o.out), true, false)?;
+        let (i, _) = kids.spawn("play", TAP_BIN, &play_args(&o.out), true, false)?;
         play = i;
     }
     let synth = if o.plays == Plays::Midi {
@@ -601,10 +629,15 @@ fn run_live(o: &Opts, shared: &Shared, stop: &Arc<AtomicBool>, kids: &Kids, m: &
     let (mut blocks, mut late) = (0u64, 0u64);
     let (mut win_min, mut base) = (f64::INFINITY, 0.0f64);
     let mut calls: Vec<f64> = Vec::new();
+    let mut dead = 0u32;
     while !stop.load(Ordering::Relaxed) {
         if tap.read_exact(&mut raw).is_err() {
             if stop.load(Ordering::Relaxed) {
                 break;
+            }
+            dead += 1;
+            if gives_up(&tap_cmd(&o.tap, o.tap_sink, "stems_tap").0, dead) {
+                return Err(format!("the capture exited {dead} times in a row with no audio; see the message above"));
             }
             s.reset();
             std::thread::sleep(Duration::from_millis(500));
@@ -613,6 +646,7 @@ fn run_live(o: &Opts, shared: &Shared, stop: &Arc<AtomicBool>, kids: &Kids, m: &
             set_status(shared, "tap restarted");
             continue;
         }
+        dead = 0;
         t_first.get_or_insert_with(Instant::now);
         let planar = deinterleave(&bytes_to_f32(&raw));
         let t = Instant::now();
@@ -658,7 +692,10 @@ fn run_live(o: &Opts, shared: &Shared, stop: &Arc<AtomicBool>, kids: &Kids, m: &
 }
 
 fn open_tap(kids: &Kids, o: &Opts) -> Result<ChildStdout, String> {
-    let (_, so) = kids.spawn("tap", &tap_args(&o.tap, o.tap_sink, "stems_tap"), false, true)?;
+    let (_, so) = {
+        let (bin, args) = tap_cmd(&o.tap, o.tap_sink, "stems_tap");
+        kids.spawn("tap", &bin, &args, false, true)
+    }?;
     so.ok_or_else(|| "tap has no output".to_string())
 }
 
@@ -806,7 +843,10 @@ fn separate_loop(
 }
 
 fn open_tap_for(kids: &Kids, name: &str, sink: bool) -> Result<ChildStdout, String> {
-    let (_, so) = kids.spawn("tap", &tap_args(name, sink, "stems_tap"), false, true)?;
+    let (_, so) = {
+        let (bin, args) = tap_cmd(name, sink, "stems_tap");
+        kids.spawn("tap", &bin, &args, false, true)
+    }?;
     so.ok_or_else(|| "tap has no output".to_string())
 }
 
@@ -1273,6 +1313,67 @@ mod tests {
         let pl = play_args("ch_stems");
         assert_eq!(&sv(&pl)[..3], &["--playback", "--target", "ch_stems"]);
         assert_eq!(TAP_BIN, "pw-cat");
+    }
+
+    #[test]
+    fn gives_up_only_for_our_own_capture() {
+        assert!(!gives_up(TAP_BIN, 100));
+        let me = std::env::current_exe().unwrap().to_string_lossy().to_string();
+        assert!(gives_up(&me, 3));
+        assert!(!gives_up(&me, 2));
+    }
+
+    #[test]
+    fn dropped_session_cannot_write() {
+        let shared = Shared::new();
+        let kids = Arc::new(Kids::new());
+        let current = shared.current.clone();
+        let old = Shared { gen: current.fetch_add(1, Ordering::SeqCst) + 1, ..shared.clone() };
+        assert!(old.live().is_some());
+        drop(Session { stop: Arc::new(AtomicBool::new(false)), kids, current });
+        assert!(old.live().is_none());
+    }
+
+    #[test]
+    fn tap_cmd_is_pw_cat_for_every_pipewire_target() {
+        // I2: the Linux capture child does not change. Generated targets over ids and names.
+        let alphabet: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789._-".chars().collect();
+        let mut s: u64 = 77;
+        for _ in 0..300 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let len = 1 + (s >> 33) as usize % 12;
+            let mut id = String::new();
+            for _ in 0..len {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                id.push(alphabet[(s >> 33) as usize % alphabet.len()]);
+            }
+            for target in [crate::config::names::ch(&id), id.clone()] {
+                for sink in [false, true] {
+                    assert_eq!(tap_cmd(&target, sink, "stems_tap"), (TAP_BIN.to_string(), tap_args(&target, sink, "stems_tap")));
+                }
+            }
+        }
+        assert_eq!(tap_cmd("ch_spotify", true, "stems_tap").0, "pw-cat");
+    }
+
+    #[test]
+    fn tap_cmd_wav_and_mac_run_this_binary() {
+        let me = std::env::current_exe().unwrap().to_string_lossy().to_string();
+        let file = ["/tmp/x", "wav"].join(".");
+        assert_eq!(tap_cmd(&format!("wav:{file}"), false, "stems_tap"), (me.clone(), vec!["wav-tap".to_string(), file]));
+        assert_eq!(tap_cmd(MAC_TAP, false, "stems_tap"), (me.clone(), vec!["mac-tap".to_string()]));
+        assert_eq!(tap_cmd(MAC_TAP_MUTE, false, "stems_tap"), (me, vec!["mac-tap".to_string(), "--mute".to_string()]));
+    }
+
+    #[test]
+    fn breaker_r7b_prune_drops_unsaved_final_note_after_20_minutes() {
+        // #75 as written in the issue: a final note from a long session survives a 20-minute prune.
+        let mut tl = Timeline::new();
+        tl.add(1, &[Note { t: 0.0, dur: 0.5, pitch: 40, vel: 90 }]);
+        tl.set_open(1, &[]);
+        tl.set_open(1, &[]);
+        tl.prune(1300.0 - 1200.0 + 1.0);
+        assert_eq!(tl.drain_all()[1].len(), 1);
     }
 
     #[test]
