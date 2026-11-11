@@ -34,8 +34,17 @@ pub const MAC_TAP_MUTE: &str = "mac:system:mute";
 pub const WAV_TAP: &str = "wav:";
 /// The capture child for a tap target: (program, args). Compile-only skeleton for #77 U4.
 pub fn tap_cmd(target: &str, capture_sink: bool, name: &str) -> (String, Vec<String>) {
-    let _ = (target, capture_sink, name);
-    unimplemented!("#77 U4: tap_cmd")
+    let me = || std::env::current_exe().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| "wavelink-mixer".into());
+    if let Some(file) = target.strip_prefix(WAV_TAP) {
+        return (me(), vec!["wav-tap".to_string(), file.to_string()]);
+    }
+    if target == MAC_TAP {
+        return (me(), vec!["mac-tap".to_string()]);
+    }
+    if target == MAC_TAP_MUTE {
+        return (me(), vec!["mac-tap".to_string(), "--mute".to_string()]);
+    }
+    (TAP_BIN.to_string(), tap_args(target, capture_sink, name))
 }
 /// (left, hop, pad) in seconds, from the most to the least demanding.
 pub const LADDER: [(f64, f64, f64); 5] = [(1.0, 0.5, 0.5), (1.0, 0.25, 0.25), (1.0, 0.2, 0.2), (1.0, 0.1, 0.15), (1.0, 0.1, 0.1)];
@@ -313,18 +322,18 @@ impl Kids {
         Kids(Mutex::new(KidList::default()))
     }
 
-    fn spawn(&self, role: &'static str, args: &[String], stdin: bool, stdout: bool) -> Result<Pipes, String> {
+    fn spawn(&self, role: &'static str, bin: &str, args: &[String], stdin: bool, stdout: bool) -> Result<Pipes, String> {
         let mut g = lock(&self.0);
         if g.dead {
             return Err("stopped".into());
         }
-        let mut cmd = Command::new(TAP_BIN);
+        let mut cmd = Command::new(bin);
         cmd.args(args)
             .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
             .stdout(if stdout { Stdio::piped() } else { Stdio::null() })
             .stderr(Stdio::null());
         die_with_parent(&mut cmd);
-        let mut child = cmd.spawn().map_err(|e| format!("{TAP_BIN}: {e}"))?;
+        let mut child = cmd.spawn().map_err(|e| format!("{bin}: {e}"))?;
         let pipes = (child.stdin.take(), child.stdout.take());
         g.kids.push((role, child));
         Ok(pipes)
@@ -552,7 +561,7 @@ fn session_main(o: &Opts, shared: &Shared, chunks: Option<mpsc::Sender<(u64, [Ve
     let mut play = None;
     if o.plays == Plays::Stems {
         wait_node(&o.out, stop)?;
-        let (i, _) = kids.spawn("play", &play_args(&o.out), true, false)?;
+        let (i, _) = kids.spawn("play", TAP_BIN, &play_args(&o.out), true, false)?;
         play = i;
     }
     let synth = if o.plays == Plays::Midi {
@@ -667,7 +676,10 @@ fn run_live(o: &Opts, shared: &Shared, stop: &Arc<AtomicBool>, kids: &Kids, m: &
 }
 
 fn open_tap(kids: &Kids, o: &Opts) -> Result<ChildStdout, String> {
-    let (_, so) = kids.spawn("tap", &tap_args(&o.tap, o.tap_sink, "stems_tap"), false, true)?;
+    let (_, so) = {
+        let (bin, args) = tap_cmd(&o.tap, o.tap_sink, "stems_tap");
+        kids.spawn("tap", &bin, &args, false, true)
+    }?;
     so.ok_or_else(|| "tap has no output".to_string())
 }
 
@@ -815,7 +827,10 @@ fn separate_loop(
 }
 
 fn open_tap_for(kids: &Kids, name: &str, sink: bool) -> Result<ChildStdout, String> {
-    let (_, so) = kids.spawn("tap", &tap_args(name, sink, "stems_tap"), false, true)?;
+    let (_, so) = {
+        let (bin, args) = tap_cmd(name, sink, "stems_tap");
+        kids.spawn("tap", &bin, &args, false, true)
+    }?;
     so.ok_or_else(|| "tap has no output".to_string())
 }
 
