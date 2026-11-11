@@ -7,7 +7,7 @@ use crate::stems::{Opts, Session, Shared, MAC_TAP, MAC_TAP_MUTE, WAV_TAP};
 use std::fs::OpenOptions;
 use std::io::BufRead;
 use std::path::PathBuf;
-use std::sync::{mpsc, Mutex};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 #[repr(C)]
