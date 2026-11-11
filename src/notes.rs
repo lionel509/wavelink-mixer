@@ -56,6 +56,24 @@ impl Timeline {
         [std::mem::take(&mut self.notes[0]), std::mem::take(&mut self.notes[1]), std::mem::take(&mut self.notes[2])]
     }
 
+    /// Marks the notes a later window may still change, by (t, pitch) per stem. Stub: does nothing.
+    pub fn set_open(&mut self, stem: usize, open: &[Note]) {
+        let _ = (stem, open);
+    }
+
+    /// Every note is closed (a stopped session). Stub: does nothing.
+    pub fn close_all(&mut self) {}
+
+    /// Removes and returns the closed notes; held notes stay in the timeline. Stub: drains everything.
+    pub fn drain_closed(&mut self) -> [Vec<Note>; 3] {
+        self.drain_all()
+    }
+
+    /// Clones of the held notes, per stem. Stub: none.
+    pub fn held(&self) -> [Vec<Note>; 3] {
+        Default::default()
+    }
+
     /// Lengthens notes that a carry-over window extended: `ext` is (previous end, note with its new dur).
     /// Matches the first note with the same t and pitch; no match (already drained) is a no-op.
     pub fn extend(&mut self, stem: usize, ext: &[(f64, Note)]) {
@@ -65,6 +83,19 @@ impl Timeline {
             }
         }
     }
+}
+
+/// What Save writes: the closed notes, and how many notes are still held. A stopped session closes every note
+/// first. Stub: drains everything, holds nothing.
+pub fn take_for_save(tl: &mut Timeline, running: bool) -> ([Vec<Note>; 3], usize) {
+    let _ = running;
+    (tl.drain_all(), 0)
+}
+
+/// The status line after a Save. Stub: empty.
+pub fn save_status(path: &str, n: usize, held: usize) -> String {
+    let _ = (path, n, held);
+    String::new()
 }
 
 /// MIDI key for a note: drum pitch 0 is the GM bass drum (38), everything else is the pitch itself.
@@ -569,5 +600,85 @@ mod tests {
         let p62 = got.iter().find(|m| m.pitch == 62).unwrap();
         assert_eq!(p60.dur, 2.4);
         assert_eq!(p62.dur, 0.9);
+    }
+
+    #[test]
+    fn timeline_drain_closed_keeps_open_notes() {
+        let mut tl = Timeline::new();
+        tl.add(1, &[n(1.0, 0.5, 50, 90), n(2.0, 0.5, 52, 90)]);
+        tl.set_open(1, &[n(2.0, 0.5, 52, 90)]);
+        let closed = tl.drain_closed();
+        assert_eq!(closed[1], vec![n(1.0, 0.5, 50, 90)]);
+        assert_eq!(tl.held()[1], vec![n(2.0, 0.5, 52, 90)]);
+        assert_eq!(tl.drain_all()[1], vec![n(2.0, 0.5, 52, 90)], "the held note is still in the timeline");
+    }
+
+    #[test]
+    fn take_for_save_when_stopped_takes_everything() {
+        let (a, b) = (n(1.0, 0.5, 50, 90), n(2.0, 0.5, 52, 90));
+        let mut tl = Timeline::new();
+        tl.add(1, &[a.clone(), b.clone()]);
+        tl.set_open(1, &[b.clone()]);
+        let (tracks, held) = take_for_save(&mut tl, true);
+        assert_eq!(held, 1);
+        assert_eq!(tracks[1], vec![a.clone()], "a held note is not written while running");
+        let mut stopped = Timeline::new();
+        stopped.add(1, &[a.clone(), b.clone()]);
+        stopped.set_open(1, &[b.clone()]);
+        let (tracks, held) = take_for_save(&mut stopped, false);
+        assert_eq!(held, 0, "a stopped session holds nothing");
+        assert_eq!(tracks[1], vec![a, b]);
+    }
+
+    #[test]
+    fn save_status_texts() {
+        assert_eq!(save_status("x.mid", 0, 0), "no notes yet");
+        assert_eq!(save_status("x.mid", 0, 2), "no finished notes yet (2 held)");
+        assert_eq!(save_status("x.mid", 3, 0), "saved x.mid (3 notes)");
+        assert_eq!(save_status("x.mid", 3, 2), "saved x.mid (3 notes, 2 held for the next save)");
+    }
+
+    /// #61: two notes of one key on one tick collapse to one note that lasts to the longer end.
+    #[test]
+    fn midi_equal_tick_same_key_collapses_to_the_longer() {
+        let tracks = [vec![], vec![n(1.0, 0.5, 50, 90), n(1.0, 1.0, 50, 100), n(1.0004, 0.2, 50, 80)], vec![]];
+        let b = midi_bytes(&tracks);
+        let ev: Vec<(u64, u8, u8)> = track_events(&b, 2).into_iter().filter(|e| e.2 == 50).collect();
+        assert_eq!(ev, vec![(0, 0x90, 50), (960, 0x80, 50)]);
+    }
+
+    /// #61 in general: each key strictly alternates on and off, every off after its on, every on after the previous off.
+    #[test]
+    fn midi_keys_alternate_for_any_input() {
+        for seed in 1..=50u64 {
+            let mut s = seed;
+            let mut drums = Vec::new();
+            let mut bass = Vec::new();
+            for i in 0..40 {
+                let grid = lcg(&mut s) < 0.5;
+                let t = if grid { (lcg(&mut s) * 20.0).floor() * 0.25 } else { lcg(&mut s) * 5.0 };
+                let dur = if lcg(&mut s) < 0.1 { 0.0 } else { lcg(&mut s) * 1.5 };
+                if i % 4 == 0 {
+                    drums.push(n(t, dur, 0, 100));
+                } else {
+                    bass.push(n(t, dur, 50 + (lcg(&mut s) * 3.0) as u8, 100));
+                }
+            }
+            let b = midi_bytes(&[drums, bass, vec![]]);
+            for (track, keys) in [(1usize, vec![38u8]), (2usize, vec![50u8, 51, 52])] {
+                for k in keys {
+                    let seq: Vec<(u64, u8)> = track_events(&b, track).into_iter().filter(|e| e.2 == k).map(|e| (e.0, e.1)).collect();
+                    assert_eq!(seq.len() % 2, 0, "seed {seed} key {k}: unmatched event");
+                    let mut prev_off = 0u64;
+                    for (i, pair) in seq.chunks(2).enumerate() {
+                        assert_eq!(pair[0].1, 0x90, "seed {seed} key {k} pair {i}: starts with an on");
+                        assert_eq!(pair[1].1, 0x80, "seed {seed} key {k} pair {i}: an on is followed by its off");
+                        assert!(pair[1].0 > pair[0].0, "seed {seed} key {k} pair {i}: off must come after its on");
+                        assert!(pair[0].0 >= prev_off, "seed {seed} key {k} pair {i}: on before the previous off");
+                        prev_off = pair[1].0;
+                    }
+                }
+            }
+        }
     }
 }
