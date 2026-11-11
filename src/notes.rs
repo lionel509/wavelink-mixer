@@ -155,6 +155,12 @@ impl Timeline {
             self.longest[stem] = self.longest[stem].max(dur);
         }
     }
+
+    pub fn put_back(&mut self, tracks: &[Vec<Note>; 3]) {
+        for (i, t) in tracks.iter().enumerate() {
+            self.add(i, t);
+        }
+    }
 }
 
 /// What Save writes: the closed notes, and how many notes are still held. A stopped session closes every note
@@ -489,18 +495,6 @@ mod tests {
     }
 
     #[test]
-    fn put_back_after_a_failed_save_is_clipped_by_a_strike_added_meanwhile() {
-        let mut tl = Timeline::new();
-        tl.add(1, &[n(0.0, 3.0, 60, 90)]);
-        let taken = tl.drain_all()[1].clone();
-        tl.add(1, &[n(2.0, 0.2, 60, 90)]);
-        tl.add(1, &taken);
-        let w = tl.window(1, 0.0, 9.0);
-        assert_eq!(w.len(), 2);
-        assert!((w[0].dur - 2.0).abs() < 1e-9, "{}", w[0].dur);
-    }
-
-    #[test]
     fn add_same_onset_merge_is_clipped_by_a_later_strike() {
         let mut tl = Timeline::new();
         tl.add(1, &[n(1.0, 0.2, 60, 90), n(1.3, 0.4, 60, 90)]);
@@ -780,6 +774,9 @@ mod tests {
         let mut tl = Timeline::new();
         tl.add(1, &[n(1.0, 0.5, 50, 90), n(2.0, 0.5, 52, 90)]);
         tl.set_open(1, &[n(2.0, 0.5, 52, 90)]);
+        assert!(tl.drain_closed()[1].is_empty(), "a note that closed in the last window waits one window");
+        assert_eq!(tl.held()[1], vec![n(1.0, 0.5, 50, 90), n(2.0, 0.5, 52, 90)]);
+        tl.set_open(1, &[n(2.0, 0.5, 52, 90)]);
         let closed = tl.drain_closed();
         assert_eq!(closed[1], vec![n(1.0, 0.5, 50, 90)]);
         assert_eq!(tl.held()[1], vec![n(2.0, 0.5, 52, 90)]);
@@ -792,6 +789,7 @@ mod tests {
         let mut tl = Timeline::new();
         tl.add(1, &[a.clone(), b.clone()]);
         tl.set_open(1, &[b.clone()]);
+        tl.set_open(1, &[b.clone()]);
         let (tracks, held) = take_for_save(&mut tl, true);
         assert_eq!(held, 1);
         assert_eq!(tracks[1], vec![a.clone()], "a held note is not written while running");
@@ -801,6 +799,289 @@ mod tests {
         let (tracks, held) = take_for_save(&mut stopped, false);
         assert_eq!(held, 0, "a stopped session holds nothing");
         assert_eq!(tracks[1], vec![a, b]);
+    }
+
+    fn same_key_overlaps(v: &[Note]) -> Vec<(Note, Note)> {
+        let mut s = v.to_vec();
+        s.sort_by(|a, b| a.t.total_cmp(&b.t).then(a.pitch.cmp(&b.pitch)));
+        let mut out = Vec::new();
+        for i in 0..s.len() {
+            for j in i + 1..s.len() {
+                if s[i].pitch == s[j].pitch && s[j].t < s[i].t + s[i].dur - 1e-9 {
+                    out.push((s[i].clone(), s[j].clone()));
+                }
+            }
+        }
+        out
+    }
+
+    fn by_start(v: &mut Vec<Note>) {
+        v.sort_by(|a, b| a.t.total_cmp(&b.t).then(a.pitch.cmp(&b.pitch)).then(a.dur.total_cmp(&b.dur)));
+    }
+
+    #[test]
+    fn breaker_r6_extend_after_restrike_was_drained_overlaps_it() {
+        let mut tl = Timeline::new();
+        tl.add(1, &[n(0.0, 0.5, 40, 90)]);
+        tl.add(1, &[n(0.125, 0.3, 40, 90)]);
+        tl.extend(1, &[(0.5, n(0.0, 2.0, 40, 90))]);
+        tl.set_open(1, &[n(0.0, 2.0, 40, 90)]);
+        let drained = tl.drain_closed();
+        tl.extend(1, &[(2.0, n(0.0, 2.5, 40, 90))]);
+        let (fin, _) = take_for_save(&mut tl, false);
+        let mut all = drained[1].clone();
+        all.extend(fin[1].iter().cloned());
+        assert!(same_key_overlaps(&all).is_empty(), "mid-save + final overlap: {:?}", all);
+    }
+
+    fn r6_seven_calls(mid: bool) -> Vec<Note> {
+        let mut tl = Timeline::new();
+        tl.add(1, &[n(0.0, 0.5, 40, 90)]);
+        tl.add(1, &[n(0.125, 0.3, 40, 90)]);
+        tl.extend(1, &[(0.5, n(0.0, 2.0, 40, 90))]);
+        tl.set_open(1, &[n(0.0, 2.0, 40, 90)]);
+        let mut out = Vec::new();
+        if mid {
+            out.extend(tl.drain_closed()[1].iter().cloned());
+        }
+        tl.extend(1, &[(2.0, n(0.0, 2.5, 40, 90))]);
+        out.extend(take_for_save(&mut tl, false).0[1].iter().cloned());
+        by_start(&mut out);
+        out
+    }
+
+    #[test]
+    fn breaker_r6_mid_save_plus_final_equals_single_after_restrike() {
+        let mid = r6_seven_calls(true);
+        let single = r6_seven_calls(false);
+        assert_eq!(mid, single, "mid + final differ from one final save");
+        assert_eq!(single, vec![n(0.0, 0.125, 40, 90), n(0.125, 0.3, 40, 90)]);
+    }
+
+    #[test]
+    fn extend_respects_a_restrike_that_was_already_drained() {
+        let mut tl = Timeline::new();
+        tl.add(1, &[n(0.0, 0.5, 40, 90)]);
+        tl.add(1, &[n(0.125, 0.3, 40, 90)]);
+        tl.set_open(1, &[n(0.0, 0.5, 40, 90)]);
+        tl.set_open(1, &[n(0.0, 0.5, 40, 90)]);
+        assert_eq!(tl.drain_closed()[1], vec![n(0.125, 0.3, 40, 90)]);
+        tl.extend(1, &[(0.5, n(0.0, 2.5, 40, 90))]);
+        assert_eq!(take_for_save(&mut tl, false).0[1], vec![n(0.0, 0.125, 40, 90)]);
+    }
+
+    #[test]
+    fn a_closed_note_waits_one_window_so_the_next_strike_still_clips_it() {
+        let mut tl = Timeline::new();
+        tl.add(1, &[n(1.0, 0.8, 60, 90)]);
+        tl.set_open(1, &[]);
+        assert!(tl.drain_closed()[1].is_empty());
+        assert_eq!(tl.held()[1].len(), 1);
+        tl.add(1, &[n(1.5, 0.3, 60, 90)]);
+        tl.set_open(1, &[]);
+        assert_eq!(tl.drain_closed()[1], vec![n(1.0, 0.5, 60, 90)]);
+        assert_eq!(tl.held()[1], vec![n(1.5, 0.3, 60, 90)]);
+    }
+
+    fn final_note_is_never_changed(mid: bool) -> Vec<Note> {
+        let mut tl = Timeline::new();
+        tl.add(1, &[n(1.0, 1.0, 60, 90)]);
+        tl.set_open(1, &[]);
+        tl.set_open(1, &[]);
+        let mut out = Vec::new();
+        if mid {
+            out.extend(tl.drain_closed()[1].iter().cloned());
+        }
+        tl.add(1, &[n(1.5, 1.0, 60, 90)]);
+        tl.add(1, &[n(1.2, 0.3, 60, 90)]);
+        tl.extend(1, &[(2.0, n(1.0, 5.0, 60, 90))]);
+        out.extend(take_for_save(&mut tl, false).0[1].iter().cloned());
+        by_start(&mut out);
+        out
+    }
+
+    #[test]
+    fn a_final_note_is_never_changed_and_a_late_strike_starts_at_its_end() {
+        let want = vec![n(1.0, 1.0, 60, 90), n(2.0, 0.5, 60, 90)];
+        assert_eq!(final_note_is_never_changed(false), want);
+        assert_eq!(final_note_is_never_changed(true), want);
+    }
+
+    #[test]
+    fn put_back_restores_the_taken_notes_unchanged() {
+        let mut tl = Timeline::new();
+        tl.add(1, &[n(0.0, 3.0, 60, 90), n(1.0, 0.5, 62, 90)]);
+        tl.set_open(1, &[]);
+        tl.set_open(1, &[]);
+        let (taken, held) = take_for_save(&mut tl, true);
+        assert_eq!(taken[1].len(), 2);
+        assert_eq!(held, 0);
+        tl.add(1, &[n(2.0, 1.5, 60, 90)]);
+        tl.put_back(&taken);
+        assert_eq!(take_for_save(&mut tl, false).0[1], vec![n(0.0, 3.0, 60, 90), n(1.0, 0.5, 62, 90), n(3.0, 0.5, 60, 90)]);
+    }
+
+    enum Op {
+        Add(Vec<Note>),
+        Ext(Vec<(f64, Note)>),
+        Open(Vec<Note>),
+        CloseAll,
+        Drain,
+        FailedSave,
+    }
+
+    fn run_ops(ops: &[Op], mid: bool) -> Vec<Note> {
+        let mut tl = Timeline::new();
+        let mut out: Vec<Note> = Vec::new();
+        for op in ops {
+            match op {
+                Op::Add(v) => tl.add(1, v),
+                Op::Ext(v) => tl.extend(1, v),
+                Op::Open(v) => tl.set_open(1, v),
+                Op::CloseAll => tl.close_all(),
+                Op::Drain => {
+                    if mid {
+                        out.extend(tl.drain_closed()[1].iter().cloned());
+                    }
+                }
+                Op::FailedSave => {
+                    if mid {
+                        let t = tl.drain_closed();
+                        tl.put_back(&t);
+                    }
+                }
+            }
+        }
+        out.extend(take_for_save(&mut tl, false).0[1].iter().cloned());
+        by_start(&mut out);
+        out
+    }
+
+    #[test]
+    fn timeline_invariant_random_ops() {
+        for seed in 1..=300u64 {
+            let mut s = seed;
+            let mut known: Vec<Note> = Vec::new();
+            let mut ops: Vec<Op> = Vec::new();
+            for _ in 0..60 {
+                let r = lcg(&mut s);
+                if r < 0.40 {
+                    let count = 1 + (lcg(&mut s) * 3.0) as usize;
+                    let mut batch = Vec::new();
+                    for _ in 0..count {
+                        let t = (lcg(&mut s) * 48.0).floor() * 0.125;
+                        let dur = 0.125 * (1.0 + (lcg(&mut s) * 12.0).floor());
+                        let pitch = 40 + (lcg(&mut s) * 2.0) as u8;
+                        let note = n(t, dur, pitch, 90);
+                        known.push(note.clone());
+                        batch.push(note);
+                    }
+                    ops.push(Op::Add(batch));
+                } else if r < 0.60 {
+                    if known.is_empty() {
+                        continue;
+                    }
+                    let k = known[(lcg(&mut s) * known.len() as f64) as usize].clone();
+                    let dur = 0.125 * (1.0 + (lcg(&mut s) * 24.0).floor());
+                    ops.push(Op::Ext(vec![(k.t + k.dur, Note { dur, ..k.clone() })]));
+                } else if r < 0.80 {
+                    let from = known.len().saturating_sub(6);
+                    let open: Vec<Note> = known[from..].iter().filter(|_| lcg(&mut s) < 0.5).cloned().collect();
+                    ops.push(Op::Open(open));
+                } else if r < 0.84 {
+                    ops.push(Op::CloseAll);
+                } else if r < 0.94 {
+                    ops.push(Op::Drain);
+                } else {
+                    ops.push(Op::FailedSave);
+                }
+            }
+            let single = run_ops(&ops, false);
+            let mid = run_ops(&ops, true);
+            assert_eq!(mid, single, "seed {seed}: mid-save + final differ from one final save");
+            assert!(same_key_overlaps(&single).is_empty(), "seed {seed}: {:?}", single);
+            assert!(single.iter().all(|x| x.dur > 0.0), "seed {seed}: {:?}", single);
+        }
+    }
+
+    #[test]
+    fn timeline_invariant_writer_like_windows_match_the_oracle() {
+        for seed in 1..=200u64 {
+            let mut s = seed ^ 0xabcdef;
+            let mut mid = Timeline::new();
+            let mut single = Timeline::new();
+            let mut mid_out: Vec<Note> = Vec::new();
+            let mut asked: Vec<Note> = Vec::new();
+            let mut open: Vec<Note> = Vec::new();
+            for w in 0..40usize {
+                let w0 = 0.5 * w as f64;
+                let limit = w0 + 1.0;
+                let mut ext: Vec<(f64, Note)> = Vec::new();
+                let mut next_open: Vec<Note> = Vec::new();
+                for o in open.iter() {
+                    let stays = lcg(&mut s) < 0.6;
+                    let end = if stays {
+                        limit + 0.125 * (1.0 + (lcg(&mut s) * 8.0).floor())
+                    } else {
+                        limit - 0.125 * (lcg(&mut s) * 4.0).floor()
+                    };
+                    let u = Note { dur: end - o.t, ..o.clone() };
+                    if u.dur != o.dur {
+                        ext.push((o.t + o.dur, u.clone()));
+                        if let Some(a) = asked.iter_mut().find(|a| a.t == o.t && a.pitch == o.pitch) {
+                            a.dur = u.dur;
+                        }
+                    }
+                    if stays {
+                        next_open.push(u);
+                    }
+                }
+                let mut batch: Vec<Note> = Vec::new();
+                for j in 0..4usize {
+                    let t = w0 + 0.125 * j as f64;
+                    for pitch in [40u8, 41] {
+                        if lcg(&mut s) >= 0.35 {
+                            continue;
+                        }
+                        let closed = lcg(&mut s) < 0.5;
+                        let end = if closed {
+                            (t + 0.125 * (1.0 + (lcg(&mut s) * 4.0).floor())).min(limit)
+                        } else {
+                            limit + 0.125 * (1.0 + (lcg(&mut s) * 8.0).floor())
+                        };
+                        let note = n(t, end - t, pitch, 90);
+                        batch.push(note.clone());
+                        asked.push(note.clone());
+                        if !closed {
+                            next_open.push(note);
+                        }
+                    }
+                }
+                for tl in [&mut mid, &mut single] {
+                    tl.add(1, &batch);
+                    tl.extend(1, &ext);
+                    tl.set_open(1, &next_open);
+                }
+                if lcg(&mut s) < 0.3 {
+                    mid_out.extend(mid.drain_closed()[1].iter().cloned());
+                }
+                open = next_open;
+            }
+            let mut single_out = take_for_save(&mut single, false).0[1].clone();
+            mid_out.extend(take_for_save(&mut mid, false).0[1].iter().cloned());
+            by_start(&mut single_out);
+            by_start(&mut mid_out);
+            let mut expected: Vec<Note> = asked
+                .iter()
+                .map(|a| {
+                    let next = asked.iter().filter(|b| b.pitch == a.pitch && b.t > a.t).map(|b| b.t).fold(f64::INFINITY, f64::min);
+                    Note { dur: a.dur.min(next - a.t), ..a.clone() }
+                })
+                .collect();
+            by_start(&mut expected);
+            assert_eq!(single_out, expected, "seed {seed}: single save against the oracle");
+            assert_eq!(mid_out, expected, "seed {seed}: mid + final against the oracle");
+        }
     }
 
     #[test]
