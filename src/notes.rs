@@ -41,6 +41,8 @@ struct Live {
 pub struct Timeline {
     live: [Vec<Live>; 3],
     done: [Vec<Note>; 3],
+    /// Final notes the piano roll may still draw: a copy, never a Save source. Only `prune` trims it (#75).
+    recent: [Vec<Note>; 3],
     /// Per stem and pitch, the end of the last final note of that pitch.
     floor: [[f64; 256]; 3],
 }
@@ -51,9 +53,10 @@ fn fit(m: &mut Live, want: f64) {
 }
 
 /// The only way a note becomes final.
-fn retire(done: &mut Vec<Note>, floor: &mut [f64; 256], n: Note) {
+fn retire(done: &mut Vec<Note>, recent: &mut Vec<Note>, floor: &mut [f64; 256], n: Note) {
     let p = n.pitch as usize;
     floor[p] = floor[p].max(n.t + n.dur);
+    recent.push(n.clone());
     done.push(n);
 }
 
@@ -62,6 +65,7 @@ impl Timeline {
         Timeline {
             live: [Vec::new(), Vec::new(), Vec::new()],
             done: [Vec::new(), Vec::new(), Vec::new()],
+            recent: [Vec::new(), Vec::new(), Vec::new()],
             floor: [[f64::NEG_INFINITY; 256]; 3],
         }
     }
@@ -116,7 +120,7 @@ impl Timeline {
 
     /// Notes with t < to and t + dur >= from, in time order.
     pub fn window(&self, stem: usize, from: f64, to: f64) -> Vec<Note> {
-        let mut v: Vec<Note> = self.done[stem]
+        let mut v: Vec<Note> = self.recent[stem]
             .iter()
             .cloned()
             .chain(self.live[stem].iter().map(|m| m.n.clone()))
@@ -126,13 +130,11 @@ impl Timeline {
         v
     }
 
-    /// Drops notes with t + dur < before.
+    /// Trims the roll copy: drops recent notes with t + dur < before. Never drops a note a Save has not written
+    /// (#75): `done` and `live` are not touched.
     pub fn prune(&mut self, before: f64) {
-        for v in self.done.iter_mut() {
+        for v in self.recent.iter_mut() {
             v.retain(|n| n.t + n.dur >= before);
-        }
-        for v in self.live.iter_mut() {
-            v.retain(|m| m.n.t + m.n.dur >= before);
         }
     }
 
@@ -145,7 +147,7 @@ impl Timeline {
     /// The window tick: marks the notes a later window may still change, by (t, pitch) per stem. A live note not
     /// listed cools for one window; a cooling note not listed again is retired.
     pub fn set_open(&mut self, stem: usize, open: &[Note]) {
-        let Timeline { live, done, floor } = self;
+        let Timeline { live, done, recent, floor } = self;
         live[stem].retain_mut(|m| {
             let listed = open.iter().any(|o| o.t == m.n.t && o.pitch == m.n.pitch);
             if listed {
@@ -155,7 +157,7 @@ impl Timeline {
                 m.cool = true;
                 true
             } else {
-                retire(&mut done[stem], &mut floor[stem], m.n.clone());
+                retire(&mut done[stem], &mut recent[stem], &mut floor[stem], m.n.clone());
                 false
             }
         });
@@ -163,10 +165,10 @@ impl Timeline {
 
     /// Every note is closed (a stopped session): all live notes become final.
     pub fn close_all(&mut self) {
-        let Timeline { live, done, floor } = self;
+        let Timeline { live, done, recent, floor } = self;
         for stem in 0..3 {
             for m in live[stem].drain(..) {
-                retire(&mut done[stem], &mut floor[stem], m.n);
+                retire(&mut done[stem], &mut recent[stem], &mut floor[stem], m.n);
             }
         }
     }
@@ -201,9 +203,15 @@ impl Timeline {
         }
     }
 
-    /// Bytes of note state held (capacity times element size, per list). Compile-only skeleton for #77 U1.
+    /// Bytes of note state held (capacity times element size, per list).
     pub fn state_bytes(&self) -> usize {
-        unimplemented!("#77 U1: state_bytes")
+        let mut total = 0;
+        for stem in 0..3 {
+            total += self.done[stem].capacity() * std::mem::size_of::<Note>();
+            total += self.recent[stem].capacity() * std::mem::size_of::<Note>();
+            total += self.live[stem].capacity() * std::mem::size_of::<Live>();
+        }
+        total
     }
 
     /// A failed Save hands its notes back unchanged; they were final when taken.
@@ -233,14 +241,37 @@ pub struct Saved {
 }
 
 /// One Save: takes the final notes under the lock, writes them with the lock released, and hands them back on a
-/// failed write so the next Save still has them (#69, #75). Compile-only skeleton for #77 U1.
+/// failed write so the next Save still has them (#69, #75).
 pub fn save_once(
     tl: &std::sync::Mutex<Timeline>,
     running: bool,
     open: impl FnOnce() -> std::io::Result<(PathBuf, std::fs::File)>,
 ) -> Result<Saved, String> {
-    let _ = (tl, running, open);
-    unimplemented!("#77 U1: save_once")
+    let (tracks, held) = {
+        let mut g = tl.lock().map_err(|e| e.to_string())?;
+        take_for_save(&mut g, running)
+    };
+    let per_stem = [tracks[0].len(), tracks[1].len(), tracks[2].len()];
+    if per_stem.iter().all(|&n| n == 0) {
+        return Ok(Saved { path: PathBuf::new(), per_stem, held, span: None });
+    }
+    let span = tracks.iter().flatten().fold(None, |acc: Option<(f64, f64)>, n| {
+        let (lo, hi) = acc.unwrap_or((n.t, n.t + n.dur));
+        Some((lo.min(n.t), hi.max(n.t + n.dur)))
+    });
+    let written = open().and_then(|(path, mut f)| {
+        f.write_all(&midi_bytes(&tracks))?;
+        Ok(path)
+    });
+    match written {
+        Ok(path) => Ok(Saved { path, per_stem, held, span }),
+        Err(e) => {
+            if let Ok(mut g) = tl.lock() {
+                g.put_back(&tracks);
+            }
+            Err(e.to_string())
+        }
+    }
 }
 
 /// The status line after a Save.
