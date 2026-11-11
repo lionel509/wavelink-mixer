@@ -28,6 +28,15 @@ pub const BP_WINDOW: usize = 88200;
 pub const DRUM_WINDOW: usize = 66150;
 /// Not pw-record: the leak watch counts the GUI's pw-record children.
 pub const TAP_BIN: &str = "pw-cat";
+/// #77: the Mac capture children. Same stdout contract as pw-cat: raw f32 LE, 44100 Hz, 2 ch.
+pub const MAC_TAP: &str = "mac:system";
+pub const MAC_TAP_MUTE: &str = "mac:system:mute";
+pub const WAV_TAP: &str = "wav:";
+/// The capture child for a tap target: (program, args). Compile-only skeleton for #77 U4.
+pub fn tap_cmd(target: &str, capture_sink: bool, name: &str) -> (String, Vec<String>) {
+    let _ = (target, capture_sink, name);
+    unimplemented!("#77 U4: tap_cmd")
+}
 /// (left, hop, pad) in seconds, from the most to the least demanding.
 pub const LADDER: [(f64, f64, f64); 5] = [(1.0, 0.5, 0.5), (1.0, 0.25, 0.25), (1.0, 0.2, 0.2), (1.0, 0.1, 0.15), (1.0, 0.1, 0.1)];
 
@@ -1273,6 +1282,48 @@ mod tests {
         let pl = play_args("ch_stems");
         assert_eq!(&sv(&pl)[..3], &["--playback", "--target", "ch_stems"]);
         assert_eq!(TAP_BIN, "pw-cat");
+    }
+
+    #[test]
+    fn tap_cmd_is_pw_cat_for_every_pipewire_target() {
+        // I2: the Linux capture child does not change. Generated targets over ids and names.
+        let alphabet: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789._-".chars().collect();
+        let mut s: u64 = 77;
+        for _ in 0..300 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let len = 1 + (s >> 33) as usize % 12;
+            let mut id = String::new();
+            for _ in 0..len {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                id.push(alphabet[(s >> 33) as usize % alphabet.len()]);
+            }
+            for target in [crate::config::names::ch(&id), id.clone()] {
+                for sink in [false, true] {
+                    assert_eq!(tap_cmd(&target, sink, "stems_tap"), (TAP_BIN.to_string(), tap_args(&target, sink, "stems_tap")));
+                }
+            }
+        }
+        assert_eq!(tap_cmd("ch_spotify", true, "stems_tap").0, "pw-cat");
+    }
+
+    #[test]
+    fn tap_cmd_wav_and_mac_run_this_binary() {
+        let me = std::env::current_exe().unwrap().to_string_lossy().to_string();
+        let file = ["/tmp/x", "wav"].join(".");
+        assert_eq!(tap_cmd(&format!("wav:{file}"), false, "stems_tap"), (me.clone(), vec!["wav-tap".to_string(), file]));
+        assert_eq!(tap_cmd(MAC_TAP, false, "stems_tap"), (me.clone(), vec!["mac-tap".to_string()]));
+        assert_eq!(tap_cmd(MAC_TAP_MUTE, false, "stems_tap"), (me, vec!["mac-tap".to_string(), "--mute".to_string()]));
+    }
+
+    #[test]
+    fn breaker_r7b_prune_drops_unsaved_final_note_after_20_minutes() {
+        // #75 as written in the issue: a final note from a long session survives a 20-minute prune.
+        let mut tl = Timeline::new();
+        tl.add(1, &[Note { t: 0.0, dur: 0.5, pitch: 40, vel: 90 }]);
+        tl.set_open(1, &[]);
+        tl.set_open(1, &[]);
+        tl.prune(1300.0 - 1200.0 + 1.0);
+        assert_eq!(tl.drain_all()[1].len(), 1);
     }
 
     #[test]

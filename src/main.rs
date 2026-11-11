@@ -12,6 +12,8 @@ mod notes;
 mod sep;
 mod stemcfg;
 mod stems;
+mod listen;
+mod mactap;
 #[cfg(test)]
 #[path = "test_breaker_back.rs"]
 mod test_breaker_back;

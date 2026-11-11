@@ -201,6 +201,11 @@ impl Timeline {
         }
     }
 
+    /// Bytes of note state held (capacity times element size, per list). Compile-only skeleton for #77 U1.
+    pub fn state_bytes(&self) -> usize {
+        unimplemented!("#77 U1: state_bytes")
+    }
+
     /// A failed Save hands its notes back unchanged; they were final when taken.
     pub fn put_back(&mut self, tracks: &[Vec<Note>; 3]) {
         for i in 0..3 {
@@ -217,6 +222,25 @@ pub fn take_for_save(tl: &mut Timeline, running: bool) -> ([Vec<Note>; 3], usize
     }
     let held = tl.held().iter().map(|v| v.len()).sum();
     (tl.drain_closed(), held)
+}
+
+/// What one Save wrote. `path` is empty when there was nothing to write.
+pub struct Saved {
+    pub path: PathBuf,
+    pub per_stem: [usize; 3],
+    pub held: usize,
+    pub span: Option<(f64, f64)>,
+}
+
+/// One Save: takes the final notes under the lock, writes them with the lock released, and hands them back on a
+/// failed write so the next Save still has them (#69, #75). Compile-only skeleton for #77 U1.
+pub fn save_once(
+    tl: &std::sync::Mutex<Timeline>,
+    running: bool,
+    open: impl FnOnce() -> std::io::Result<(PathBuf, std::fs::File)>,
+) -> Result<Saved, String> {
+    let _ = (tl, running, open);
+    unimplemented!("#77 U1: save_once")
 }
 
 /// The status line after a Save.
@@ -577,17 +601,169 @@ mod tests {
 
     #[test]
     fn timeline_window_prune_drain() {
+        // #75: prune trims only the roll copy; a note Save has not written is never dropped.
         let mut tl = Timeline::new();
         tl.add(1, &[n(1.0, 0.1, 40, 100), n(2.0, 0.1, 40, 100), n(3.0, 0.1, 40, 100)]);
         assert_eq!(tl.window(1, 1.5, 3.5).len(), 2);
         tl.prune(2.5);
-        assert_eq!(tl.window(1, 0.0, 10.0).len(), 1);
+        assert_eq!(tl.window(1, 0.0, 10.0).len(), 3);
         let d = tl.drain_all();
         assert!(d[0].is_empty());
-        assert_eq!(d[1].len(), 1);
-        assert_eq!(d[1][0].t, 3.0);
+        assert_eq!(d[1].len(), 3);
+        assert_eq!(d[1][2].t, 3.0);
         assert!(d[2].is_empty());
         assert!(tl.drain_all().iter().all(|v| v.is_empty()));
+    }
+
+    fn final_note(tl: &mut Timeline, stem: usize, nt: Note) {
+        tl.add(stem, &[nt]);
+        tl.set_open(stem, &[]);
+        tl.set_open(stem, &[]);
+    }
+
+    #[test]
+    fn prune_keeps_unsaved_final_note_after_20_minutes() {
+        let mut tl = Timeline::new();
+        final_note(&mut tl, 1, n(0.0, 0.5, 40, 90));
+        tl.prune(1200.0);
+        let d = tl.drain_all();
+        assert_eq!(d[1].len(), 1, "an unsaved final note must survive prune (#75)");
+    }
+
+    #[test]
+    fn prune_never_changes_what_save_returns() {
+        // Same action script with and without prune calls: the saved tracks and the final drain must match.
+        fn run(seed: u64, prune_on: bool) -> (Vec<[Vec<Note>; 3]>, [Vec<Note>; 3]) {
+            let mut s = seed;
+            let mut tl = Timeline::new();
+            let mut now = 0.0f64;
+            let mut seen: Vec<Note> = Vec::new();
+            let mut saves = Vec::new();
+            for step in 0..400u32 {
+                now += 0.5;
+                let stem = (lcg(&mut s) * 3.0) as usize % 3;
+                let pitch = 40 + (lcg(&mut s) * 6.0) as u8;
+                let dur = 0.1 + lcg(&mut s) * 2.0;
+                let nt = n(now, dur, pitch, 90);
+                tl.add(stem, &[nt.clone()]);
+                seen.push(nt);
+                let k = (lcg(&mut s) * seen.len() as f64) as usize;
+                let open: Vec<Note> = seen.iter().rev().take(k % 4).cloned().collect();
+                tl.set_open(stem, &open);
+                if step % 37 == 36 {
+                    let running = lcg(&mut s) < 0.8;
+                    let (tracks, _) = take_for_save(&mut tl, running);
+                    if lcg(&mut s) < 0.5 {
+                        tl.put_back(&tracks);
+                    } else {
+                        saves.push(tracks);
+                    }
+                }
+                if prune_on && step % 7 == 6 {
+                    tl.prune(now - 1200.0);
+                    tl.prune(now - 30.0);
+                    tl.prune(now);
+                }
+            }
+            (saves, tl.drain_all())
+        }
+        for seed in 0..50u64 {
+            let (a, da) = run(seed + 1, true);
+            let (b, db) = run(seed + 1, false);
+            assert_eq!(a, b, "seed {seed}: prune changed a Save");
+            assert_eq!(da, db, "seed {seed}: prune changed the final drain");
+        }
+    }
+
+    #[test]
+    fn prune_bounds_the_roll_copy() {
+        assert_eq!(std::mem::size_of::<Note>(), 24);
+        let mut tl = Timeline::new();
+        let mut now = 0.0f64;
+        for i in 0..36000u32 {
+            let t = i as f64 * 0.1;
+            now = t;
+            tl.add(1, &[n(t, 0.05, 40 + (i % 10) as u8, 90)]);
+            if i % 10 == 9 {
+                tl.set_open(1, &[]);
+            }
+            if i % 300 == 299 {
+                tl.prune(now - 1200.0);
+            }
+        }
+        let rolled = tl.window(1, 0.0, 1e9);
+        assert!(rolled.len() <= 12000 + 40, "roll copy holds {} notes", rolled.len());
+        assert!(tl.state_bytes() <= 2 * 24 * 36000 + 24 * 12000 * 2, "state {} bytes", tl.state_bytes());
+        assert_eq!(tl.drain_all()[1].len(), 36000, "prune must not drop unsaved notes");
+    }
+
+    #[test]
+    fn window_keeps_showing_notes_a_save_took() {
+        let mut tl = Timeline::new();
+        final_note(&mut tl, 1, n(1.0, 0.5, 40, 90));
+        let (tracks, _) = take_for_save(&mut tl, true);
+        assert_eq!(tracks[1].len(), 1);
+        assert_eq!(tl.window(1, 0.0, 10.0).len(), 1, "the roll still shows a note Save took");
+    }
+
+    #[test]
+    fn save_once_writes_and_drains() {
+        let mut t = Timeline::new();
+        final_note(&mut t, 0, n(1.0, 0.1, 38, 90));
+        final_note(&mut t, 1, n(2.0, 0.5, 40, 90));
+        let tl = std::sync::Mutex::new(t);
+        let path = std::env::temp_dir().join(format!("wm-save-once-{}-a.mid", std::process::id()));
+        let p2 = path.clone();
+        let saved = save_once(&tl, true, move || std::fs::File::options().write(true).create(true).truncate(true).open(&p2).map(|f| (p2.clone(), f))).unwrap();
+        assert_eq!(saved.path, path);
+        assert_eq!(saved.per_stem, [1, 1, 0]);
+        assert_eq!(saved.held, 0);
+        assert_eq!(saved.span, Some((1.0, 2.5)));
+        assert_eq!(std::fs::read(&path).unwrap(), midi_bytes(&[vec![n(1.0, 0.1, 38, 90)], vec![n(2.0, 0.5, 40, 90)], vec![]]));
+        let _ = std::fs::remove_file(&path);
+        assert!(tl.lock().unwrap().drain_all().iter().all(|v| v.is_empty()), "a written Save drains its notes");
+    }
+
+    #[test]
+    fn save_once_failed_open_puts_notes_back_for_the_retry() {
+        let mut t = Timeline::new();
+        final_note(&mut t, 1, n(1.0, 0.5, 40, 90));
+        let tl = std::sync::Mutex::new(t);
+        let err = save_once(&tl, true, || Err(std::io::Error::new(std::io::ErrorKind::Other, "disk full")));
+        assert!(err.is_err(), "a failed open is an error");
+        let path = std::env::temp_dir().join(format!("wm-save-once-{}-retry.mid", std::process::id()));
+        let p2 = path.clone();
+        let saved = save_once(&tl, true, move || std::fs::File::options().write(true).create(true).truncate(true).open(&p2).map(|f| (p2.clone(), f))).unwrap();
+        assert_eq!(saved.per_stem, [0, 1, 0], "the retry still has the note");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_once_no_notes_does_not_open() {
+        let tl = std::sync::Mutex::new(Timeline::new());
+        let mut opened = false;
+        let saved = save_once(&tl, true, || {
+            opened = true;
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "should not open"))
+        })
+        .unwrap();
+        assert!(!opened, "nothing to write means no file");
+        assert!(saved.path.as_os_str().is_empty());
+        assert_eq!(saved.span, None);
+    }
+
+    #[test]
+    fn save_once_running_leaves_held_notes() {
+        let mut t = Timeline::new();
+        final_note(&mut t, 1, n(1.0, 0.5, 40, 90));
+        t.add(1, &[n(5.0, 0.5, 52, 90)]);
+        let tl = std::sync::Mutex::new(t);
+        let path = std::env::temp_dir().join(format!("wm-save-once-{}-held.mid", std::process::id()));
+        let p2 = path.clone();
+        let saved = save_once(&tl, true, move || std::fs::File::options().write(true).create(true).truncate(true).open(&p2).map(|f| (p2.clone(), f))).unwrap();
+        assert_eq!(saved.per_stem, [0, 1, 0]);
+        assert_eq!(saved.held, 1, "the live note is held, not written");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
