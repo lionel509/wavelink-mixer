@@ -5,6 +5,7 @@
 #
 #   scripts/listen-demo.sh <wav|live> <plain|saves> <WAV> <OUTDIR> <N>
 #   scripts/listen-demo.sh gate <OUTDIR>
+#   scripts/listen-demo.sh speed <WAV> <OUTDIR> <SECS>   (#83: latency and CPU at each speed stop)
 #
 # wav  : `listen --wav WAV` (the same stdout contract fed from the file, no grant)
 # live : `listen --mute` on the Mac system tap, with WAV played by afplay at low volume
@@ -199,17 +200,81 @@ run() {
   fi
 }
 
+# speed WAV OUTDIR SECS (#83): one `listen --wav WAV --speed N` run per stop N = 0..3. Each run sends `lat`, `stop`
+# and `save` after SECS (keep SECS below the clip length: a finished wav tap restarts), then prints the table and
+# the gate: every stop's cpu_per_min_s <= 1.05 x stop 0.
+speed_run() {
+  wav=$1; dir=$2; secs=$3
+  case "$secs" in ''|*[!0-9]*) echo "SECS must be a whole number of seconds" >&2; exit 2 ;; esac
+  [ -f "$wav" ] || { echo "no such WAV: $wav" >&2; exit 2; }
+  [ -x "$BIN" ] || { echo "no binary at $BIN (cargo build --release -p wavelink-mixer)" >&2; exit 2; }
+  mkdir -p "$dir" || exit 2
+  dir=$(cd "$dir" && pwd)
+  wav=$(cd "$(dirname "$wav")" && pwd)/$(basename "$wav")
+  pid=""
+  trap '[ -n "$pid" ] && kill -9 "$pid" 2>/dev/null' EXIT
+  for n in 0 1 2 3; do
+    out="$dir/speed-$n.txt"
+    log="$dir/speed-$n.log"
+    fifo="$dir/cmd-speed-$n.fifo"
+    rm -f "$fifo" "$out" "$log" "$dir/speed-$n.mid"
+    mkfifo "$fifo" || exit 2
+    "$BIN" listen --wav "$wav" --speed "$n" < "$fifo" > "$out" 2> "$log" &
+    pid=$!
+    exec 3<> "$fifo"   # read-write so opening the fifo never blocks
+    sleep "$secs"
+    echo lat >&3
+    echo stop >&3
+    echo "save $dir/speed-$n.mid" >&3
+    echo quit >&3
+    exec 3>&-
+    reap "$pid"
+    pid=""
+    rm -f "$fifo"
+  done
+
+  echo "speed guard_ms n min_ms p50_ms p95_ms max_ms cpu_per_min_s rss_peak_mb tap_rss_mb drums bass other"
+  base=""
+  fail=0
+  for n in 0 1 2 3; do
+    out="$dir/speed-$n.txt"
+    lat=$(grep '^lat ' "$out" | tail -1)
+    st=$(last_stats "$out")
+    sv=$(grep '^saved ' "$out" | tail -1)
+    cpu=$(echo "$st" | field cpu_per_min_s)
+    [ "$n" = 0 ] && base=$cpu
+    printf "%-5s %-8s %-4s %-6s %-6s %-6s %-6s %-13s %-11s %-10s %-5s %-4s %s\n" "$n" \
+      "$(echo "$lat" | field guard_ms)" "$(echo "$lat" | field n)" "$(echo "$lat" | field min_ms)" \
+      "$(echo "$lat" | field p50_ms)" "$(echo "$lat" | field p95_ms)" "$(echo "$lat" | field max_ms)" \
+      "${cpu:-none}" "$(echo "$st" | field rss_peak_mb)" "$(echo "$st" | field tap_rss_mb)" \
+      "$(echo "$sv" | field drums)" "$(echo "$sv" | field bass)" "$(echo "$sv" | field other)"
+    if [ -z "$cpu" ] || ! awk -v c="$cpu" -v b="$base" 'BEGIN { exit !(c <= 1.05 * b) }'; then
+      fail=1
+    fi
+  done
+  if [ "$fail" = 0 ]; then
+    echo "GATE PASS: every stop cpu_per_min_s <= 1.05 x stop 0 ($base)"
+  else
+    echo "GATE FAIL: a stop's cpu_per_min_s is above 1.05 x stop 0 ($base), or a stop has no stats line"
+    exit 1
+  fi
+}
+
 case "${1:-}" in
   gate)
     [ $# -eq 2 ] || { echo "usage: $0 gate <OUTDIR>" >&2; exit 2; }
     gate "$2"
+    ;;
+  speed)
+    [ $# -eq 4 ] || { echo "usage: $0 speed <WAV> <OUTDIR> <SECS>" >&2; exit 2; }
+    speed_run "$2" "$3" "$4"
     ;;
   wav|live)
     [ $# -eq 5 ] || { echo "usage: $0 <wav|live> <plain|saves> <WAV> <OUTDIR> <N>" >&2; exit 2; }
     run "$1" "$2" "$3" "$4" "$5"
     ;;
   *)
-    echo "usage: $0 <wav|live> <plain|saves> <WAV> <OUTDIR> <N> | $0 gate <OUTDIR>" >&2
+    echo "usage: $0 <wav|live> <plain|saves> <WAV> <OUTDIR> <N> | $0 gate <OUTDIR> | $0 speed <WAV> <OUTDIR> <SECS>" >&2
     exit 2
     ;;
 esac
