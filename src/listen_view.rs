@@ -8,19 +8,45 @@ use crate::lat::Summary;
 pub const SPAN_S: f64 = 8.0;
 
 /// The rectangles (x, y, w, h) of one lane's notes at a page of `w` x `h`. Lane `i` is the `i`-th third of the
-/// height; time runs left to right, `now` at the right edge.
-pub fn lane_rects(_notes: &[Note], _i: usize, _now: f64, _w: f64, _h: f64) -> Vec<(f64, f64, f64, f64)> {
-    Vec::new()
+/// height; time runs left to right, `now` at the right edge. Drums are a full-lane tick, pitched notes a bar.
+pub fn lane_rects(notes: &[Note], i: usize, now: f64, w: f64, h: f64) -> Vec<(f64, f64, f64, f64)> {
+    let top = i as f64 * h / 3.0;
+    let lane_h = h / 3.0;
+    let start = now - SPAN_S;
+    let mut out = Vec::new();
+    for n in notes {
+        if n.t + n.dur < start || n.t > now {
+            continue;
+        }
+        let x = (n.t - start) / SPAN_S * w;
+        let (y, bar_h, bar_w) = if n.pitch == 0 {
+            (top, lane_h, 2.0)
+        } else {
+            let frac = ((96.0 - n.pitch as f64) / 72.0).clamp(0.0, 1.0);
+            (top + frac * (lane_h - 3.0), 3.0, (n.dur / SPAN_S * w).max(2.0))
+        };
+        // Visibility is decided by time above; the clip only trims what sits past either edge.
+        let x0 = x.max(0.0);
+        let x1 = (x + bar_w).min(w);
+        out.push((x0, y, (x1 - x0).max(0.0), bar_h));
+    }
+    out
 }
 
 /// The speed stop for a slider value: the left end (0) is the fastest stop (3), the right end (3) is today's.
-pub fn speed_of_slider(_v: f64) -> usize {
-    0
+pub fn speed_of_slider(v: f64) -> usize {
+    3 - (v.round() as usize).min(3)
 }
 
 /// The latency line under the slider: the measured numbers at this stop, or what to expect before any note.
-pub fn lat_text(_speed: usize, _s: Option<Summary>) -> String {
-    String::new()
+pub fn lat_text(speed: usize, s: Option<Summary>) -> String {
+    match s {
+        Some(s) => format!("latency {:.0} ms median · {:.0} ms p95 · {} notes", s.p50, s.p95, s.n),
+        None => {
+            let (lo, hi) = crate::lat::expected_ms(speed);
+            format!("latency not measured at this stop yet · expect {lo}–{hi} ms plus model time")
+        }
+    }
 }
 
 #[cfg(test)]
