@@ -8,6 +8,7 @@ use crate::stems::{Opts, Session, Shared, MAC_TAP, MAC_TAP_MUTE, WAV_TAP};
 use std::fs::OpenOptions;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -85,6 +86,7 @@ pub fn cmd(line: &str) -> Cmd {
         "start" => Cmd::Start(rest.trim() == "new"),
         "stop" => Cmd::Stop,
         "stats" => Cmd::Stats,
+        "lat" => Cmd::Lat,
         "quit" => Cmd::Quit,
         _ => Cmd::Unknown(w.to_string()),
     }
@@ -213,7 +215,14 @@ pub(crate) fn start_session(tap: &str, engine: SepEngine, shared: &Shared, ctx: 
 
 /// The `listen` command. Exit code.
 pub fn run(args: &[String]) -> i32 {
-    let (tap, engine) = match parse(args) {
+    let (rest, speed) = match parse_speed(args) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    let (tap, engine) = match parse(&rest) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("{e}");
@@ -235,6 +244,8 @@ pub fn run(args: &[String]) -> i32 {
     });
 
     let shared = Shared::new();
+    // Read once per session by `Session::start`, so it must be set before the first start (#83).
+    shared.speed.store(speed, Ordering::Relaxed);
     let (ctx, crx) = mpsc::channel::<(u64, [Vec<f32>; 3])>();
     let mut session: Option<Session> = Some(start_session(&tap, engine, &shared, ctx));
     let mut chunks: Option<mpsc::Receiver<(u64, [Vec<f32>; 3])>> = Some(crx);
@@ -314,7 +325,7 @@ pub fn run(args: &[String]) -> i32 {
                     }
                     println!("{}", stats_line(&stats_of(&meter, &shared)));
                 }
-                Cmd::Lat => {}
+                Cmd::Lat => println!("{}", lat_line(speed, summary_of(&shared))),
                 Cmd::Quit => break,
                 Cmd::Unknown(w) => eprintln!("listen: unknown command: {w}"),
             }
@@ -332,22 +343,63 @@ pub const MIDI_DIR: &str = "~/Music/wavelink-midi";
 /// The `--speed N` flag (#83), taken out of the args before `parse` sees them. 0 is full processing (today), 3 the
 /// fastest stop; anything else is an error.
 pub fn parse_speed(args: &[String]) -> Result<(Vec<String>, usize), String> {
-    Ok((args.to_vec(), 0))
+    const ERR: &str = "listen: --speed is 0 (full processing, the default) to 3 (fastest)";
+    let mut rest = Vec::with_capacity(args.len());
+    let mut speed = 0;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--speed" {
+            let n: usize = it.next().and_then(|v| v.parse().ok()).ok_or(ERR.to_string())?;
+            if n > 3 {
+                return Err(ERR.to_string());
+            }
+            speed = n;
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    Ok((rest, speed))
+}
+
+/// The latency summary of the current stop, if any note has been measured.
+fn summary_of(shared: &Shared) -> Option<Summary> {
+    shared.lat.lock().unwrap_or_else(|p| p.into_inner()).summary()
 }
 
 /// The `lat` line (#83): the measured latency of the current stop, or `n=0` before any note.
-pub fn lat_line(_speed: usize, _s: Option<Summary>) -> String {
-    String::new()
+pub fn lat_line(speed: usize, s: Option<Summary>) -> String {
+    let guard = (crate::lat::guard(speed) * 1000.0).round() as u32;
+    match s {
+        Some(s) => format!(
+            "lat speed={speed} guard_ms={guard} n={} min_ms={:.0} p50_ms={:.0} p95_ms={:.0} max_ms={:.0}",
+            s.n, s.min, s.p50, s.p95, s.max
+        ),
+        None => format!("lat speed={speed} guard_ms={guard} n=0"),
+    }
 }
 
 /// A new `listen-STAMP.mid` in `dir`: `-2`, `-3`, .. when the name is taken; never an overwrite (#83).
-pub fn create_in(_dir: &Path, _stamp: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
-    Err(std::io::Error::other("not implemented"))
+pub fn create_in(dir: &Path, stamp: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+    std::fs::create_dir_all(dir)?;
+    for i in 1..=99 {
+        let name = if i == 1 { format!("listen-{stamp}.mid") } else { format!("listen-{stamp}-{i}.mid") };
+        let p = dir.join(name);
+        match OpenOptions::new().write(true).create_new(true).open(&p) {
+            Ok(f) => return Ok((p, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "listen-STAMP names up to -99 are taken"))
 }
 
 /// The tap for the Listen page (#83): the WAV when one is given, else the Mac system tap, else none.
-pub fn page_tap(_wav: Option<String>, _macos: bool) -> Option<String> {
-    None
+pub fn page_tap(wav: Option<String>, macos: bool) -> Option<String> {
+    match wav {
+        Some(f) => Some(format!("{WAV_TAP}{f}")),
+        None if macos => Some(MAC_TAP.to_string()),
+        None => None,
+    }
 }
 
 /// One listening session driven by the Listen page: start, stop, poll and save over one `Shared` (#83).
@@ -370,8 +422,19 @@ impl Ctl {
     }
 
     /// Refuses over unsaved notes unless `new`, as `start_refusal` does for the CLI.
-    pub fn start(&mut self, _new: bool) -> Result<(), String> {
-        Err("not implemented".into())
+    pub fn start(&mut self, new: bool) -> Result<(), String> {
+        if self.running() {
+            return Err("already running".into());
+        }
+        if let Some(m) = start_refusal(self.unsaved(), new) {
+            return Err(m);
+        }
+        self.shared.speed.store(self.speed.min(3), Ordering::Relaxed);
+        let (ctx, crx) = mpsc::channel::<(u64, [Vec<f32>; 3])>();
+        self.session = Some(start_session(&self.tap, SepEngine::Live, &self.shared, ctx));
+        self.chunks = Some(crx);
+        self.peak = 0.0;
+        Ok(())
     }
 
     pub fn stop(&mut self) {
@@ -381,11 +444,21 @@ impl Ctl {
 
     /// Drains the level meter; true when the capture has been silent for five seconds.
     pub fn poll(&mut self) -> bool {
-        false
+        if let Some(rx) = &self.chunks {
+            while let Ok((_, stems)) = rx.try_recv() {
+                for v in &stems {
+                    for &x in v {
+                        self.peak = self.peak.max(x.abs());
+                    }
+                }
+            }
+        }
+        self.running() && silent(self.peak, self.shared.now())
     }
 
-    pub fn save(&mut self, _dir: &Path, _stamp: &str) -> Result<Saved, String> {
-        Err("not implemented".into())
+    pub fn save(&mut self, dir: &Path, stamp: &str) -> Result<Saved, String> {
+        let running = self.running();
+        save_once(&self.shared.timeline, running, || create_in(dir, stamp))
     }
 
     pub fn unsaved(&self) -> usize {
@@ -393,7 +466,7 @@ impl Ctl {
     }
 
     pub fn lat(&self) -> Option<Summary> {
-        None
+        summary_of(&self.shared)
     }
 }
 
