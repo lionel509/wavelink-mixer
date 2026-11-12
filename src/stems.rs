@@ -389,6 +389,7 @@ impl Session {
         if let Some(mut tl) = shared.live() {
             *tl = Timeline::new();
             shared.played.store(0, Ordering::Relaxed);
+            *lock(&shared.lat) = Lat::new();
             for b in &shared.bands {
                 lock(b).iter_mut().for_each(|x| *x = 0.0);
             }
@@ -636,6 +637,7 @@ fn run_live(o: &Opts, shared: &Shared, stop: &Arc<AtomicBool>, kids: &Kids, m: &
     let (mut win_min, mut base) = (f64::INFINITY, 0.0f64);
     let mut calls: Vec<f64> = Vec::new();
     let mut dead = 0u32;
+    let mut anchored = false;
     while !stop.load(Ordering::Relaxed) {
         if tap.read_exact(&mut raw).is_err() {
             if stop.load(Ordering::Relaxed) {
@@ -650,9 +652,14 @@ fn run_live(o: &Opts, shared: &Shared, stop: &Arc<AtomicBool>, kids: &Kids, m: &
             kids.kill("tap");
             tap = open_tap(kids, o)?;
             set_status(shared, "tap restarted");
+            anchored = false;
             continue;
         }
         dead = 0;
+        if !anchored {
+            lock(&shared.lat).anchor(Instant::now(), out.played as f64 / RATE as f64);
+            anchored = true;
+        }
         t_first.get_or_insert_with(Instant::now);
         let planar = deinterleave(&bytes_to_f32(&raw));
         let t = Instant::now();
@@ -740,6 +747,7 @@ fn run_quality(o: &Opts, shared: &Shared, stop: &Arc<AtomicBool>, kids: &Arc<Kid
         }
         std::thread::sleep(Duration::from_millis(5));
     };
+    lock(&shared.lat).anchor(t0v, 0.0);
     let (_, h, p) = LADDER[idx];
     let hop = frames(h);
     let slices = hop / SLICE;
@@ -859,6 +867,8 @@ fn open_tap_for(kids: &Kids, name: &str, sink: bool) -> Result<ChildStdout, Stri
 /// Consumes finished blocks: keeps notes for the window ending at `end`, adds them to the timeline and the MIDI queue.
 fn transcribe(mut tr: Transcriber, rx: mpsc::Receiver<(u64, [Vec<f32>; 3])>, tx: mpsc::Sender<(usize, Vec<Note>, Vec<(f64, Note)>)>, shared: &Shared, stop: &AtomicBool) {
     let mut open: [Vec<Note>; 3] = Default::default();
+    // The speed stop is read once per session (#83).
+    let guard = crate::lat::guard(shared.speed.load(Ordering::Relaxed));
     while let Ok((end, rings)) = rx.recv() {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -875,13 +885,13 @@ fn transcribe(mut tr: Transcriber, rx: mpsc::Receiver<(u64, [Vec<f32>; 3])>, tx:
                         pitch: 0,
                         vel: (127.0 * s).round().clamp(0.0, 127.0) as u8,
                     })
-                    .filter(|n| in_window(n.t, end_t))
+                    .filter(|n| in_keep(n.t, end_t, guard))
                     .collect();
                 (kept, Vec::new())
             } else {
                 let mono = mono_tail(&rings[stem], BP_WINDOW);
                 match tr.grids(&mono) {
-                    Ok(mut g) => window_notes(g.as_mut(), end_t, &mut open[stem]),
+                    Ok(mut g) => window_notes_g(g.as_mut(), end_t, &mut open[stem], guard),
                     Err(e) => {
                         set_status(shared, format!("notes off: {e}"));
                         release(shared);
@@ -904,6 +914,11 @@ fn transcribe(mut tr: Transcriber, rx: mpsc::Receiver<(u64, [Vec<f32>; 3])>, tx:
 /// Returns the new notes and `(previous end, note with its new dur)` for each extension.
 /// A silent window (`None`) closes every open note at its current end.
 pub fn window_notes(g: Option<&mut Grids>, end_t: f64, open: &mut Vec<Note>) -> (Vec<Note>, Vec<(f64, Note)>) {
+    window_notes_g(g, end_t, open, crate::lat::GUARD_S[0])
+}
+
+/// `window_notes` at a speed stop (#83): the keep slice is `[end - guard - KEEP, end - guard)`.
+pub fn window_notes_g(g: Option<&mut Grids>, end_t: f64, open: &mut Vec<Note>, guard: f64) -> (Vec<Note>, Vec<(f64, Note)>) {
     let ws = end_t - BP_SAMPLES as f64 / BP_RATE as f64;
     let Some(g) = g else {
         open.clear();
@@ -932,12 +947,12 @@ pub fn window_notes(g: Option<&mut Grids>, end_t: f64, open: &mut Vec<Note>) -> 
         // A raw strike of this pitch (#59) ends the carried note where it goes quiet, and is left for a new note.
         // Only a strike this window keeps may close the note; a later one leaves the note open up to it.
         let own = ((n.t - ws) * FPS).round() as i64 + MIN_NOTE_FRAMES as i64 + 1;
-        let keep0 = ((end_t - 1.0 - ws) * FPS).ceil() as i64;
+        let keep0 = ((end_t - (guard + crate::lat::KEEP_S) - ws) * FPS).ceil() as i64;
         let from = own.max(keep0).max(1) as usize;
         let strike = next_strike(&g.note, &g.onset, p, from, end);
         if let Some(fr) = strike {
             end = (0..fr).rev().find(|&f| g.note[f][p] >= FRAME_THRESH).map_or(fr, |f| f + 1);
-            at_edge = !in_window(ws + fr as f64 / FPS, end_t);
+            at_edge = !in_keep(ws + fr as f64 / FPS, end_t, guard);
         }
         let new_end = ws + end as f64 / FPS;
         if strike.is_none() && new_end <= old_end {
@@ -957,10 +972,10 @@ pub fn window_notes(g: Option<&mut Grids>, end_t: f64, open: &mut Vec<Note>) -> 
     *open = still;
     let mut new: Vec<Note> = Vec::new();
     // A new note whose re-strike is past this window's keep slice stays open for the next window (review #69 f2).
-    let keep_end = ((end_t - 0.5 - ws) * crate::sep::FPS).ceil() as usize;
+    let keep_end = ((end_t - guard - ws) * crate::sep::FPS).ceil() as usize;
     for (n, at_edge) in crate::sep::frames_to_notes_open_keep(&g.note, &g.onset, keep_end) {
         let t = ws + n.t;
-        if !in_window(t, end_t) {
+        if !in_keep(t, end_t, guard) {
             continue;
         }
         let n = Note { t, ..n };
@@ -979,6 +994,11 @@ pub(crate) fn commit(shared: &Shared, stem: usize, kept: &[Note], ext: &[(f64, N
         tl.add(stem, kept);
         tl.extend(stem, ext);
         tl.set_open(stem, open);
+        let now = Instant::now();
+        let mut l = lock(&shared.lat);
+        for n in kept {
+            l.note(now, n.t);
+        }
     }
 }
 
@@ -1026,26 +1046,46 @@ pub(crate) fn chunk_line(shared: &Shared, sent: &mut [Vec<Note>; 3], id: u64) ->
 }
 
 pub(crate) fn in_window(t: f64, end_t: f64) -> bool {
-    t >= end_t - 1.0 && t < end_t - 0.5
+    in_keep(t, end_t, crate::lat::GUARD_S[0])
 }
 
 /// The keep slice of a window at a speed stop (#83): `[end - guard - KEEP, end - guard)`. Stop 0 is `in_window`.
-pub(crate) fn in_keep(t: f64, end_t: f64, _guard: f64) -> bool {
-    in_window(t, end_t)
-}
-
-/// `window_notes` with the speed stop's guard (#83). Stub: today's window until the engine unit lands.
-pub fn window_notes_g(g: Option<&mut Grids>, end_t: f64, open: &mut Vec<Note>, _guard: f64) -> (Vec<Note>, Vec<(f64, Note)>) {
-    window_notes(g, end_t, open)
+pub(crate) fn in_keep(t: f64, end_t: f64, guard: f64) -> bool {
+    t >= end_t - (guard + crate::lat::KEEP_S) && t < end_t - guard
 }
 
 /// How long a stopped capture child gets after SIGTERM before SIGKILL (#83).
 const STOP_GRACE: Duration = Duration::from_millis(500);
 
+mod sys {
+    unsafe extern "C" {
+        pub fn kill(pid: i32, sig: i32) -> i32;
+    }
+}
+
 /// SIGTERM to each child still running, one shared grace, then SIGKILL; reaps all and returns each signal (#83).
-/// Stub: SIGKILL at once.
-fn term_then_kill(cs: &mut [Child], _grace: Duration) -> Vec<Option<i32>> {
+fn term_then_kill(cs: &mut [Child], grace: Duration) -> Vec<Option<i32>> {
     use std::os::unix::process::ExitStatusExt;
+    // A child that already exited is never signalled: its pid may have been reused.
+    for c in cs.iter_mut() {
+        if matches!(c.try_wait(), Ok(None)) {
+            // SAFETY: the child has not been reaped, so its pid still names it.
+            unsafe { sys::kill(c.id() as i32, 15) };
+        }
+    }
+    let t = Instant::now();
+    loop {
+        let mut all_done = true;
+        for c in cs.iter_mut() {
+            if matches!(c.try_wait(), Ok(None)) {
+                all_done = false;
+            }
+        }
+        if all_done || t.elapsed() >= grace {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     cs.iter_mut()
         .map(|c| {
             let _ = c.kill();

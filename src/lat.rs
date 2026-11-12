@@ -20,6 +20,9 @@ pub fn expected_ms(speed: usize) -> (u32, u32) {
     ((g * 1000.0).round() as u32, ((g + KEEP_S) * 1000.0).round() as u32)
 }
 
+/// Ring size: the summary covers the last this-many notes.
+const RING: usize = 4096;
+
 /// Latency numbers in ms over the last 4096 notes; `n` counts every note.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Summary {
@@ -44,13 +47,32 @@ impl Lat {
     }
 
     /// The stream was at `stream_s` at wall time `now`.
-    pub fn anchor(&mut self, _now: Instant, _stream_s: f64) {}
+    pub fn anchor(&mut self, now: Instant, stream_s: f64) {
+        self.anchor = Some((now, stream_s));
+    }
 
     /// A note at stream time `t` was handed over at wall time `now`.
-    pub fn note(&mut self, _now: Instant, _t: f64) {}
+    pub fn note(&mut self, now: Instant, t: f64) {
+        let Some((wall0, stream0)) = self.anchor else { return };
+        let ms = (now.saturating_duration_since(wall0).as_secs_f64() - (t - stream0)) * 1000.0;
+        if self.ring.len() == RING {
+            let i = (self.n as usize) % RING;
+            self.ring[i] = ms;
+        } else {
+            self.ring.push(ms);
+        }
+        self.n += 1;
+    }
 
     pub fn summary(&self) -> Option<Summary> {
-        None
+        if self.n == 0 {
+            return None;
+        }
+        let mut s = self.ring.clone();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let len = s.len();
+        let p95 = s[((len as f64 * 0.95) as usize).min(len - 1)];
+        Some(Summary { n: self.n, min: s[0], p50: s[len / 2], p95, max: s[len - 1] })
     }
 }
 
