@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 use std::io::Write;
 use std::mem::ManuallyDrop;
+use std::sync::atomic::Ordering;
 use std::os::unix::io::FromRawFd;
 use std::time::{Duration, Instant};
 
@@ -178,6 +179,15 @@ pub fn run(args: &[String]) -> i32 {
     2
 }
 
+/// Set by SIGTERM; `run` checks it between chunks (#83).
+#[cfg(target_os = "macos")]
+static TERM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+extern "C" fn on_term(_: i32) {
+    TERM.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// `mac-tap [--mute]`: the Core Audio process tap. Exit code.
 #[cfg(target_os = "macos")]
 pub fn run(args: &[String]) -> i32 {
@@ -189,6 +199,8 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
+    // SIGTERM (the page's Stop) ends the loop; the Tap drop then tears the tap and aggregate down (#83).
+    unsafe { ffi::signal(15, on_term) };
     let (tx, rx) = sync_channel::<Vec<f32>>(64);
     if let Err(e) = tap.start(tx) {
         eprintln!("mac-tap: {e}");
@@ -201,10 +213,10 @@ pub fn run(args: &[String]) -> i32 {
     let mut bytes = Vec::new();
     loop {
         // Parent gone (reparented to launchd): stop, and the Tap drop tears down the tap.
-        if unsafe { ffi::getppid() } == 1 {
+        if TERM.load(Ordering::Relaxed) || unsafe { ffi::getppid() } == 1 {
             return 0;
         }
-        match rx.recv_timeout(Duration::from_millis(500)) {
+        match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(chunk) => {
                 pcm.clear();
                 rs.push(&chunk, &mut pcm);
@@ -337,6 +349,7 @@ pub mod ffi {
 
     unsafe extern "C" {
         pub fn getppid() -> i32;
+        pub fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
     }
 
     /// Registers (or looks up) a selector.

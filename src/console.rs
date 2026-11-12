@@ -212,6 +212,7 @@ pub fn host_strip(h: &Host, on_edit: Rc<dyn Fn(HostEdit)>) -> HostStrip {
     scale.set_inverted(true);
     scale.set_draw_value(false);
     scale.set_vexpand(true);
+    scale.set_halign(gtk::Align::Center);
     scale.set_size_request(-1, 220);
     scale.add_css_class("console");
     for m in PCT_MARKS {
@@ -345,12 +346,19 @@ fn db_scale(height: i32) -> gtk::Scale {
     scale.set_inverted(true);
     scale.set_draw_value(false);
     scale.set_vexpand(true);
+    scale.set_halign(gtk::Align::Center);
     scale.set_size_request(-1, height);
     scale.add_css_class("console");
     for (d, t) in [(12.0, "+12"), (6.0, "+6"), (0.0, "0"), (-5.0, "5"), (-10.0, "10"), (-20.0, "20"), (-30.0, "30"), (-40.0, "40"), (-60.0, "∞")] {
         scale.add_mark(db_to_pos(d), gtk::PositionType::Left, Some(t));
     }
     scale
+}
+
+/// A strip takes its column's full width and height; its controls are centred inside it.
+fn fill(w: &impl IsA<gtk::Widget>) {
+    w.set_hexpand(true);
+    w.set_vexpand(true);
 }
 
 /// Per-strip widgets of one input.
@@ -381,7 +389,7 @@ struct BusUi {
 struct Console {
     win: adw::ApplicationWindow,
     pill: gtk::Label,
-    body: gtk::Box,
+    body: gtk::Grid,
     dynamic: gtk::CssProvider,
     conn: RefCell<Option<Conn>>,
     conn_text: RefCell<String>,
@@ -398,8 +406,8 @@ struct Console {
     /// CoreAudio watch wakes, drained on the GTK thread.
     wake: RefCell<Option<mpsc::Receiver<()>>>,
     next_id: Cell<u64>,
-    /// The default width is set once, from the strips present at the first state.
-    sized: Cell<bool>,
+    /// The size this window was last set to (#43, #83); a window the user resized is left alone.
+    last_set: Cell<(i32, i32)>,
 }
 
 impl Console {
@@ -443,24 +451,28 @@ impl Console {
         let st = self.state.borrow().clone();
         let mut css = String::new();
 
-        let ins = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        ins.append(&section("INPUTS"));
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        row.set_vexpand(true);
-        for inp in &st.inputs {
+        // Strips fill the width: one grid column per strip, a separator between inputs and outputs (#83).
+        let n_in = st.inputs.len();
+        let n_out = st.buses.len() + st.hosts.len();
+        let out_col = (n_in.max(1) + 1) as i32;
+        self.body.attach(&section("INPUTS"), 0, 0, n_in.max(1) as i32, 1);
+        for (i, inp) in st.inputs.iter().enumerate() {
             let u = self.input_strip(inp, &st.buses, &mut css);
-            row.append(&u.root);
+            fill(&u.root);
+            self.body.attach(&u.root, i as i32, 1, 1, 1);
             self.inputs.borrow_mut().push(u);
         }
-        ins.append(&row);
-
-        let outs = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        outs.append(&section("OUTPUTS"));
-        let orow = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        orow.set_vexpand(true);
+        let sep = gtk::Separator::new(gtk::Orientation::Vertical);
+        sep.set_margin_start(4);
+        sep.set_margin_end(4);
+        self.body.attach(&sep, n_in.max(1) as i32, 0, 1, 2);
+        self.body.attach(&section("OUTPUTS"), out_col, 0, n_out.max(1) as i32, 1);
+        let mut col = out_col;
         for bus in &st.buses {
             let u = self.bus_strip(bus, &mut css);
-            orow.append(&u.0);
+            fill(&u.0);
+            self.body.attach(&u.0, col, 1, 1, 1);
+            col += 1;
             self.buses.borrow_mut().push(u.1);
         }
         for h in &st.hosts {
@@ -475,22 +487,22 @@ impl Console {
                 });
             });
             let s = host_strip(h, on_edit);
-            orow.append(&s.root);
+            fill(&s.root);
+            self.body.attach(&s.root, col, 1, 1, 1);
+            col += 1;
             self.hosts.borrow_mut().push(s);
         }
-        outs.append(&orow);
-
-        self.body.append(&ins);
-        self.body.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-        self.body.append(&outs);
         self.dynamic.load_from_string(&css);
         self.refresh();
-        if !self.sized.get() && st.inputs.len() + st.buses.len() + st.hosts.len() > 0 {
-            self.sized.set(true);
-            // Every strip is in the body, so its natural width is what the window needs.
+        // The window is sized to the strips once per set of strips (#43); a user resize is left alone (#83).
+        let strips = n_in + n_out;
+        if strips > 0 && !self.win.is_maximized() && !self.win.is_fullscreen() {
             let natural = self.body.measure(gtk::Orientation::Horizontal, -1).1;
-            let w = default_width(natural, monitor_width(&self.win));
-            self.win.set_default_size(w, self.win.default_height());
+            let cur = (self.win.default_width(), self.win.default_height());
+            if let Some((w, h)) = fit_size(natural, cur, self.last_set.get(), monitor_size(&self.win)) {
+                self.win.set_default_size(w, h);
+                self.last_set.set((w, h));
+            }
         }
     }
 
@@ -535,6 +547,7 @@ impl Console {
         }
         let mut routes = Vec::new();
         let rbox = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        rbox.set_halign(gtk::Align::Center);
         for bus in buses {
             let t = gtk::ToggleButton::with_label(&bus.name);
             t.add_css_class("route");
@@ -720,16 +733,39 @@ impl Console {
     }
 }
 
+/// `WxH` for the MIXER_SIZE demo hook (#83).
+fn parse_size(s: &str) -> Option<(i32, i32)> {
+    let (w, h) = s.split_once('x')?;
+    let (w, h) = (w.parse::<i32>().ok()?, h.parse::<i32>().ok()?);
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+/// The size a rebuild should set (#43, #83): `None` when the user has resized the window or nothing changes. Width
+/// grows to the strips' natural width and never past the monitor; height never past the monitor.
+fn fit_size(natural_w: i32, cur: (i32, i32), last_set: (i32, i32), monitor: Option<(i32, i32)>) -> Option<(i32, i32)> {
+    if cur != last_set {
+        return None;
+    }
+    let w = default_width(natural_w, monitor.map(|m| m.0)).max(cur.0);
+    let h = cur.1.min(monitor.map(|m| m.1).unwrap_or(cur.1));
+    if (w, h) == cur {
+        None
+    } else {
+        Some((w, h))
+    }
+}
+
 /// Default window width: the strips' natural width, never under the old 1100, never over the monitor (1800 when GTK can't tell).
 fn default_width(natural: i32, monitor: Option<i32>) -> i32 {
     natural.max(1100).min(monitor.unwrap_or(1800))
 }
 
-/// Width of the monitor the window is on, in logical pixels.
-fn monitor_width(win: &adw::ApplicationWindow) -> Option<i32> {
+/// Size of the monitor the window is on, in logical pixels.
+fn monitor_size(win: &adw::ApplicationWindow) -> Option<(i32, i32)> {
     let surface = win.surface()?;
     let mon = gdk::Display::default()?.monitor_at_surface(&surface)?;
-    Some(mon.geometry().width())
+    let g = mon.geometry();
+    Some((g.width(), g.height()))
 }
 
 fn section(text: &str) -> gtk::Label {
@@ -784,11 +820,16 @@ fn activate(app: &adw::Application, o: Opts) {
         }
     }
 
-    let win = adw::ApplicationWindow::builder().application(app).title("Mixer — remote").default_width(1100).default_height(760).build();
+    // MIXER_SIZE=WxH is the demo hook for the two window sizes; the window then keeps the size it was given (#83).
+    let demo_size = std::env::var("MIXER_SIZE").ok().as_deref().and_then(parse_size);
+    let (dw, dh) = demo_size.unwrap_or((1100, 760));
+    let last_set = if demo_size.is_some() { (0, 0) } else { (dw, dh) };
+    let win = adw::ApplicationWindow::builder().application(app).title("Mixer — remote").default_width(dw).default_height(dh).build();
     let pill = gtk::Label::new(Some("Connecting…"));
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&pill));
-    let body = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    let body = gtk::Grid::new();
+    body.set_column_spacing(8);
     body.set_margin_start(16);
     body.set_margin_end(16);
     body.set_margin_top(12);
@@ -819,7 +860,7 @@ fn activate(app: &adw::Application, o: Opts) {
         watch: RefCell::new(watch),
         wake: RefCell::new(wake),
         next_id: Cell::new(0),
-        sized: Cell::new(false),
+        last_set: Cell::new(last_set),
     });
     let c = console.clone();
     glib::timeout_add_local(TICK, move || {
@@ -920,5 +961,56 @@ mod tests {
         assert_eq!(default_width(2400, Some(1728)), 1728);
         // Without a monitor, the sane max applies.
         assert_eq!(default_width(2400, None), 1800);
+    }
+
+
+    #[test]
+    fn size_env_parses_wxh() {
+        assert_eq!(parse_size("1100x760"), Some((1100, 760)));
+        assert_eq!(parse_size("700x480"), Some((700, 480)));
+        assert_eq!(parse_size("x480"), None);
+        assert_eq!(parse_size("700"), None);
+    }
+
+    #[test]
+    fn fit_size_grows_for_new_strips_never_shrinks_never_past_the_monitor() {
+        let mon = Some((1512, 982));
+        assert_eq!(fit_size(1400, (1100, 760), (1100, 760), mon), Some((1400, 760)));
+        assert_eq!(fit_size(600, (1100, 760), (1100, 760), mon), None);
+        assert_eq!(fit_size(3000, (1100, 760), (1100, 760), mon), Some((1512, 760)));
+        assert_eq!(fit_size(1100, (1100, 1200), (1100, 1200), mon), Some((1100, 982)));
+    }
+
+    #[test]
+    fn fit_size_leaves_a_user_resized_window_alone() {
+        assert_eq!(fit_size(1400, (900, 700), (1100, 760), Some((1512, 982))), None);
+    }
+
+    #[test]
+    fn fit_size_generated() {
+        let mut s = 3u64;
+        let mut next = move |m: u64| -> i32 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) % m) as i32
+        };
+        for _ in 0..2000 {
+            let natural = 200 + next(2800);
+            let cur = (300 + next(1700), 200 + next(1000));
+            let last = if next(2) == 0 { cur } else { (300 + next(1700), 200 + next(1000)) };
+            let mon = if next(4) == 0 { None } else { Some((800 + next(2200), 600 + next(1400))) };
+            let got = fit_size(natural, cur, last, mon);
+            if cur != last {
+                assert_eq!(got, None, "user-resized {cur:?} vs {last:?}");
+                continue;
+            }
+            if let Some((w, h)) = got {
+                assert!(w >= cur.0 && h <= cur.1, "{got:?} from {cur:?}");
+                if let Some((mw, _)) = mon {
+                    if cur.0 <= mw {
+                        assert!(w <= mw, "{got:?} past monitor {mw}");
+                    }
+                }
+            }
+        }
     }
 }
