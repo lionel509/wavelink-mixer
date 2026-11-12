@@ -720,6 +720,17 @@ impl Console {
     }
 }
 
+/// `WxH` for the MIXER_SIZE demo hook (#83).
+fn parse_size(_s: &str) -> Option<(i32, i32)> {
+    None
+}
+
+/// The size a rebuild should set (#43, #83): `None` when the user has resized the window or nothing changes. Width
+/// grows to the strips' natural width and never past the monitor; height never past the monitor.
+fn fit_size(_natural_w: i32, _cur: (i32, i32), _last_set: (i32, i32), _monitor: Option<(i32, i32)>) -> Option<(i32, i32)> {
+    None
+}
+
 /// Default window width: the strips' natural width, never under the old 1100, never over the monitor (1800 when GTK can't tell).
 fn default_width(natural: i32, monitor: Option<i32>) -> i32 {
     natural.max(1100).min(monitor.unwrap_or(1800))
@@ -920,5 +931,56 @@ mod tests {
         assert_eq!(default_width(2400, Some(1728)), 1728);
         // Without a monitor, the sane max applies.
         assert_eq!(default_width(2400, None), 1800);
+    }
+
+
+    #[test]
+    fn size_env_parses_wxh() {
+        assert_eq!(parse_size("1100x760"), Some((1100, 760)));
+        assert_eq!(parse_size("700x480"), Some((700, 480)));
+        assert_eq!(parse_size("x480"), None);
+        assert_eq!(parse_size("700"), None);
+    }
+
+    #[test]
+    fn fit_size_grows_for_new_strips_never_shrinks_never_past_the_monitor() {
+        let mon = Some((1512, 982));
+        assert_eq!(fit_size(1400, (1100, 760), (1100, 760), mon), Some((1400, 760)));
+        assert_eq!(fit_size(600, (1100, 760), (1100, 760), mon), None);
+        assert_eq!(fit_size(3000, (1100, 760), (1100, 760), mon), Some((1512, 760)));
+        assert_eq!(fit_size(1100, (1100, 1200), (1100, 1200), mon), Some((1100, 982)));
+    }
+
+    #[test]
+    fn fit_size_leaves_a_user_resized_window_alone() {
+        assert_eq!(fit_size(1400, (900, 700), (1100, 760), Some((1512, 982))), None);
+    }
+
+    #[test]
+    fn fit_size_generated() {
+        let mut s = 3u64;
+        let mut next = move |m: u64| -> i32 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) % m) as i32
+        };
+        for _ in 0..2000 {
+            let natural = 200 + next(2800);
+            let cur = (300 + next(1700), 200 + next(1000));
+            let last = if next(2) == 0 { cur } else { (300 + next(1700), 200 + next(1000)) };
+            let mon = if next(4) == 0 { None } else { Some((800 + next(2200), 600 + next(1400))) };
+            let got = fit_size(natural, cur, last, mon);
+            if cur != last {
+                assert_eq!(got, None, "user-resized {cur:?} vs {last:?}");
+                continue;
+            }
+            if let Some((w, h)) = got {
+                assert!(w >= cur.0 && h <= cur.1, "{got:?} from {cur:?}");
+                if let Some((mw, _)) = mon {
+                    if cur.0 <= mw {
+                        assert!(w <= mw, "{got:?} past monitor {mw}");
+                    }
+                }
+            }
+        }
     }
 }

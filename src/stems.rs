@@ -3,6 +3,7 @@
 use crate::config::Config;
 use crate::dash::{Fft, BANDS};
 use crate::dsp::{envelope, onsets, xcorr_lag, BP_RATE};
+use crate::lat::Lat;
 use crate::models::{self, ModelSet, S_FILES, U_FILES};
 use crate::notes::{synth_events, Note, Synth, Timeline, MIDI_LAG, STEMS};
 use crate::pw::{die_with_parent, Graph};
@@ -12,7 +13,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -264,6 +265,10 @@ pub struct Shared {
     pub timeline: Arc<Mutex<Timeline>>,
     pub played: Arc<AtomicU64>,
     pub status: Arc<Mutex<String>>,
+    /// Speed stop (0 = today's full processing), read once per session by `transcribe` (#83).
+    pub speed: Arc<AtomicUsize>,
+    /// Attack-to-note-out latency of this session's notes (#83).
+    pub lat: Arc<Mutex<Lat>>,
     current: Arc<AtomicU64>,
     gen: u64,
 }
@@ -275,6 +280,8 @@ impl Shared {
             timeline: Arc::new(Mutex::new(Timeline::new())),
             played: Arc::new(AtomicU64::new(0)),
             status: Arc::new(Mutex::new(String::new())),
+            speed: Arc::new(AtomicUsize::new(0)),
+            lat: Arc::new(Mutex::new(Lat::new())),
             current: Arc::new(AtomicU64::new(0)),
             gen: 0,
         }
@@ -340,28 +347,27 @@ impl Kids {
         Ok(pipes)
     }
 
-    /// Kills and reaps every child with `role`.
-    fn kill(&self, role: &str) {
+    /// Stops and reaps every child with `role`; returns each one's signal (#83).
+    fn kill(&self, role: &str) -> Vec<Option<i32>> {
         let mut g = lock(&self.0);
+        let mut cs: Vec<Child> = Vec::new();
         let mut i = 0;
         while i < g.kids.len() {
             if g.kids[i].0 == role {
-                let (_, mut c) = g.kids.remove(i);
-                let _ = c.kill();
-                let _ = c.wait();
+                cs.push(g.kids.remove(i).1);
             } else {
                 i += 1;
             }
         }
+        term_then_kill(&mut cs, STOP_GRACE)
     }
 
-    fn kill_all(&self) {
+    /// Stops and reaps every child; returns each one's signal (#83).
+    fn kill_all(&self) -> Vec<Option<i32>> {
         let mut g = lock(&self.0);
         g.dead = true;
-        for (_, mut c) in g.kids.drain(..) {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
+        let mut cs: Vec<Child> = g.kids.drain(..).map(|(_, c)| c).collect();
+        term_then_kill(&mut cs, STOP_GRACE)
     }
 }
 
@@ -1021,6 +1027,31 @@ pub(crate) fn chunk_line(shared: &Shared, sent: &mut [Vec<Note>; 3], id: u64) ->
 
 pub(crate) fn in_window(t: f64, end_t: f64) -> bool {
     t >= end_t - 1.0 && t < end_t - 0.5
+}
+
+/// The keep slice of a window at a speed stop (#83): `[end - guard - KEEP, end - guard)`. Stop 0 is `in_window`.
+pub(crate) fn in_keep(t: f64, end_t: f64, _guard: f64) -> bool {
+    in_window(t, end_t)
+}
+
+/// `window_notes` with the speed stop's guard (#83). Stub: today's window until the engine unit lands.
+pub fn window_notes_g(g: Option<&mut Grids>, end_t: f64, open: &mut Vec<Note>, _guard: f64) -> (Vec<Note>, Vec<(f64, Note)>) {
+    window_notes(g, end_t, open)
+}
+
+/// How long a stopped capture child gets after SIGTERM before SIGKILL (#83).
+const STOP_GRACE: Duration = Duration::from_millis(500);
+
+/// SIGTERM to each child still running, one shared grace, then SIGKILL; reaps all and returns each signal (#83).
+/// Stub: SIGKILL at once.
+fn term_then_kill(cs: &mut [Child], _grace: Duration) -> Vec<Option<i32>> {
+    use std::os::unix::process::ExitStatusExt;
+    cs.iter_mut()
+        .map(|c| {
+            let _ = c.kill();
+            c.wait().ok().and_then(|s| s.signal())
+        })
+        .collect()
 }
 
 /// Mono of the last `frames` frames of an interleaved stereo ring, zero-padded at the front.
@@ -1971,6 +2002,187 @@ mod tests {
             assert_eq!(client.len(), want.len(), "seed {seed}: client {client:?} vs {want:?}");
             for (c, w) in client.iter().zip(want.iter()) {
                 assert!(c.pitch == w.pitch && (c.t - w.t).abs() < 1e-6 && (c.dur - w.dur).abs() < 1e-6, "seed {seed}: client {c:?} vs {w:?}");
+            }
+        }
+    }
+
+
+    /// #83: the keep slice moves with the speed stop's guard.
+    #[test]
+    fn in_keep_moves_with_the_guard() {
+        let end = 10.0;
+        assert!(in_keep(end - 0.2, end, 0.15));
+        assert!(!in_keep(end - 0.2, end, 0.5));
+    }
+
+    /// #83: an onset 0.3 s before the window end is emitted at the fast stop and waits at stop 0.
+    #[test]
+    fn window_notes_g_emits_sooner_at_the_fast_stop() {
+        let end_t = 10.0;
+        let ws = end_t - BP_SAMPLES as f64 / BP_RATE as f64;
+        let on = end_t - 0.3;
+        let notes = [(on, end_t + 0.2, 48usize)];
+        let mut g = held_win(ws, &notes);
+        let (fast, _) = window_notes_g(Some(&mut g), end_t, &mut Vec::new(), 0.15);
+        let mut g = held_win(ws, &notes);
+        let (full, _) = window_notes_g(Some(&mut g), end_t, &mut Vec::new(), 0.5);
+        assert!(fast.iter().any(|n| (n.t - on).abs() < 0.05), "fast stop: {fast:?}");
+        assert!(!full.iter().any(|n| (n.t - on).abs() < 0.05), "stop 0 keeps today's window: {full:?}");
+    }
+
+    /// #83: committed notes are timed once each, and none before the anchor.
+    #[test]
+    fn commit_records_latency_once_anchored() {
+        let sh = Shared::new();
+        let note = |t: f64| Note { t, dur: 0.2, pitch: 60, vel: 90 };
+        commit(&sh, 1, &[note(0.4)], &[], &[]);
+        assert!(lock(&sh.lat).summary().is_none(), "nothing before the anchor");
+        lock(&sh.lat).anchor(Instant::now(), 0.0);
+        commit(&sh, 1, &[note(0.5), note(0.9)], &[], &[]);
+        assert_eq!(lock(&sh.lat).summary().map(|s| s.n), Some(2));
+    }
+
+    /// #83: a running capture child gets SIGTERM first, and Stop does not wait out the grace.
+    #[test]
+    fn stop_sends_sigterm_first_and_does_not_wait_out_the_grace() {
+        let mut cs = vec![Command::new("sleep").arg("30").spawn().unwrap()];
+        let t = Instant::now();
+        let sig = term_then_kill(&mut cs, STOP_GRACE);
+        assert_eq!(sig, vec![Some(15)]);
+        assert!(t.elapsed() < Duration::from_millis(400), "{:?}", t.elapsed());
+    }
+
+    /// #83: a child that ignores SIGTERM is killed when the grace runs out.
+    #[test]
+    fn stop_kills_a_child_that_ignores_sigterm_after_the_grace() {
+        let mut cs = vec![Command::new("sh").args(["-c", "trap '' TERM; exec sleep 30"]).spawn().unwrap()];
+        std::thread::sleep(Duration::from_millis(200));
+        let t = Instant::now();
+        let sig = term_then_kill(&mut cs, STOP_GRACE);
+        assert_eq!(sig, vec![Some(9)]);
+        let e = t.elapsed();
+        assert!(e >= Duration::from_millis(500) && e < Duration::from_secs(2), "{e:?}");
+    }
+
+    /// #83: Kids::kill_all asks every child to stop with SIGTERM.
+    #[test]
+    fn kids_kill_all_stops_with_sigterm() {
+        let k = Kids::new();
+        k.spawn("tap", "sleep", &["30".to_string()], false, false).unwrap();
+        assert_eq!(k.kill_all(), vec![Some(15)]);
+    }
+
+    /// #83: a child that has already exited is never signalled (its pid may be reused).
+    #[test]
+    fn stop_never_signals_a_child_that_already_exited() {
+        let mut c = Command::new("true").spawn().unwrap();
+        let t = Instant::now();
+        while c.try_wait().unwrap().is_none() {
+            assert!(t.elapsed() < Duration::from_secs(5), "true did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(term_then_kill(std::slice::from_mut(&mut c), STOP_GRACE), vec![None]);
+    }
+
+    /// #83 I1: at every stop, each time lies in one or two keep slices, so no note falls in a gap.
+    #[test]
+    fn keep_slices_leave_no_gap_at_any_stop() {
+        let step = CHUNK as f64 / RATE as f64;
+        let mut s = 7u64;
+        let times: Vec<f64> = (0..10_000).map(|_| 2.0 + lcg_f(&mut s) * 58.0).collect();
+        for &g in &crate::lat::GUARD_S {
+            for &t in &times {
+                let hits = (1..=140usize).filter(|&k| in_keep(t, k as f64 * step, g)).count();
+                assert!((1..=2).contains(&hits), "guard {g} t {t}: {hits} slices");
+            }
+        }
+    }
+
+    /// #83 I1: stop 0 keeps exactly today's window.
+    #[test]
+    fn stop_0_is_todays_window() {
+        let mut s = 11u64;
+        for _ in 0..10_000 {
+            let end_t = 2.0 + lcg_f(&mut s) * 58.0;
+            let t = end_t - 1.5 + lcg_f(&mut s) * 2.0;
+            assert_eq!(in_keep(t, end_t, crate::lat::GUARD_S[0]), t >= end_t - 1.0 && t < end_t - 0.5);
+        }
+    }
+
+    /// Like `carry_out`, with the speed stop's guard.
+    fn carry_out_g(notes: &[(f64, f64, usize)], ks: &[usize], guard: f64) -> Vec<crate::notes::Note> {
+        let step = CHUNK as f64 / RATE as f64;
+        let win_len = BP_SAMPLES as f64 / BP_RATE as f64;
+        let mut open = Vec::new();
+        let mut tl = crate::notes::Timeline::new();
+        for &k in ks {
+            let end_t = k as f64 * step;
+            let mut g = held_win(end_t - win_len, notes);
+            let (new, ext) = window_notes_g(Some(&mut g), end_t, &mut open, guard);
+            tl.add(1, &new);
+            tl.extend(1, &ext);
+        }
+        tl.window(1, 0.0, 100.0)
+    }
+
+    /// I59 and I62 at every speed stop: one note per strike, no same-pitch overlap.
+    #[test]
+    fn carry_invariant_one_note_per_strike_at_every_stop() {
+        let tol = 1.5 / crate::sep::FPS;
+        let step = CHUNK as f64 / RATE as f64;
+        let win_len = BP_SAMPLES as f64 / BP_RATE as f64;
+        for &g in &crate::lat::GUARD_S {
+            for seed in 1..=40u64 {
+                let chain = chain_notes(seed);
+                let mut open: Vec<Note> = Vec::new();
+                let mut tl = crate::notes::Timeline::new();
+                for k in 1..=28usize {
+                    let end_t = k as f64 * step;
+                    let mut gr = held_win(end_t - win_len, &chain);
+                    let (new, ext) = window_notes_g(Some(&mut gr), end_t, &mut open, g);
+                    tl.add(1, &new);
+                    tl.extend(1, &ext);
+                    let mut ps: Vec<u8> = open.iter().map(|n| n.pitch).collect();
+                    ps.sort();
+                    ps.dedup();
+                    assert_eq!(ps.len(), open.len(), "guard {g} seed {seed} window {k}: two open notes share a pitch");
+                }
+                let out = tl.window(1, 0.0, 100.0);
+                for p in [40usize, 52] {
+                    let mut want: Vec<(f64, f64)> = chain.iter().filter(|c| c.2 == p).map(|c| (c.0, c.1)).collect();
+                    let mut got: Vec<(f64, f64)> = out.iter().filter(|n| n.pitch as usize == p + 21).map(|n| (n.t, n.t + n.dur)).collect();
+                    want.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    got.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    assert_eq!(got.len(), want.len(), "guard {g} seed {seed} pitch {}: {got:?} vs {want:?}", p + 21);
+                    for i in 0..got.len() {
+                        assert!((got[i].0 - want[i].0).abs() <= tol, "guard {g} seed {seed} pitch {} note {i}: onset {} vs {}", p + 21, got[i].0, want[i].0);
+                        assert!((got[i].1 - want[i].1).abs() <= tol, "guard {g} seed {seed} pitch {} note {i}: end {} vs {}", p + 21, got[i].1, want[i].1);
+                        if i > 0 {
+                            assert!(got[i].0 >= got[i - 1].1 - 1e-9, "guard {g} seed {seed} pitch {}: notes {} and {} overlap", p + 21, i - 1, i);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// I62 at every speed stop: a run of dropped windows never splits or shortens a held note.
+    #[test]
+    fn carry_invariant_held_note_survives_dropped_windows_at_every_stop() {
+        let tol = 1.5 / crate::sep::FPS;
+        for &g in &crate::lat::GUARD_S {
+            for seed in 1..=40u64 {
+                let mut s = seed;
+                let on = 0.6 + lcg_f(&mut s) * 1.0;
+                let len = 8.0 + lcg_f(&mut s) * 4.0;
+                let k0 = 8 + (lcg_f(&mut s) * 4.0) as usize;
+                let d = 1 + (lcg_f(&mut s) * 7.0) as usize;
+                let ks: Vec<usize> = (1..=30usize).filter(|k| !(k0..k0 + d).contains(k)).collect();
+                let out = carry_out_g(&[(on, on + len, 48)], &ks, g);
+                assert_eq!(out.len(), 1, "guard {g} seed {seed}, dropped {k0}..{}: {out:?}", k0 + d);
+                let m = &out[0];
+                assert!((m.t - on).abs() <= tol, "guard {g} seed {seed}: onset {} vs {on}", m.t);
+                assert!((m.t + m.dur - (on + len)).abs() <= tol, "guard {g} seed {seed}: end {} vs {}", m.t + m.dur, on + len);
             }
         }
     }

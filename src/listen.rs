@@ -1,12 +1,13 @@
 //! `wavelink-mixer listen`: a headless listening session for #77. One capture child, no playback child, commands on
 //! stdin (`save PATH`, `stop`, `stats`, `quit`), status on stderr, numbers on stdout.
 #![allow(dead_code)]
-use crate::notes::save_once;
+use crate::lat::Summary;
+use crate::notes::{save_once, Saved};
 use crate::stemcfg::{Plays, SepEngine};
 use crate::stems::{Opts, Session, Shared, MAC_TAP, MAC_TAP_MUTE, WAV_TAP};
 use std::fs::OpenOptions;
 use std::io::BufRead;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -69,6 +70,8 @@ pub enum Cmd {
     Start(bool),
     Stop,
     Stats,
+    /// `lat`: the measured latency of the current stop (#83).
+    Lat,
     Quit,
     Unknown(String),
 }
@@ -203,7 +206,7 @@ fn poll(m: &mut Meter, shared: &Shared, chunks: &mpsc::Receiver<(u64, [Vec<f32>;
     }
 }
 
-fn start_session(tap: &str, engine: SepEngine, shared: &Shared, ctx: mpsc::Sender<(u64, [Vec<f32>; 3])>) -> Session {
+pub(crate) fn start_session(tap: &str, engine: SepEngine, shared: &Shared, ctx: mpsc::Sender<(u64, [Vec<f32>; 3])>) -> Session {
     let opts = Opts { tap: tap.to_string(), tap_sink: false, engine, plays: Plays::Nothing, out: String::new(), buf_ms: 0, tier: None };
     Session::start(opts, shared.clone(), Some(ctx))
 }
@@ -311,6 +314,7 @@ pub fn run(args: &[String]) -> i32 {
                     }
                     println!("{}", stats_line(&stats_of(&meter, &shared)));
                 }
+                Cmd::Lat => {}
                 Cmd::Quit => break,
                 Cmd::Unknown(w) => eprintln!("listen: unknown command: {w}"),
             }
@@ -322,9 +326,81 @@ pub fn run(args: &[String]) -> i32 {
     0
 }
 
+/// Where Save MIDI writes by default: the Listen page's folder (`expand_home` resolves the `~`).
+pub const MIDI_DIR: &str = "~/Music/wavelink-midi";
+
+/// The `--speed N` flag (#83), taken out of the args before `parse` sees them. 0 is full processing (today), 3 the
+/// fastest stop; anything else is an error.
+pub fn parse_speed(args: &[String]) -> Result<(Vec<String>, usize), String> {
+    Ok((args.to_vec(), 0))
+}
+
+/// The `lat` line (#83): the measured latency of the current stop, or `n=0` before any note.
+pub fn lat_line(_speed: usize, _s: Option<Summary>) -> String {
+    String::new()
+}
+
+/// A new `listen-STAMP.mid` in `dir`: `-2`, `-3`, .. when the name is taken; never an overwrite (#83).
+pub fn create_in(_dir: &Path, _stamp: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+    Err(std::io::Error::other("not implemented"))
+}
+
+/// The tap for the Listen page (#83): the WAV when one is given, else the Mac system tap, else none.
+pub fn page_tap(_wav: Option<String>, _macos: bool) -> Option<String> {
+    None
+}
+
+/// One listening session driven by the Listen page: start, stop, poll and save over one `Shared` (#83).
+pub struct Ctl {
+    pub shared: Shared,
+    pub speed: usize,
+    tap: String,
+    session: Option<Session>,
+    chunks: Option<mpsc::Receiver<(u64, [Vec<f32>; 3])>>,
+    peak: f32,
+}
+
+impl Ctl {
+    pub fn new(tap: String) -> Ctl {
+        Ctl { shared: Shared::new(), speed: 0, tap, session: None, chunks: None, peak: 0.0 }
+    }
+
+    pub fn running(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// Refuses over unsaved notes unless `new`, as `start_refusal` does for the CLI.
+    pub fn start(&mut self, _new: bool) -> Result<(), String> {
+        Err("not implemented".into())
+    }
+
+    pub fn stop(&mut self) {
+        self.session = None;
+        self.chunks = None;
+    }
+
+    /// Drains the level meter; true when the capture has been silent for five seconds.
+    pub fn poll(&mut self) -> bool {
+        false
+    }
+
+    pub fn save(&mut self, _dir: &Path, _stamp: &str) -> Result<Saved, String> {
+        Err("not implemented".into())
+    }
+
+    pub fn unsaved(&self) -> usize {
+        self.shared.timeline.lock().map(|t| t.unsaved()).unwrap_or(0)
+    }
+
+    pub fn lat(&self) -> Option<Summary> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notes::Note;
 
     fn s(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|x| x.to_string()).collect()
@@ -410,5 +486,68 @@ mod tests {
         assert!(!silent(0.0, 4.9), "under five seconds is not judged");
         assert!(silent(0.0, 5.0));
         assert!(!silent(0.01, 10.0), "audible output is not silence");
+    }
+
+
+    #[test]
+    fn parse_speed_takes_the_flag_out_and_defaults_to_0() {
+        assert_eq!(parse_speed(&s(&["--wav", "a.wav", "--speed", "2"])), Ok((s(&["--wav", "a.wav"]), 2)));
+        assert_eq!(parse_speed(&s(&["--wav", "a.wav"])), Ok((s(&["--wav", "a.wav"]), 0)));
+    }
+
+    #[test]
+    fn parse_speed_rejects_out_of_range() {
+        assert!(parse_speed(&s(&["--speed", "4"])).is_err());
+        assert!(parse_speed(&s(&["--speed"])).is_err());
+        assert!(parse_speed(&s(&["--speed", "x"])).is_err());
+    }
+
+    #[test]
+    fn cmd_lat() {
+        assert_eq!(cmd("lat"), Cmd::Lat);
+    }
+
+    #[test]
+    fn lat_line_format() {
+        let sm = Summary { n: 41, min: 212.0, p50: 431.0, p95: 655.0, max: 702.0 };
+        assert_eq!(lat_line(3, Some(sm)), "lat speed=3 guard_ms=150 n=41 min_ms=212 p50_ms=431 p95_ms=655 max_ms=702");
+        assert_eq!(lat_line(3, None), "lat speed=3 guard_ms=150 n=0");
+    }
+
+    #[test]
+    fn create_in_never_overwrites() {
+        let d = std::env::temp_dir().join(format!("wl83-{}-create", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (a, _fa) = create_in(&d, "20260101-000000").expect("first file");
+        let (b, _fb) = create_in(&d, "20260101-000000").expect("second file");
+        assert_ne!(a, b);
+        assert!(a.exists() && b.exists());
+    }
+
+    #[test]
+    fn page_tap_prefers_the_wav_then_the_mac_tap() {
+        assert_eq!(page_tap(Some("a.wav".into()), true), Some("wav:a.wav".to_string()));
+        assert_eq!(page_tap(None, true), Some(MAC_TAP.to_string()));
+        assert_eq!(page_tap(None, false), None);
+    }
+
+    #[test]
+    fn ctl_start_refuses_over_unsaved_notes() {
+        let mut c = Ctl::new("mac:system".into());
+        c.shared.timeline.lock().unwrap().add(1, &[Note { t: 0.5, dur: 0.2, pitch: 60, vel: 90 }]);
+        let e = c.start(false).expect_err("must refuse over unsaved notes");
+        assert!(e.contains("unsaved"), "{e}");
+        assert!(!c.running());
+    }
+
+    #[test]
+    fn ctl_save_writes_the_closed_notes_into_the_folder() {
+        let d = std::env::temp_dir().join(format!("wl83-{}-save", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let mut c = Ctl::new("mac:system".into());
+        c.shared.timeline.lock().unwrap().add(1, &[Note { t: 0.5, dur: 0.2, pitch: 60, vel: 90 }]);
+        let saved = c.save(&d, "20260101-000000").expect("save");
+        assert_eq!(saved.per_stem[1], 1);
+        assert!(saved.path.starts_with(&d) && saved.path.exists(), "{:?}", saved.path);
     }
 }

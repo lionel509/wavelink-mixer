@@ -4,7 +4,7 @@
 //!   wavelink-mixer remote-token [--rotate]   print the host/port/token a remote client needs (new token with --rotate)
 //!   wavelink-mixer remote [ADDR]             the mixer console for another computer (a MacBook), a client of the engine
 //!   wavelink-mixer fake-engine [PORT]        a test engine (no PipeWire) for the remote console demo
-//!   wavelink-mixer listen [--wav FILE | --mute] [--engine live|quality]   headless listening session (#77)
+//!   wavelink-mixer listen [--wav FILE | --mute] [--engine live|quality] [--speed 0..3]   headless listening session (#77)
 //!   wavelink-mixer mac-tap [--mute]          Mac system-audio capture child, raw f32 stereo 44.1 kHz on stdout (#77)
 //!   wavelink-mixer wav-tap FILE              the same stdout contract fed from a WAV at real-time pace (#77)
 mod config;
@@ -15,7 +15,9 @@ mod notes;
 mod sep;
 mod stemcfg;
 mod stems;
+mod lat;
 mod listen;
+mod listen_view;
 mod mactap;
 #[cfg(test)]
 #[path = "test_breaker_back.rs"]

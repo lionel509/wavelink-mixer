@@ -105,3 +105,56 @@ fn demo_script_unmuted_with_no_flags_starts_listen() {
     let got = std::fs::read_to_string(&rec).unwrap_or_default();
     assert_eq!(got.trim(), "argc=1", "{got} / {}", String::from_utf8_lossy(&o.stdout));
 }
+
+/// One numeric field of a `key=value` line.
+fn field(line: &str, key: &str) -> f64 {
+    let pre = format!("{key}=");
+    line.split_whitespace()
+        .find_map(|w| w.strip_prefix(pre.as_str()))
+        .unwrap_or_else(|| panic!("no {key} in {line}"))
+        .parse()
+        .unwrap()
+}
+
+/// #83: `lat` reports the measured latency, and the fastest stop answers sooner than stop 0.
+#[test]
+fn lat_line_reports_latency_and_the_fast_stop_is_faster() {
+    let d = tmp("lat");
+    let w = d.join("in.wav");
+    write_wav(&w, 12);
+    let run = |speed: &str| -> String {
+        let (out, _) = listen(&["--wav", w.to_str().unwrap(), "--speed", speed], &[(11000, "lat"), (100, "stop"), (200, "quit")]);
+        out.lines().find(|l| l.starts_with("lat ")).unwrap_or_else(|| panic!("no lat line: {out}")).to_string()
+    };
+    let slow = run("0");
+    let fast = run("3");
+    assert!(field(&slow, "n") > 0.0 && field(&fast, "n") > 0.0, "{slow} / {fast}");
+    assert!(field(&fast, "min_ms") >= field(&fast, "guard_ms") - 30.0, "{fast}");
+    assert!(field(&fast, "p50_ms") < field(&slow, "p50_ms") - 150.0, "{slow} / {fast}");
+}
+
+/// #83 I3: without `lat`, stdout carries only the lines main prints.
+#[test]
+fn stdout_gains_no_line_unless_lat_is_asked() {
+    let d = tmp("stdout");
+    let w = d.join("in.wav");
+    write_wav(&w, 6);
+    let (out, _) = listen(&["--wav", w.to_str().unwrap()], &[(1000, "stats"), (4000, "stop"), (200, "quit")]);
+    for l in out.lines() {
+        assert!(["stats ", "started", "saved ", "save"].iter().any(|p| l.starts_with(p)), "unexpected stdout line: {l}");
+    }
+}
+
+/// #83 I4: a stopped session costs no CPU.
+#[test]
+fn a_stopped_session_costs_no_cpu() {
+    let d = tmp("idle");
+    let w = d.join("in.wav");
+    write_wav(&w, 12);
+    let (out, _) = listen(&["--wav", w.to_str().unwrap()], &[(2000, "stop"), (300, "stats"), (3000, "stats"), (200, "quit")]);
+    let stats: Vec<&str> = out.lines().filter(|l| l.starts_with("stats ")).collect();
+    assert!(stats.len() >= 3, "{out}");
+    let a = field(stats[stats.len() - 2], "cpu_total_s");
+    let b = field(stats[stats.len() - 1], "cpu_total_s");
+    assert!(b - a < 0.02, "cpu_total_s moved {a} -> {b} while stopped");
+}
