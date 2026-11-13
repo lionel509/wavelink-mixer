@@ -18,6 +18,18 @@ pub trait Backend: Send + Sync + 'static {
     fn node_is_raop(&self, _node: &str) -> bool {
         false
     }
+    /// Newest graph snapshot for full windows; None when PipeWire is not readable.
+    fn graph_wire(&self) -> Option<pw::GraphWire> {
+        None
+    }
+    /// The config bus (its `id`) whose node this is: its `names::bus(id)` node or its Hardware `target`. None = not a bus.
+    fn bus_for_node(&self, _cfg: &Config, _node: u64) -> Option<String> {
+        None
+    }
+    /// Drop any cached graph so the next read is fresh.
+    fn refresh_graph(&self) {}
+    /// Apply a live write that is not a bus volume/mute (those go through `apply`).
+    fn pw(&self, _cmd: &p::PwCmd) {}
 }
 
 /// The real thing: wpctl/pw-cli on the same nodes the GUI drives, meters from pw-record taps.
@@ -64,6 +76,42 @@ impl PwBackend {
 }
 
 impl Backend for PwBackend {
+    fn refresh_graph(&self) {
+        self.graph.lock().unwrap_or_else(|e| e.into_inner()).1 = None;
+    }
+
+    fn graph_wire(&self) -> Option<pw::GraphWire> {
+        self.graph().as_ref().map(pw::GraphWire::from)
+    }
+
+    fn bus_for_node(&self, cfg: &Config, node: u64) -> Option<String> {
+        let g = self.graph()?;
+        let name = g.nodes.iter().find(|n| n.id == node)?.name.clone();
+        cfg.buses.iter().find_map(|b| {
+            let target = matches!(&b.kind, crate::config::BusKind::Hardware { target } if *target == name);
+            (names::bus(&b.id) == name || target).then(|| b.id.clone())
+        })
+    }
+
+    fn pw(&self, cmd: &p::PwCmd) {
+        match cmd {
+            p::PwCmd::SetVolume { id, v } => pw::set_volume(*id, *v),
+            p::PwCmd::SetVolumeMute { id, v, mute } => pw::set_volume_mute(*id, *v, *mute),
+            p::PwCmd::SetMute { id, mute } => pw::set_mute(*id, *mute),
+            p::PwCmd::SetEq { id, eq } => pw::set_eq(*id, eq),
+            p::PwCmd::SetRack { id, rack } => match serde_json::from_value::<crate::config::Rack>(rack.clone()) {
+                Ok(r) => pw::set_rack(*id, &r),
+                Err(e) => eprintln!("pw set_rack: bad rack: {e}"),
+            },
+            p::PwCmd::MoveStream { serial, sink } => pw::move_stream(*serial, sink),
+            p::PwCmd::Link { out, inp } => pw::link(out, inp),
+            p::PwCmd::LinkSide { out, inp, side } => match serde_json::from_value::<pw::Side>(serde_json::Value::String(side.clone())) {
+                Ok(sd) => pw::link_side(out, inp, sd),
+                Err(e) => eprintln!("pw link_side: bad side {side:?}: {e}"),
+            },
+        }
+    }
+
     fn node_is_raop(&self, node: &str) -> bool {
         self.node(node).is_some_and(|(_, raop)| raop)
     }
@@ -258,9 +306,21 @@ pub struct FakeBackend {
     pub applied: Mutex<Vec<p::Command>>,
     pub meter_calls: AtomicU64,
     pub stopped: AtomicU64,
+    pub graph: Mutex<Option<pw::GraphWire>>,
+    pub bus_nodes: Mutex<HashMap<u64, String>>,
+    pub pw_log: Mutex<Vec<p::PwCmd>>,
 }
 
 impl Backend for FakeBackend {
+    fn graph_wire(&self) -> Option<pw::GraphWire> {
+        self.graph.lock().unwrap().clone()
+    }
+    fn bus_for_node(&self, _cfg: &Config, node: u64) -> Option<String> {
+        self.bus_nodes.lock().unwrap().get(&node).cloned()
+    }
+    fn pw(&self, cmd: &p::PwCmd) {
+        self.pw_log.lock().unwrap().push(cmd.clone());
+    }
     fn node_is_raop(&self, node: &str) -> bool {
         self.raop_nodes.lock().unwrap().iter().any(|n| n == node)
     }

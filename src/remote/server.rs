@@ -56,6 +56,10 @@ struct Client {
     id: u64,
     tx: SyncSender<Arc<str>>,
     meters: Arc<AtomicBool>,
+    /// Hello.full: wants whole-config and graph snapshots (the full mixer window).
+    full: bool,
+    /// The last graph JSON queued for this client (full clients only).
+    last_graph: Option<Arc<str>>,
 }
 
 struct Core {
@@ -64,11 +68,28 @@ struct Core {
     clients: Vec<Client>,
     /// time-based raise limit per physical bus, shared by every client
     limits: HashMap<String, safety::RaiseLimiter>,
+    /// last known gain per limiter key, kept after a bus is deleted so a later re-add can't restart from 'unknown'
+    last_gain: HashMap<String, f64>,
     /// the Macs (and other hosts) that report their own output volume (#37)
     hosts: Vec<p::Host>,
     /// host id -> the connection that owns it (the newest registration wins)
     host_owner: HashMap<String, u64>,
 }
+
+/// Limiter key: the hardware target a bus plays to (so a new id on the same device shares its history), else the id.
+fn target_key(kind: Option<&config::BusKind>, id: &str) -> String {
+    match kind {
+        Some(config::BusKind::Hardware { target }) => format!("target:{target}"),
+        _ => id.to_string(),
+    }
+}
+
+fn limit_key(cfg: &Config, bus: &str) -> String {
+    target_key(cfg.buses.iter().find(|b| b.id == bus).map(|b| &b.kind), bus)
+}
+
+/// last_gain is client-influenced (target strings come from saved configs): past this many entries, drop the ones no bus uses.
+const LAST_GAIN_CAP: usize = 256;
 
 struct Token {
     value: String,
@@ -275,7 +296,7 @@ pub fn serve(opts: Opts, backend: Arc<dyn Backend>) -> std::io::Result<Running> 
     let inner = Arc::new(Inner {
         opts,
         backend,
-        core: Mutex::new(Core { cfg, state, clients: vec![], limits: HashMap::new(), hosts: vec![], host_owner: HashMap::new() }),
+        core: Mutex::new(Core { cfg, state, clients: vec![], limits: HashMap::new(), last_gain: HashMap::new(), hosts: vec![], host_owner: HashMap::new() }),
         next_id: AtomicU64::new(1),
         stop: AtomicBool::new(false),
         conns: AtomicUsize::new(0),
@@ -342,6 +363,39 @@ pub fn serve(opts: Opts, backend: Arc<dyn Backend>) -> std::io::Result<Running> 
             if was_on {
                 let cfg = inner.lock().cfg.clone();
                 inner.backend.meters(&cfg, false);
+            }
+        })?;
+    }
+    {
+        let inner = inner.clone();
+        std::thread::Builder::new().name("remote-graph".into()).spawn(move || {
+            while !inner.stop.load(Ordering::SeqCst) {
+                let any_full = inner.lock().clients.iter().any(|c| c.full);
+                if any_full {
+                    if let Some(g) = inner.backend.graph_wire() {
+                        if let Ok(v) = serde_json::to_value(&g) {
+                            let json: Arc<str> = ServerMsg::Graph { graph: v }.to_json().into();
+                            let mut core = inner.lock();
+                            core.clients.retain_mut(|c| {
+                                if !c.full || c.last_graph.as_ref() == Some(&json) {
+                                    return true;
+                                }
+                                match c.tx.try_send(json.clone()) {
+                                    Ok(()) => {
+                                        c.last_graph = Some(json.clone());
+                                        true
+                                    }
+                                    Err(TrySendError::Full(_)) => {
+                                        eprintln!("wavelink remote: client {} stalled, dropping it", c.id);
+                                        false
+                                    }
+                                    Err(TrySendError::Disconnected(_)) => false,
+                                }
+                            });
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(500));
             }
         })?;
     }
@@ -447,12 +501,33 @@ impl Inner {
         });
     }
 
+    /// Queue `msg` for the `full` clients only.
+    fn broadcast_full(core: &mut Core, msg: &ServerMsg) {
+        let s: Arc<str> = msg.to_json().into();
+        core.clients.retain(|c| {
+            if !c.full {
+                return true;
+            }
+            match c.tx.try_send(s.clone()) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) => {
+                    eprintln!("wavelink remote: client {} stalled, dropping it", c.id);
+                    false
+                }
+                Err(TrySendError::Disconnected(_)) => false,
+            }
+        });
+    }
+
     /// Make `cfg` current and tell everyone what changed (deltas, or a full state on structure changes).
     fn publish(&self, core: &mut Core, cfg: Config) {
         let mut new = model::to_state(&cfg, &self.opts.name, core.state.rev + 1, &self.opts.caps);
         new.hosts = core.hosts.clone();
         core.cfg = cfg;
         self.publish_state(core, new);
+        if let Ok(config) = serde_json::to_value(&core.cfg) {
+            Self::broadcast_full(core, &ServerMsg::Config { config });
+        }
     }
 
     /// Edit the host list (engine memory only, never config.json) and tell everyone what changed.
@@ -554,7 +629,8 @@ impl Inner {
                 }
                 let cur = b.gain_db;
                 if *db > cur {
-                    let allowed = core.limits.entry(bus.clone()).or_default().allowed(now, cur);
+                    let key = limit_key(&core.cfg, bus);
+                    let allowed = core.limits.entry(key).or_default().allowed(now, cur);
                     if *db > allowed {
                         *db = allowed.max(cur);
                         checked.note = Some(format!("raised at most {} dB per {} s", safety::MAX_RAISE_PER_WINDOW_DB, safety::RAISE_WINDOW_S));
@@ -576,13 +652,180 @@ impl Inner {
         for (bus, before, _) in raised {
             // what was really written (model::apply clamps to the ceiling too)
             let after = cfg.buses.iter().find(|b| b.id == bus).map(|b| b.gain_db).unwrap_or(before);
-            core.limits.entry(bus).or_default().record(now, before, after);
+            let key = limit_key(&cfg, &bus);
+            core.last_gain.insert(key.clone(), after);
+            core.limits.entry(key).or_default().record(now, before, after);
         }
         for c in &checked.cmds {
             self.backend.apply(&cfg, c);
         }
         self.publish(&mut core, cfg);
         ServerMsg::Ack { id, ok: true, error: None, note: checked.note }
+    }
+
+    /// A full window's save: 3-way merge `mine` against config.json (`base` = common ancestor), with every
+    /// bus-gain raise capped exactly as `SetBusGain` from this connection would be (I1).
+    fn save_config(&self, id: u64, base: serde_json::Value, mine: serde_json::Value, unlocked: &dyn Fn(&str) -> bool) -> ServerMsg {
+        let nack = |e: String| ServerMsg::Ack { id, ok: false, error: Some(e), note: None };
+        let (mut base, mut mine): (Config, Config) = match (serde_json::from_value(base), serde_json::from_value(mine)) {
+            (Ok(b), Ok(m)) => (b, m),
+            (Err(e), _) | (_, Err(e)) => return nack(format!("bad config: {e}")),
+        };
+        let mut core = self.lock();
+        self.sync_disk(&mut core);
+        let now = self.now_s();
+        let mut notes: Vec<String> = vec![];
+        let mut raised = vec![];
+        // remember every hub bus's gain by target before this save can delete it
+        let hub_cfg = core.cfg.clone();
+        for b in hub_cfg.buses.iter().filter(|b| matches!(b.kind, config::BusKind::Hardware { .. })) {
+            // two hub buses on one target: keep the lowest, the safe baseline for a later re-add
+            let g = core.last_gain.entry(limit_key(&hub_cfg, &b.id)).or_insert(b.gain_db);
+            *g = g.min(b.gain_db);
+        }
+        // a remote save never moves a bus's ceiling or kind: the hub's values win (their lift would defeat I1)
+        for b in mine.buses.iter_mut() {
+            if let Some(h) = core.cfg.buses.iter().find(|h| h.id == b.id) {
+                b.max_db = h.max_db;
+                b.kind = h.kind.clone();
+            } else if let config::BusKind::Hardware { target } = &b.kind {
+                // a new raop bus never brings its own lift: its ceiling is at most what a local bus would get
+                if b.is_raop(self.backend.node_is_raop(target)) {
+                    b.max_db = Some(b.max_db.filter(|m| m.is_finite()).map_or(config::RAOP_MAX_DB, |m| m.min(config::RAOP_MAX_DB)));
+                }
+            }
+        }
+        // a bus the hub does not know yet has no live state to check against: it is only capped by its own ceiling
+        let want: Vec<(String, f64)> = mine
+            .buses
+            .iter()
+            .filter(|b| base.buses.iter().find(|o| o.id == b.id).map_or(true, |o| b.gain_db > o.gain_db))
+            .map(|b| (b.id.clone(), b.gain_db))
+            .collect();
+        for (bus, db) in want {
+            if core.state.bus(&bus).is_none() {
+                // not live (new id, offline target, or deleted and re-added): the rule is per target,
+                // the same one SetBusGain applies (raise window + 6 dB step), never skipped
+                let key = target_key(mine.buses.iter().find(|b| b.id == bus).map(|b| &b.kind), &bus);
+                let known = hub_cfg.buses.iter().find(|b| b.id == bus).map(|b| b.gain_db).or_else(|| core.last_gain.get(&key).copied());
+                let Some(cur) = known else { continue }; // a target the hub has never seen: ceiling-clamped only
+                let allowed = core.limits.entry(key).or_default().allowed(now, cur).min(cur + safety::MAX_STEP_DB);
+                if db > allowed {
+                    let capped = allowed.max(cur);
+                    if let Some(b) = mine.buses.iter_mut().find(|b| b.id == bus) {
+                        b.gain_db = capped;
+                    }
+                    notes.push(format!("raised at most {} dB per {} s", safety::MAX_RAISE_PER_WINDOW_DB, safety::RAISE_WINDOW_S));
+                }
+                // recorded after the save applies, under the post-apply target key, so the next save sees this raise
+                raised.push((bus.clone(), cur));
+                continue;
+            }
+            let cmd = p::Command::SetBusGain { bus: bus.clone(), db, unlock: false };
+            let mut checked = match safety::check(&cmd, &core.state, unlocked) {
+                Ok(c) => c,
+                Err(e) => return nack(e.to_string()),
+            };
+            for c in checked.cmds.iter_mut() {
+                if let p::Command::SetBusGain { bus, db, .. } = c {
+                    if let Some(b) = core.state.bus(bus).filter(|b| b.physical()) {
+                        let cur = b.gain_db;
+                        if *db > cur {
+                            let key = limit_key(&hub_cfg, bus);
+                            let allowed = core.limits.entry(key).or_default().allowed(now, cur);
+                            if *db > allowed {
+                                *db = allowed.max(cur);
+                                checked.note = Some(format!("raised at most {} dB per {} s", safety::MAX_RAISE_PER_WINDOW_DB, safety::RAISE_WINDOW_S));
+                            }
+                        }
+                        raised.push((bus.clone(), cur));
+                    }
+                }
+            }
+            for c in &checked.cmds {
+                model::apply(&mut mine, c); // writes the capped (ceiling-clamped) gain back into `mine`
+            }
+            notes.extend(checked.note);
+        }
+        // every bus in the candidate, new ones included, ends at or under its own ceiling (raop ceiling by props)
+        for b in mine.buses.iter_mut() {
+            if let config::BusKind::Hardware { target } = &b.kind {
+                let raop = self.backend.node_is_raop(target);
+                b.persist_raop_ceiling(raop);
+            }
+            b.gain_db = b.clamp_db(b.gain_db);
+        }
+        match mine.save_merged_with(&mut base, &self.opts.cfg_path, &|_, _, _| {}) {
+            Err(e) => nack(e),
+            Ok(_) => {
+                let cfg = Config::load_from(&self.opts.cfg_path);
+                for (bus, before) in raised {
+                    let after = cfg.buses.iter().find(|b| b.id == bus).map_or(before, |b| b.gain_db);
+                    let key = limit_key(&cfg, &bus);
+                    core.last_gain.insert(key.clone(), after);
+                    core.limits.entry(key).or_default().record(now, before, after);
+                }
+                if core.last_gain.len() > LAST_GAIN_CAP {
+                    let live: std::collections::HashSet<String> = cfg.buses.iter().map(|b| limit_key(&cfg, &b.id)).collect();
+                    core.last_gain.retain(|k, _| live.contains(k));
+                }
+                self.publish(&mut core, cfg);
+                ServerMsg::Ack { id, ok: true, error: None, note: if notes.is_empty() { None } else { Some(notes.join("; ")) } }
+            }
+        }
+    }
+
+    /// A full window's live PipeWire write. A bus node's volume/mute goes through `command` (the caps); the rest is raw.
+    fn pw(&self, id: u64, cmd: p::PwCmd, unlocked: &dyn Fn(&str) -> bool) -> ServerMsg {
+        let node = match &cmd {
+            p::PwCmd::SetVolume { id, .. } | p::PwCmd::SetVolumeMute { id, .. } | p::PwCmd::SetMute { id, .. } => Some(*id),
+            _ => None,
+        };
+        let bus = node.and_then(|n| {
+            let cfg = self.lock().cfg.clone();
+            self.backend.bus_for_node(&cfg, n)
+        });
+        let Some(bus) = bus else {
+            // fail closed: a volume/mute write is raw only to a node the hub can see and that is not a bus or raop node
+            if let Some(n) = node {
+                let find = |w: Option<crate::pw::GraphWire>| w.and_then(|w| w.nodes.into_iter().find(|x| x.id == n)).map(|x| x.name);
+                let mut name = find(self.backend.graph_wire());
+                if name.is_none() {
+                    self.backend.refresh_graph(); // a node under 2 s old is not in the cache yet
+                    name = find(self.backend.graph_wire());
+                }
+                let refuse = |e: &str| ServerMsg::Ack { id, ok: false, error: Some(e.into()), note: None };
+                match name {
+                    None => return refuse("hub can't see that PipeWire node"),
+                    Some(nm) if nm.starts_with("bus_") || config::is_raop_name(&nm) || self.backend.node_is_raop(&nm) => {
+                        return refuse("that node is a bus or speaker the hub does not map: refused");
+                    }
+                    Some(_) => {}
+                }
+            }
+            self.backend.pw(&cmd);
+            return ServerMsg::Ack { id, ok: true, error: None, note: None };
+        };
+        let gain = |v: f64| p::Command::SetBusGain { bus: bus.clone(), db: config::vol_to_db(v), unlock: false };
+        let mute = |m: bool| p::Command::SetBusMute { bus: bus.clone(), mute: m };
+        match cmd {
+            p::PwCmd::SetVolume { v, .. } => self.command(id, &gain(v), unlocked),
+            p::PwCmd::SetMute { mute: m, .. } => self.command(id, &mute(m), unlocked),
+            p::PwCmd::SetVolumeMute { v, mute: m, .. } => {
+                let g = self.command(id, &gain(v), unlocked);
+                match self.command(id, &mute(m), unlocked) {
+                    ServerMsg::Ack { ok: false, error, .. } => match g {
+                        ServerMsg::Ack { error: e0, note, .. } => {
+                            let err = [e0, error].into_iter().flatten().collect::<Vec<_>>().join("; ");
+                            ServerMsg::Ack { id, ok: false, error: Some(err), note }
+                        }
+                        other => other,
+                    },
+                    _ => g,
+                }
+            }
+            _ => unreachable!(),
+        }
     }
 
     fn conn(self: &Arc<Self>, s: TcpStream, peer: SocketAddr) -> Result<(), String> {
@@ -661,7 +904,18 @@ impl Inner {
                 self.register_host(&mut core, id, h);
             }
             let _ = tx.try_send(ServerMsg::State { state: core.state.clone() }.to_json().into());
-            core.clients.push(Client { id, tx, meters: meters.clone() });
+            let mut last_graph = None;
+            if hello.full {
+                if let Ok(config) = serde_json::to_value(&core.cfg) {
+                    let _ = tx.try_send(ServerMsg::Config { config }.to_json().into());
+                }
+                if let Some(Ok(graph)) = self.backend.graph_wire().map(|g| serde_json::to_value(&g)) {
+                    let j: Arc<str> = ServerMsg::Graph { graph }.to_json().into();
+                    let _ = tx.try_send(j.clone());
+                    last_graph = Some(j);
+                }
+            }
+            core.clients.push(Client { id, tx, meters: meters.clone(), full: hello.full, last_graph });
         }
         let who = format!("client {id} ({}, {peer})", sanitize_name(&hello.client));
         eprintln!("wavelink remote: {who} connected");
@@ -710,6 +964,17 @@ impl Inner {
                         Ok(ClientMsg::Command { id, cmd }) => {
                             let live = |b: &str| unlocks.get(b).is_some_and(|t| *t > Instant::now());
                             Some(self.command(id, &cmd, &live))
+                        }
+                        Ok(ClientMsg::SaveConfig { .. } | ClientMsg::Pw { .. }) if self.token_gen.load(Ordering::SeqCst) != token_gen => {
+                            break Err("token rotated".into());
+                        }
+                        Ok(ClientMsg::SaveConfig { id, base, mine }) => {
+                            let live = |b: &str| unlocks.get(b).is_some_and(|t| *t > Instant::now());
+                            Some(self.save_config(id, base, mine, &live))
+                        }
+                        Ok(ClientMsg::Pw { id, cmd }) => {
+                            let live = |b: &str| unlocks.get(b).is_some_and(|t| *t > Instant::now());
+                            Some(self.pw(id, cmd, &live))
                         }
                         Ok(ClientMsg::Subscribe { meters: on }) => {
                             meters.store(on, Ordering::Relaxed);

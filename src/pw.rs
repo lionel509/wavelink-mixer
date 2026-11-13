@@ -4,8 +4,9 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Node {
     pub id: u64,
     pub serial: u64,
@@ -25,6 +26,35 @@ pub struct Node {
     pub owned: bool,
     /// an output of the engine's own child graph (virtual mic): never a capture candidate
     pub child_out: bool,
+}
+
+/// Graph on the wire: the public parts; `by_name` is rebuilt on the way in.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct GraphWire {
+    pub nodes: Vec<Node>,
+    pub links: Vec<(u64, u64)>,
+    pub cookie: u64,
+}
+
+impl From<&Graph> for GraphWire {
+    fn from(g: &Graph) -> Self {
+        let mut links: Vec<(u64, u64)> = g.links.iter().copied().collect();
+        links.sort_unstable();
+        GraphWire { nodes: g.nodes.clone(), links, cookie: g.cookie }
+    }
+}
+
+impl From<GraphWire> for Graph {
+    fn from(w: GraphWire) -> Self {
+        let mut g = Graph { cookie: w.cookie, links: w.links.into_iter().collect(), ..Default::default() };
+        for n in &w.nodes {
+            if !n.name.is_empty() {
+                g.by_name.insert(n.name.clone(), g.nodes.len());
+            }
+            g.nodes.push(n.clone());
+        }
+        g
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -318,7 +348,8 @@ pub fn link(out: &str, inp: &str) {
     }
 }
 /// Which side of a stereo pair the listener hears (L/R solo, monitor only). Left = the left signal in both ears.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
 pub enum Side { #[default] Stereo, Left, Right }
 /// (keep, drop) port pairs `(output_X, input_Y)` for `side`; together they are the four FL/FR pairs.
 pub fn side_ports(side: Side) -> (Vec<(&'static str, &'static str)>, Vec<(&'static str, &'static str)>) {
@@ -699,5 +730,21 @@ mod tests {
         let left = held().iter().filter(|&&q| q == p).count();
         HELD.lock().unwrap_or_else(|e| e.into_inner()).retain(|&q| q != p);
         assert_eq!(left, 1, "one reap of pid {p} forgot both holds");
+    }
+
+    #[test]
+    fn graph_wire_round_trip_keeps_name_lookups_and_links() {
+        let node = |id: u64, name: &str| Node { id, serial: id + 100, name: name.into(), ..Default::default() };
+        let w = GraphWire { nodes: vec![node(1, "x"), node(2, "y"), node(3, "z")], links: vec![(1, 3)], cookie: 42 };
+        let json = serde_json::to_string(&w).unwrap();
+        let g: Graph = serde_json::from_str::<GraphWire>(&json).unwrap().into();
+        assert_eq!(g.node("y").map(|n| n.id), Some(2), "by_name rebuilt");
+        assert!(g.has("z"));
+        assert!(g.linked("x", "z"));
+        assert!(!g.linked("y", "z"));
+        assert_eq!(g.cookie, 42);
+        let back = GraphWire::from(&g);
+        assert_eq!(back.links, vec![(1, 3)]);
+        assert_eq!(back.cookie, 42);
     }
 }
