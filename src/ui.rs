@@ -1680,6 +1680,8 @@ impl App {
             cell.set_tooltip_text(Some(&format!("{} → {} {}", inp.name, b.id.to_uppercase(), b.name)));
             let t = gtk::ToggleButton::with_label(&b.id.to_uppercase());
             t.add_css_class("route");
+            // lit in the output's colour (A1 is the same colour on every strip), not the channel's
+            t.add_css_class(&format!("to-{}", b.id));
             t.set_tooltip_text(Some(&format!("Send {} to {} (on/off)", inp.name, b.name)));
             t.set_active(r.on);
             cell.append(&t);
@@ -1897,6 +1899,12 @@ impl App {
         let cls = format!("bus-{}", bus.id);
         strip.add_css_class(&cls);
         self.colour_css(&cls, &bus.color, css);
+        // every channel's send button to this output uses the output's colour; .strip + .to-x
+        // outranks the channel rule `.in-x button.route:checked`
+        css.push_str(&format!(
+            ".strip button.route.to-{}:checked {{ background-color: {}; background-image: none; color: #111; box-shadow: none; }}\n",
+            bus.id, bus.color
+        ));
         strip.append(&screw_row());
         let bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         bar.add_css_class("colorbar");
