@@ -775,6 +775,20 @@ mod tests {
     }
 
     #[test]
+    fn save_once_failed_write_leaves_no_file() {
+        let mut t = Timeline::new();
+        final_note(&mut t, 1, n(1.0, 0.5, 40, 90));
+        let tl = std::sync::Mutex::new(t);
+        let path = std::env::temp_dir().join(format!("wm-save-once-{}-partial.mid", std::process::id()));
+        std::fs::write(&path, b"").unwrap();
+        let p2 = path.clone();
+        // read-only handle: the open succeeds, the write fails
+        let err = save_once(&tl, true, move || std::fs::File::open(&p2).map(|f| (p2.clone(), f)));
+        assert!(err.is_err());
+        assert!(!path.exists(), "a failed write must not leave its file behind");
+    }
+
+    #[test]
     fn save_once_no_notes_does_not_open() {
         let tl = std::sync::Mutex::new(Timeline::new());
         let mut opened = false;

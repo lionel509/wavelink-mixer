@@ -669,8 +669,26 @@ mod tests {
     }
 
     #[test]
+    fn wav_pcm_reads_24bit_and_extensible() {
+        let (_, v) = wav_pcm(&wav_bytes(1, 24, 2, 44100, &[0, 0, 0x40, 0, 0, 0xc0])).unwrap();
+        assert_eq!(v, vec![0.5, -0.5]);
+        let mut w = wav_bytes(0xfffe, 24, 2, 44100, &[0, 0, 0x40, 0, 0, 0xc0]);
+        w.splice(36..36, [0u8; 8]); // grow the fmt chunk to 24 bytes: cbSize, validBits, mask, then subformat
+        w[16] = 40;
+        w.splice(36..44, [22, 0, 24, 0, 3, 0, 0, 0]);
+        w.splice(44..44, [1, 0, 0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71]);
+        let (_, v) = wav_pcm(&w).unwrap();
+        assert_eq!(v, vec![0.5, -0.5]);
+    }
+
+    #[test]
+    fn resampler_rejects_a_zero_rate() {
+        assert!(Resampler::new(0.0).is_err());
+    }
+
+    #[test]
     fn wav_pcm_rejects_other_formats() {
-        assert!(wav_pcm(&wav_bytes(1, 24, 2, 44100, &[0u8; 12])).is_err(), "24-bit");
+        assert!(wav_pcm(&wav_bytes(1, 8, 2, 44100, &[0u8; 12])).is_err(), "8-bit");
         assert!(wav_pcm(&wav_bytes(1, 16, 6, 44100, &[0u8; 24])).is_err(), "6 channels");
         assert!(wav_pcm(b"not a wav file at all").is_err());
     }

@@ -369,6 +369,7 @@ mod tests {
     #[test]
     fn cmd_parses_lines() {
         assert_eq!(cmd("save /tmp/out dir/x.mid"), Cmd::Save("/tmp/out dir/x.mid".to_string()));
+        assert_eq!(cmd("save"), Cmd::Save(String::new()));
         assert_eq!(cmd("start"), Cmd::Start(false));
         assert_eq!(cmd("start new"), Cmd::Start(true));
         assert_eq!(cmd("stop"), Cmd::Stop);
