@@ -696,12 +696,13 @@ pub fn apply_levels(cfg: &Config, g: &Graph) {
     }
 }
 
-/// Streams not on the channel the Apps panel picked for them: (serial, sink). Apps that set their own
-/// target.object land elsewhere every time they reopen a stream, so this runs every tick (#24).
-pub fn pick_moves(cfg: &Config, g: &Graph) -> Vec<(u64, String)> {
+/// New streams (serials not in `seen`) not on the channel the Apps panel picked for them: (serial, sink).
+/// Apps that set their own target.object land elsewhere on every reopen (new serial); a stream already
+/// seen is left alone, so a later hand move sticks (#24).
+pub fn pick_moves(cfg: &Config, g: &Graph, seen: &mut std::collections::HashSet<u64>) -> Vec<(u64, String)> {
     g.nodes
         .iter()
-        .filter(|n| n.class == "Stream/Output/Audio")
+        .filter(|n| n.class == "Stream/Output/Audio" && seen.insert(n.serial))
         .filter_map(|n| {
             let sink = cfg.app_picks.get(&n.pick_key())?;
             (g.nodes.iter().any(|t| &t.name == sink) && !g.targets_of(n.id).iter().any(|t| &t.name == sink)).then(|| (n.serial, sink.clone()))
@@ -787,6 +788,7 @@ pub fn run() {
     let mut piano: Option<(Child, std::process::ChildStdin)> = None;
     let mut piano_sent: Option<crate::config::PianoCfg> = None;
     let mut last_quantum: Option<u32> = None;
+    let mut picked_seen = std::collections::HashSet::new();
     eprintln!("wavelink engine: config {}", Config::path().display());
     crate::remote::start(); // LAN control server on its own threads (#26)
 
@@ -954,7 +956,7 @@ pub fn run() {
             apply_levels(&cfg, &g);
             levels_pending = false;
         }
-        for (serial, sink) in pick_moves(&cfg, &g) {
+        for (serial, sink) in pick_moves(&cfg, &g, &mut picked_seen) {
             pw::move_stream(serial, &sink);
         }
         std::thread::sleep(Duration::from_secs(1));
@@ -976,9 +978,11 @@ mod tests {
         g.links = [(4, 3), (5, 3), (6, 3)].into_iter().collect(); // all three sit on the device, as when an app asks for its own target
         let mut cfg = Config::default_config();
         cfg.app_picks = [("discord|WEBRTC VoiceEngine".to_string(), "ch_a".to_string()), ("DiscordCanary|WEBRTC VoiceEngine".to_string(), "ch_b".to_string())].into();
-        assert_eq!(pick_moves(&cfg, &g), vec![(14, "ch_a".to_string()), (15, "ch_b".to_string())]);
+        let mut seen = Default::default();
+        assert_eq!(pick_moves(&cfg, &g, &mut seen), vec![(14, "ch_a".to_string()), (15, "ch_b".to_string())]);
+        assert!(pick_moves(&cfg, &g, &mut seen).is_empty(), "a stream already seen (hand-moved) is left alone");
         g.links = [(4, 1), (5, 3), (6, 3)].into_iter().collect(); // discord is already on its pick
-        assert_eq!(pick_moves(&cfg, &g), vec![(15, "ch_b".to_string())]);
+        assert_eq!(pick_moves(&cfg, &g, &mut Default::default()), vec![(15, "ch_b".to_string())]);
     }
 
     #[test]

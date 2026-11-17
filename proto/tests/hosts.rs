@@ -25,11 +25,11 @@ fn state_without_hosts_field_still_parses_and_hello_host_is_optional() {
 
 #[test]
 fn host_hello_round_trips_and_is_absent_when_none() {
-    let plain = ClientMsg::Hello(Hello { protocol: PROTOCOL_VERSION, token: "t".into(), client: "c".into(), meters: false, host: None });
+    let plain = ClientMsg::Hello(Hello { protocol: PROTOCOL_VERSION, token: "t".into(), client: "c".into(), meters: false, host: None, full: false });
     assert!(!plain.to_json().contains("\"host\""), "a Hello without a host must not carry the key");
 
     let hh = HostHello { id: "macbook".into(), label: "MacBook".into(), volume: 42, mute: true };
-    let with = ClientMsg::Hello(Hello { protocol: PROTOCOL_VERSION, token: "t".into(), client: "c".into(), meters: false, host: Some(hh.clone()) });
+    let with = ClientMsg::Hello(Hello { protocol: PROTOCOL_VERSION, token: "t".into(), client: "c".into(), meters: false, host: Some(hh.clone()), full: false });
     let back = ClientMsg::from_json(&with.to_json()).unwrap();
     assert_eq!(back, with);
     match back {
