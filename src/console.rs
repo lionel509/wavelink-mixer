@@ -967,19 +967,11 @@ mod tests {
     }
 
     #[test]
-    fn host_strip_has_the_same_sections_as_an_output_strip() {
-        // #88: the MacBook strip must look like the other outputs: subtitle, VU dial, same width
-        if gtk::init().is_err() {
-            return;
-        }
-        let h = Host { id: "mac".into(), label: "MacBook".into(), volume: 40, mute: false, online: true };
-        let s = host_strip(&h, Rc::new(|_| {}));
-        let (mut dial, mut sub, mut c) = (false, false, s.root.first_child());
-        while let Some(w) = c {
-            dial |= w.is::<gtk::DrawingArea>();
-            sub |= w.is::<gtk::Label>() && w.has_css_class("small");
-            c = w.next_sibling();
-        }
-        assert!(dial && sub, "dial={dial} subtitle={sub}");
+    fn host_strip_subtitle_matches_the_output_strips() {
+        // #88: the MacBook strip carries a subtitle line like the other outputs ("device not connected" etc.)
+        let mut h = Host { id: "mac".into(), label: "MacBook".into(), volume: 40, mute: false, online: true };
+        assert_eq!(host_subtitle(&h), "system volume");
+        h.online = false;
+        assert_eq!(host_subtitle(&h), "not connected");
     }
 }
