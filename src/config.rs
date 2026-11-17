@@ -297,6 +297,10 @@ pub struct Config {
     /// Graph quantum forced by the engine (`pw-metadata clock.force-quantum`); 0 = don't force.
     #[serde(default = "default_quantum", deserialize_with = "lenient_quantum")]
     pub quantum: u32,
+    /// Apps-panel picks: `Node::pick_key` -> channel sink. The engine re-applies them whenever a stream
+    /// opens on another sink (apps that set their own target.object undo WirePlumber's restore, #24).
+    #[serde(default)]
+    pub app_picks: BTreeMap<String, String>,
 }
 
 fn default_quantum() -> u32 {
@@ -522,6 +526,7 @@ impl Config {
         Config {
             piano: PianoCfg::default(),
             quantum: 256,
+            app_picks: BTreeMap::new(),
             inputs: vec![
                 input("system", "System", "#8e8e93", "clean", r(&[("a1", true, 0.0), ("b1", true, -13.3)])),
                 input("spotify", "Spotify", "#1ed760", "music", r(&[("a1", true, -4.2), ("b1", true, -36.0)])),

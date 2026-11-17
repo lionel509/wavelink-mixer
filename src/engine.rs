@@ -696,6 +696,19 @@ pub fn apply_levels(cfg: &Config, g: &Graph) {
     }
 }
 
+/// Streams not on the channel the Apps panel picked for them: (serial, sink). Apps that set their own
+/// target.object land elsewhere every time they reopen a stream, so this runs every tick (#24).
+pub fn pick_moves(cfg: &Config, g: &Graph) -> Vec<(u64, String)> {
+    g.nodes
+        .iter()
+        .filter(|n| n.class == "Stream/Output/Audio")
+        .filter_map(|n| {
+            let sink = cfg.app_picks.get(&n.pick_key())?;
+            (g.nodes.iter().any(|t| &t.name == sink) && !g.targets_of(n.id).iter().any(|t| &t.name == sink)).then(|| (n.serial, sink.clone()))
+        })
+        .collect()
+}
+
 /// Which node a bus fader controls: the device itself for hardware buses, else the bus sink.
 pub fn bus_fader_node(b: &crate::config::Bus) -> String {
     match &b.kind {
@@ -940,6 +953,9 @@ pub fn run() {
         if levels_pending && missing_names.is_empty() {
             apply_levels(&cfg, &g);
             levels_pending = false;
+        }
+        for (serial, sink) in pick_moves(&cfg, &g) {
+            pw::move_stream(serial, &sink);
         }
         std::thread::sleep(Duration::from_secs(1));
     }
