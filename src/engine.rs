@@ -950,6 +950,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn picks_tell_same_named_apps_apart_and_skip_streams_already_there() {
+        let node = |id, serial, name: &str, class: &str, bin: &str| crate::pw::Node { id, serial, name: name.into(), class: class.into(), app: "WEBRTC VoiceEngine".into(), bin: bin.into(), ..Default::default() };
+        let mut g = Graph::default();
+        g.nodes = vec![
+            node(1, 11, "ch_a", "Audio/Sink", ""), node(2, 12, "ch_b", "Audio/Sink", ""), node(3, 13, "out", "Audio/Sink", ""),
+            node(4, 14, "s1", "Stream/Output/Audio", "discord"), node(5, 15, "s2", "Stream/Output/Audio", "DiscordCanary"), node(6, 16, "s3", "Stream/Output/Audio", "other"),
+        ];
+        g.links = [(4, 3), (5, 3), (6, 3)].into_iter().collect(); // all three sit on the device, as when an app asks for its own target
+        let mut cfg = Config::default_config();
+        cfg.app_picks = [("discord|WEBRTC VoiceEngine".to_string(), "ch_a".to_string()), ("DiscordCanary|WEBRTC VoiceEngine".to_string(), "ch_b".to_string())].into();
+        assert_eq!(pick_moves(&cfg, &g), vec![(14, "ch_a".to_string()), (15, "ch_b".to_string())]);
+        g.links = [(4, 1), (5, 3), (6, 3)].into_iter().collect(); // discord is already on its pick
+        assert_eq!(pick_moves(&cfg, &g), vec![(15, "ch_b".to_string())]);
+    }
+
+    #[test]
     fn patience_scales_with_size_and_backs_off() {
         assert!(graph_patience(56, 0) > Duration::from_secs(5) + Duration::from_millis(1500));
         assert!(graph_patience(130, 0) > graph_patience(56, 0));
