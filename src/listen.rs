@@ -1,7 +1,9 @@
 //! `wavelink-mixer listen`: a headless listening session for #77. One capture child, no playback child, commands on
 //! stdin (`save PATH`, `stop`, `stats`, `quit`), status on stderr, numbers on stdout.
 #![allow(dead_code)]
+use crate::config::glib_home;
 use crate::notes::save_once;
+use crate::ui::stems_view::{create_midi, stamp};
 use crate::stemcfg::{Plays, SepEngine};
 use crate::stems::{Opts, Session, Shared, MAC_TAP, MAC_TAP_MUTE, WAV_TAP};
 use std::fs::OpenOptions;
@@ -73,12 +75,12 @@ pub enum Cmd {
     Unknown(String),
 }
 
-/// One stdin line. `save` takes the rest of the line as the path.
+/// One stdin line. `save` takes the rest of the line as the path (none: the GUI's default name).
 pub fn cmd(line: &str) -> Cmd {
     let t = line.trim();
     let (w, rest) = t.split_once(' ').unwrap_or((t, ""));
     match w {
-        "save" if !rest.is_empty() => Cmd::Save(rest.to_string()),
+        "save" => Cmd::Save(rest.to_string()),
         "start" => Cmd::Start(rest.trim() == "new"),
         "stop" => Cmd::Stop,
         "stats" => Cmd::Stats,
@@ -258,6 +260,9 @@ pub fn run(args: &[String]) -> i32 {
                 Cmd::Save(path) => {
                     let running = session.is_some();
                     let res = save_once(&shared.timeline, running, || {
+                        if path.is_empty() {
+                            return create_midi(&glib_home(), "listen", &stamp());
+                        }
                         let path = expand_home(&path);
                         let f = OpenOptions::new().write(true).create_new(true).open(&path)?;
                         Ok((path, f))

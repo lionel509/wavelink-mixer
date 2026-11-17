@@ -265,7 +265,10 @@ pub fn save_once(
         Some((lo.min(n.t), hi.max(n.t + n.dur)))
     });
     let written = open().and_then(|(path, mut f)| {
-        f.write_all(&midi_bytes(&tracks))?;
+        f.write_all(&midi_bytes(&tracks)).map_err(|e| {
+            let _ = std::fs::remove_file(&path); // no partial file, so a retry to the same path can create_new it
+            e
+        })?;
         Ok(path)
     });
     match written {
@@ -780,7 +783,7 @@ mod tests {
         final_note(&mut t, 1, n(1.0, 0.5, 40, 90));
         let tl = std::sync::Mutex::new(t);
         let path = std::env::temp_dir().join(format!("wm-save-once-{}-partial.mid", std::process::id()));
-        std::fs::write(&path, b"").unwrap();
+        drop(std::fs::File::options().write(true).create(true).truncate(true).open(&path).unwrap());
         let p2 = path.clone();
         // read-only handle: the open succeeds, the write fails
         let err = save_once(&tl, true, move || std::fs::File::open(&p2).map(|f| (p2.clone(), f)));
