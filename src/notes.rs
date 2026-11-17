@@ -265,7 +265,10 @@ pub fn save_once(
         Some((lo.min(n.t), hi.max(n.t + n.dur)))
     });
     let written = open().and_then(|(path, mut f)| {
-        f.write_all(&midi_bytes(&tracks))?;
+        f.write_all(&midi_bytes(&tracks)).map_err(|e| {
+            let _ = std::fs::remove_file(&path); // no partial file, so a retry to the same path can create_new it
+            e
+        })?;
         Ok(path)
     });
     match written {
@@ -772,6 +775,20 @@ mod tests {
         let saved = save_once(&tl, true, move || std::fs::File::options().write(true).create(true).truncate(true).open(&p2).map(|f| (p2.clone(), f))).unwrap();
         assert_eq!(saved.per_stem, [0, 1, 0], "the retry still has the note");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_once_failed_write_leaves_no_file() {
+        let mut t = Timeline::new();
+        final_note(&mut t, 1, n(1.0, 0.5, 40, 90));
+        let tl = std::sync::Mutex::new(t);
+        let path = std::env::temp_dir().join(format!("wm-save-once-{}-partial.mid", std::process::id()));
+        drop(std::fs::File::options().write(true).create(true).truncate(true).open(&path).unwrap());
+        let p2 = path.clone();
+        // read-only handle: the open succeeds, the write fails
+        let err = save_once(&tl, true, move || std::fs::File::open(&p2).map(|f| (p2.clone(), f)));
+        assert!(err.is_err());
+        assert!(!path.exists(), "a failed write must not leave its file behind");
     }
 
     #[test]

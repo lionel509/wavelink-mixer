@@ -290,9 +290,16 @@ pub(super) fn midi_path(home: &Path, source: &str, stamp: &str) -> PathBuf {
     home.join("Music").join("wavelink").join(format!("stems-{source}-{stamp}.mid"))
 }
 
+pub(crate) fn stamp() -> String {
+    glib::DateTime::now_local()
+        .and_then(|d| d.format("%Y%m%d-%H%M%S"))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|_| "unknown-time".into())
+}
+
 /// Creates the first free name from `midi_path`, then `-2`, `-3`... on a clash, so a save never replaces
 /// an earlier file (two saves in the same second share a stamp). Never overwrites: `create_new`.
-pub(super) fn create_midi(home: &Path, source: &str, stamp: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+pub(crate) fn create_midi(home: &Path, source: &str, stamp: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
     let first = midi_path(home, source, stamp);
     if let Some(dir) = first.parent() {
         std::fs::create_dir_all(dir)?;
@@ -465,11 +472,7 @@ fn save_midi(app: &Rc<App>, v: &View) {
     let running = app.stems.session.borrow().is_some();
     let src = source_id(app, v).unwrap_or_else(|| "spotify".into());
     let res = save_once(&app.stems.shared.timeline, running, || {
-        let stamp = glib::DateTime::now_local()
-            .and_then(|d| d.format("%Y%m%d-%H%M%S"))
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| "unknown-time".into());
-        create_midi(&glib_home(), &src, &stamp)
+        create_midi(&glib_home(), &src, &stamp())
     });
     match res {
         Ok(s) if s.path.as_os_str().is_empty() => v.status.set_text(&save_status("", 0, s.held)),

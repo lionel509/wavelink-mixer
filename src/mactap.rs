@@ -24,8 +24,11 @@ pub struct Resampler {
 }
 
 impl Resampler {
-    pub fn new(in_rate: f64) -> Self {
-        Resampler { step: in_rate / RATE_OUT as f64, pos: 0.0, prev: [0.0; 2], primed: false }
+    pub fn new(in_rate: f64) -> Result<Self, String> {
+        if !(in_rate > 0.0) {
+            return Err(format!("bad sample rate {in_rate}"));
+        }
+        Ok(Resampler { step: in_rate / RATE_OUT as f64, pos: 0.0, prev: [0.0; 2], primed: false })
     }
 
     /// `inp` is interleaved stereo at the input rate; the output is appended to `out`, interleaved stereo at 44100.
@@ -54,7 +57,7 @@ impl Resampler {
     }
 }
 
-/// Reads a RIFF/WAVE file: PCM 16-bit or IEEE float 32-bit, mono or stereo. Returns (rate, interleaved stereo).
+/// Reads a RIFF/WAVE file: PCM 16/24-bit or IEEE float 32-bit, plain or WAVE_FORMAT_EXTENSIBLE, mono or stereo. Returns (rate, interleaved stereo).
 pub fn wav_pcm(bytes: &[u8]) -> Result<(u32, Vec<f32>), String> {
     if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err("not a RIFF/WAVE file".into());
@@ -72,7 +75,10 @@ pub fn wav_pcm(bytes: &[u8]) -> Result<(u32, Vec<f32>), String> {
             if body.len() < 16 {
                 return Err("short fmt chunk".into());
             }
-            let tag = u16::from_le_bytes([body[0], body[1]]);
+            let mut tag = u16::from_le_bytes([body[0], body[1]]);
+            if tag == 0xfffe && body.len() >= 26 {
+                tag = u16::from_le_bytes([body[24], body[25]]); // extensible: the real format starts the SubFormat GUID
+            }
             let ch = u16::from_le_bytes([body[2], body[3]]);
             let rate = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
             let bits = u16::from_le_bytes([body[14], body[15]]);
@@ -84,7 +90,7 @@ pub fn wav_pcm(bytes: &[u8]) -> Result<(u32, Vec<f32>), String> {
     }
     let (tag, ch, rate, bits) = fmt.ok_or("no fmt chunk")?;
     let data = data.ok_or("no data chunk")?;
-    if !matches!((tag, bits), (1, 16) | (3, 32)) {
+    if !matches!((tag, bits), (1, 16) | (1, 24) | (3, 32)) {
         return Err(format!("unsupported WAV: format {tag}, {bits} bits"));
     }
     if ch != 1 && ch != 2 {
@@ -92,6 +98,8 @@ pub fn wav_pcm(bytes: &[u8]) -> Result<(u32, Vec<f32>), String> {
     }
     let samples: Vec<f32> = if bits == 16 {
         data.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).collect()
+    } else if bits == 24 {
+        data.chunks_exact(3).map(|b| (i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8) as f32 / 8388608.0).collect()
     } else {
         data.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
     };
@@ -161,7 +169,13 @@ pub fn wav_run(args: &[String]) -> i32 {
     };
     if rate != RATE_OUT {
         let mut out = Vec::new();
-        Resampler::new(rate as f64).push(&pcm, &mut out);
+        match Resampler::new(rate as f64) {
+            Ok(mut r) => r.push(&pcm, &mut out),
+            Err(e) => {
+                eprintln!("wav-tap: {path}: {e}");
+                return 1;
+            }
+        }
         pcm = out;
     }
     // fd 1 belongs to the parent; never close it here.
@@ -194,7 +208,13 @@ pub fn run(args: &[String]) -> i32 {
         eprintln!("mac-tap: {e}");
         return 1;
     }
-    let mut rs = Resampler::new(tap.rate);
+    let mut rs = match Resampler::new(tap.rate) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("mac-tap: {e}");
+            return 1;
+        }
+    };
     // fd 1 belongs to the parent; never close it here.
     let mut stdout = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(1) });
     let mut pcm = Vec::new();
@@ -599,11 +619,11 @@ mod tests {
     #[test]
     fn resampler_output_does_not_depend_on_block_split() {
         let input = sine(4800, 48000.0, 440.0);
-        let mut whole = Resampler::new(48000.0);
+        let mut whole = Resampler::new(48000.0).unwrap();
         let mut a = Vec::new();
         whole.push(&input, &mut a);
         let mut s = 9u64;
-        let mut split = Resampler::new(48000.0);
+        let mut split = Resampler::new(48000.0).unwrap();
         let mut b = Vec::new();
         let mut at = 0;
         while at < input.len() {
@@ -618,7 +638,7 @@ mod tests {
     #[test]
     fn resampler_48k_to_44k1_keeps_length_and_pitch() {
         let input = sine(48000, 48000.0, 440.0);
-        let mut r = Resampler::new(48000.0);
+        let mut r = Resampler::new(48000.0).unwrap();
         let mut out = Vec::new();
         r.push(&input, &mut out);
         let frames = out.len() / 2;
@@ -630,7 +650,7 @@ mod tests {
     #[test]
     fn resampler_same_rate_is_passthrough() {
         let input = sine(1000, 44100.0, 300.0);
-        let mut r = Resampler::new(44100.0);
+        let mut r = Resampler::new(44100.0).unwrap();
         let mut out = Vec::new();
         r.push(&input[..500], &mut out);
         r.push(&input[500..], &mut out);
@@ -669,8 +689,26 @@ mod tests {
     }
 
     #[test]
+    fn wav_pcm_reads_24bit_and_extensible() {
+        let (_, v) = wav_pcm(&wav_bytes(1, 24, 2, 44100, &[0, 0, 0x40, 0, 0, 0xc0])).unwrap();
+        assert_eq!(v, vec![0.5, -0.5]);
+        let mut w = wav_bytes(0xfffe, 24, 2, 44100, &[0, 0, 0x40, 0, 0, 0xc0]);
+        w.splice(36..36, [0u8; 8]); // grow the fmt chunk to 24 bytes: cbSize, validBits, mask, then subformat
+        w[16] = 40;
+        w.splice(36..44, [22, 0, 24, 0, 3, 0, 0, 0]);
+        w.splice(44..44, [1, 0, 0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71]);
+        let (_, v) = wav_pcm(&w).unwrap();
+        assert_eq!(v, vec![0.5, -0.5]);
+    }
+
+    #[test]
+    fn resampler_rejects_a_zero_rate() {
+        assert!(Resampler::new(0.0).is_err());
+    }
+
+    #[test]
     fn wav_pcm_rejects_other_formats() {
-        assert!(wav_pcm(&wav_bytes(1, 24, 2, 44100, &[0u8; 12])).is_err(), "24-bit");
+        assert!(wav_pcm(&wav_bytes(1, 8, 2, 44100, &[0u8; 12])).is_err(), "8-bit");
         assert!(wav_pcm(&wav_bytes(1, 16, 6, 44100, &[0u8; 24])).is_err(), "6 channels");
         assert!(wav_pcm(b"not a wav file at all").is_err());
     }
