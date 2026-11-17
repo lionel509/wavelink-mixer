@@ -475,6 +475,12 @@ impl Config {
     /// changes (`base` stays, so the next save still merges instead of overwriting).
     pub fn pull_merged_with(&mut self, base: &mut Config, p: &std::path::Path, prefer: &dyn Fn(&Config, &Config, &mut Config)) -> Result<Option<Config>, String> {
         let Some(d) = Config::peek(p) else { return Ok(None) };
+        self.pull_merged_from(base, d, prefer)
+    }
+
+    /// The merge half of `pull_merged_with`, no I/O: `theirs` is the other writer's config.
+    pub fn pull_merged_from(&mut self, base: &mut Config, theirs: Config, prefer: &dyn Fn(&Config, &Config, &mut Config)) -> Result<Option<Config>, String> {
+        let d = theirs;
         if &d == base {
             return Ok(None);
         }
@@ -482,7 +488,7 @@ impl Config {
         prefer(base, &d, &mut mine);
         match merge3(base, &mine, &d) {
             Some(m) => *self = m,
-            None => return Err(format!("{}: merge with the newer file failed; keeping the window's config", p.display())),
+            None => return Err("merge with the newer config failed; keeping the window's config".to_string()),
         }
         *base = d.clone();
         Ok(Some(d))
@@ -1037,5 +1043,28 @@ mod tests {
         let old: Input = serde_json::from_value(v).unwrap();
         assert_eq!((old.norm_base, old.norm_out), (None, None));
         assert_eq!(old.gain_db, -40.0);
+    }
+
+    #[test]
+    fn pull_merged_from_matches_pull_merged_with() {
+        // the value-taking merge must give exactly what the file-reading one gives
+        let dir = std::env::temp_dir().join(format!("wavelink-pullfrom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+        let base = Config::default_config();
+        let mut theirs = base.clone();
+        theirs.inputs[0].name = "Theirs".into();
+        assert!(theirs.save_to(&p));
+        let mut mine_a = base.clone();
+        mine_a.inputs[0].gain_db = -3.0;
+        let mut base_a = base.clone();
+        let mut mine_b = mine_a.clone();
+        let mut base_b = base.clone();
+        let via_file = mine_a.pull_merged_with(&mut base_a, &p, &|_, _, _| {});
+        let via_value = mine_b.pull_merged_from(&mut base_b, Config::load_from(&p), &|_, _, _| {});
+        assert_eq!(via_file, via_value);
+        assert_eq!(mine_a, mine_b);
+        assert_eq!(base_a, base_b);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
