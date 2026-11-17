@@ -14,6 +14,9 @@ pub struct Node {
     pub class: String,
     pub desc: String,
     pub app: String,
+    /// application.process.binary: tells apps that share an application.name apart (#24)
+    #[serde(default)]
+    pub bin: String,
     pub media: String,
     /// wpctl volume (cube root of the mean linear channelVolume); 1.0 when `has_vol` is false
     pub vol: f64,
@@ -67,6 +70,13 @@ pub struct Graph {
     pub cookie: u64,
 }
 
+impl Node {
+    /// Key of an Apps-panel pick: Discord and Discord Canary share an application.name, not a binary.
+    pub fn pick_key(&self) -> String {
+        format!("{}|{}", self.bin, self.app)
+    }
+}
+
 impl Graph {
     pub fn read() -> Option<Graph> {
         // time-limited: a wedged PipeWire must never hang the caller
@@ -99,6 +109,7 @@ impl Graph {
                         class: s("media.class"),
                         desc: s("node.description"),
                         app: s("application.name"),
+                        bin: s("application.process.binary"),
                         media: s("media.name"),
                         vol,
                         mute,
@@ -337,7 +348,7 @@ pub fn set_rack(id: u64, rack: &crate::config::Rack) {
     let params: String = rack.controls().iter().map(|(k, v)| format!("\"{k}\" {v:.4} ")).collect();
     spawn("pw-cli", &["set-param", &id.to_string(), "Props", &format!("{{ params = [ {params}] }}")]);
 }
-/// Move a playback stream to another sink (WirePlumber remembers it per app).
+/// Move a playback stream to another sink (the engine re-applies the pick, config `app_picks`).
 pub fn move_stream(serial: u64, sink: &str) {
     spawn("pactl", &["move-sink-input", &serial.to_string(), sink]);
 }

@@ -808,6 +808,13 @@ impl App {
         dd
     }
 
+    /// Move a stream now and remember the pick so the engine redoes it when the app reopens the stream.
+    fn pick_app(self: &Rc<Self>, key: String, sink: &str, serial: u64) {
+        self.mixer.move_stream(serial, sink);
+        self.cfg.borrow_mut().app_picks.insert(key, sink.to_string());
+        self.save_cfg();
+    }
+
     /// Patch bay click: open the thing that was clicked, right where it was clicked.
     fn patch_clicked(self: &Rc<Self>, hit: Hit, x: f64, y: f64) {
         let d = self.patch.data();
@@ -833,10 +840,12 @@ impl App {
                 body.append(&label(&format!("PATCH {} INTO", app.to_uppercase()), "section"));
                 for (i, inp) in inputs.iter().enumerate().filter(|(_, i)| i.kind == InputKind::Virtual) {
                     let b = gtk::Button::with_label(&if i == cur { format!("● {}", inp.name) } else { inp.name.clone() });
-                    let (sink, p2) = (names::ch(&inp.id), pop.clone());
-                    let mx = self.mixer.clone();
+                    let (sink, p2, me) = (names::ch(&inp.id), pop.clone(), self.clone());
                     b.connect_clicked(move |_| {
-                        mx.move_stream(serial, &sink);
+                        let key = me.graph.borrow().nodes.iter().find(|n| n.serial == serial).map(|n| n.pick_key());
+                        if let Some(key) = key {
+                            me.pick_app(key, &sink, serial);
+                        }
                         p2.popdown();
                     });
                     body.append(&b);
@@ -2469,7 +2478,7 @@ impl App {
         }
     }
 
-    fn sync(&self, g: &Graph) {
+    fn sync(self: &Rc<Self>, g: &Graph) {
         for f in self.faders.borrow().iter() {
             let bus = f.bus.borrow().clone();
             match bus {
@@ -2568,7 +2577,7 @@ impl App {
         self.patch.set(Patch { apps, inputs, chains, buses, routes });
     }
 
-    fn sync_apps(&self, g: &Graph) {
+    fn sync_apps(self: &Rc<Self>, g: &Graph) {
         let ours = |n: &str| ["route_", "strip_", "bus_", "meter_", "wavelink", "mix_", "voice_chat", "ee_", "easyeffects", "send_"].iter().any(|p| n.starts_with(p));
         let inputs: Vec<(String, String)> = self.cfg.borrow().inputs.iter().filter(|i| i.kind == InputKind::Virtual).map(|i| (names::ch(&i.id), i.name.clone())).collect();
         let streams: Vec<_> = g
@@ -2602,11 +2611,10 @@ impl App {
             m.set_max_width_chars(28);
             let dd = gtk::DropDown::from_strings(&labels);
             dd.set_selected(tgt.map(|t| t as u32).unwrap_or(gtk::INVALID_LIST_POSITION));
-            let (serial, names_) = (n.serial, inputs.iter().map(|i| i.0.clone()).collect::<Vec<_>>());
-            let mx = self.mixer.clone();
+            let (serial, key, names_, me) = (n.serial, n.pick_key(), inputs.iter().map(|i| i.0.clone()).collect::<Vec<_>>(), self.clone());
             dd.connect_selected_notify(move |d| {
                 if let Some(sink) = names_.get(d.selected() as usize) {
-                    mx.move_stream(serial, sink);
+                    me.pick_app(key.clone(), sink, serial);
                 }
             });
             row.append(&t);
